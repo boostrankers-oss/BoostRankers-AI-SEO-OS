@@ -1,0 +1,18 @@
+
+## Troubleshooting
+
+**Claude agent returns "Claude API not configured":**
+- Ensure `ANTHROPIC_API_KEY` environment variable is set
+- Restart the backend after setting the variable
+- Verify the key starts with `sk-ant-`
+
+**Frontend shows "Backend offline — using simulator":**
+- Ensure the backend is running on port 8000
+- Check CORS settings if using a different frontend URL
+- Verify `VITE_API_BASE` environment variable if not using default
+
+**Claude analysis errors:**
+- Check API key validity
+- Ensure sufficient API credits
+- Check network connectivity to Anthropic API
+}

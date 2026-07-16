@@ -1,0 +1,4 @@
+
+## Health Check
+
+Verify the backend and Claude AI status:

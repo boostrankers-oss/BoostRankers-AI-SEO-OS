@@ -1,0 +1,26 @@
+
+## Audit Agents
+
+| Agent | What It Checks | AI Powered |
+|-------|----------------|------------|
+| Technical SEO | HTTP status, HTTPS, canonical, title, meta, H1, images, robots.txt, sitemap, compression, mobile | No |
+| Content SEO | Content depth, keyword in title/H1, density, subheadings, internal/external links, FAQ | No |
+| Local SEO | NAP consistency, location mentions, LocalBusiness schema, Google Maps embed | No |
+| Schema | JSON-LD types present, validation, missing schema recommendations | No |
+| EEAT | About page, contact, privacy policy, author attribution, trust signals | No |
+| Internal Linking | Anchor text quality, link count, breadcrumb navigation | No |
+| Competitor | Content gap analysis vs provided competitor URLs | No |
+| Backlink | Placeholder for Ahrefs/Moz/Semrush API integration | No |
+| AI Search | Question coverage, entity density, semantic depth, schema for AI | No |
+| Claude AI Deep Analysis | Content quality, EEAT signals, keyword usage, AI search optimization | **Yes** |
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VITE_API_BASE` | `http://localhost:8000` | FastAPI backend URL |
+| `ANTHROPIC_API_KEY` | None | Anthropic API key for Claude AI agent |
+
+## License
+
+MIT

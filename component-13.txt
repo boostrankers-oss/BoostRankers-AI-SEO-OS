@@ -1,0 +1,5 @@
+
+The frontend automatically detects the backend and switches from simulator
+to live mode. See `backend/INTEGRATION.md` for full details.
+
+## Architecture

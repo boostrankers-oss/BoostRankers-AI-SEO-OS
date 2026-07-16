@@ -1,0 +1,4 @@
+
+If no key is set, the Claude agent gracefully falls back to an informational message, and the other 9 rule-based agents continue to function normally.
+
+### 3. Start the backend

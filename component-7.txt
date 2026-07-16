@@ -1,0 +1,23 @@
+
+The frontend automatically connects to `http://localhost:8000`. If the backend is offline, it falls back to the built-in simulator.
+
+## How Claude AI Integration Works
+
+The `agent_claude_seo` function in `backend/main.py`:
+
+1. **Fetches the target URL** using `httpx`
+2. **Extracts key SEO elements** (title, meta description, H1, text content, word count, etc.) using `BeautifulSoup`
+3. **Constructs a prompt** asking Claude to act as a Senior SEO Expert and analyze the page data
+4. **Calls the Anthropic API** using the `AsyncAnthropic` client for non-blocking execution
+5. **Parses Claude's JSON response** containing 4-5 findings with status, detail, and recommendation
+6. **Streams the findings** to the frontend via SSE, just like the rule-based agents
+
+The Claude agent focuses on:
+- Content quality and depth analysis
+- EEAT (Experience, Expertise, Authority, Trust) evaluation
+- Keyword usage optimization
+- AI search readiness assessment
+
+## SSE Event Protocol
+
+The backend streams these events:

@@ -1,0 +1,5 @@
+
+The app runs at `http://localhost:5173` and works immediately with the
+built-in audit simulator.
+
+### Backend (optional — for live audits)
