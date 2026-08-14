@@ -1,0 +1,9 @@
+from .auth import router as auth
+from .users import router as users
+from .clients import router as clients
+from .audits import router as audits
+from .reports import router as reports
+from .competitors import router as competitors
+from .internal_linking import router as internal_linking
+from .dashboard import router as dashboard
+from .backlinks import router as backlinks

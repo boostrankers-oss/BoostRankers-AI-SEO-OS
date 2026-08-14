@@ -1,3 +1,0 @@
-
-**Or use a `.env` file:**
-Create `backend/.env`:
