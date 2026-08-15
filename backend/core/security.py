@@ -115,10 +115,33 @@ def validate_password_strength(
     password: str,
 ) -> PasswordValidationResult:
     """
-    Returns a score from 0–5.
+    Validate password strength.
+
+    Requirements:
+    - At least 12 characters
+    - No more than 72 UTF-8 bytes (bcrypt limit)
+    - At least one uppercase letter
+    - At least one lowercase letter
+    - At least one digit
+    - At least one special character
     """
 
     score = 0
+
+    # bcrypt processes passwords up to 72 bytes.
+    # Check encoded byte length rather than Python character count
+    # because UTF-8 characters can occupy multiple bytes.
+    password_bytes = len(password.encode("utf-8"))
+
+    if password_bytes > 72:
+        return PasswordValidationResult(
+            valid=False,
+            score=0,
+            message=(
+                "Password must not exceed 72 bytes. "
+                "Please use a shorter password."
+            ),
+        )
 
     if len(password) >= 12:
         score += 1
