@@ -1,43 +1,89 @@
 from logging.config import fileConfig
+from pathlib import Path
+import os
 
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
+from dotenv import load_dotenv
+
+from sqlalchemy import engine_from_config, pool
 
 from alembic import context
 
-from config import settings
+
+# ============================================================
+# Load project environment
+# ============================================================
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = BACKEND_DIR.parent
+ENV_FILE = PROJECT_ROOT / ".env"
+
+load_dotenv(ENV_FILE)
+
+
+# ============================================================
+# Database URL
+# ============================================================
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        f"DATABASE_URL is required for Alembic. "
+        f"Expected environment file: {ENV_FILE}"
+    )
+
+
+# ============================================================
+# SQLAlchemy metadata
+# ============================================================
+
 from models.base import Base
 
-# ---------------------------------------------------------
-# IMPORT ALL SQLALCHEMY MODELS HERE
-# ---------------------------------------------------------
 
-from models.audit import Audit
-from models.audit_log import AuditLog
-from models.client import Client
-from models.company import Company
-from models.permission import Permission
-from models.refresh_token import RefreshToken
-from models.role import Role
-from models.role_permission import role_permissions
-from models.user import User
+# Import EVERY model module so SQLAlchemy registers every table
+# in Base.metadata before Alembic performs autogeneration.
 
-# ---------------------------------------------------------
+import models.audit
+import models.audit_log
+import models.backlink
+import models.client
+import models.company
+import models.competitor
+import models.internal_linking
+import models.permission
+import models.refresh_token
+import models.report
+import models.role
+import models.role_permission
+import models.user
+
+
+# ============================================================
+# Alembic configuration
+# ============================================================
 
 config = context.config
 
+# The password may contain URL-encoded characters such as %40,
+# %23, etc. ConfigParser requires % to be escaped here.
 config.set_main_option(
     "sqlalchemy.url",
-    settings.DATABASE_URL
+    DATABASE_URL.replace("%", "%%"),
 )
+
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+
 target_metadata = Base.metadata
 
 
-def run_migrations_offline():
+# ============================================================
+# Offline migrations
+# ============================================================
+
+def run_migrations_offline() -> None:
     """Run migrations in offline mode."""
 
     url = config.get_main_option("sqlalchemy.url")
@@ -53,11 +99,17 @@ def run_migrations_offline():
         context.run_migrations()
 
 
-def run_migrations_online():
-    """Run migrations in online mode."""
+# ============================================================
+# Online migrations
+# ============================================================
+
+def run_migrations_online() -> None:
+    """Run migrations against PostgreSQL."""
 
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
+        config.get_section(
+            config.config_ini_section
+        ),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
@@ -73,6 +125,10 @@ def run_migrations_online():
         with context.begin_transaction():
             context.run_migrations()
 
+
+# ============================================================
+# Run migrations
+# ============================================================
 
 if context.is_offline_mode():
     run_migrations_offline()

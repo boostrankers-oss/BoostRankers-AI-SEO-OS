@@ -3,13 +3,12 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { PenLine, Sparkles, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 import { useClaude } from "@/components/ClaudeProvider";
 import { toast } from "sonner";
 
 export function BlogOptimizer() {
-  const { isConfigured, generateContent } = useClaude();
+  const { isConfigured, isReady, status, generateContent } = useClaude();
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(false);
@@ -28,6 +27,18 @@ export function BlogOptimizer() {
       return;
     }
 
+    if (!isReady) {
+      const message =
+        status === "billing_required"
+          ? "Anthropic billing is required. Your API key is valid, but your Anthropic credit balance is too low. Please add credits or upgrade your plan."
+          : status === "invalid_api_key"
+            ? "Anthropic API key is invalid. Please update it in Settings."
+            : "Claude AI is currently unavailable. Please check Settings.";
+      toast.error(message);
+      setError(message);
+      return;
+    }
+
     setLoading(true);
     setError(null);
     setOptimization(null);
@@ -35,14 +46,14 @@ export function BlogOptimizer() {
     const prompt = `You are an expert SEO blog optimizer. Analyze the following blog post and provide actionable recommendations to improve its SEO ranking.
     Title: "${title}"
     Content: "${content}"
-    
+
     Provide recommendations on:
     1. Title optimization
     2. Meta description suggestion
     3. Content structure (H2, H3 tags)
     4. Keyword density and LSI keywords
     5. Readability improvements
-    
+
     Format the output cleanly with bullet points.`;
 
     try {
@@ -96,20 +107,20 @@ export function BlogOptimizer() {
             <CardDescription>Input your blog post details to analyze.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <Input 
-              placeholder="Blog Title" 
+            <Input
+              placeholder="Blog Title"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
             />
-            <Textarea 
-              placeholder="Paste your blog content here..." 
+            <Textarea
+              placeholder="Paste your blog content here..."
               className="min-h-[300px]"
               value={content}
               onChange={(e) => setContent(e.target.value)}
             />
-            <Button 
-              onClick={handleOptimize} 
-              disabled={loading || !isConfigured || !title || !content} 
+            <Button
+              onClick={handleOptimize}
+              disabled={loading || !isReady || !title || !content}
               className="w-full bg-emerald-600 hover:bg-emerald-700 text-white"
             >
               {loading ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}

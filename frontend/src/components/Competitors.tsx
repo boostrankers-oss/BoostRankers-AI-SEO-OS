@@ -20,7 +20,7 @@ interface Competitor {
 }
 
 export function Competitors() {
-  const { isConfigured } = useClaude();
+  const { isConfigured, isReady, status } = useClaude();
   const [competitors, setCompetitors] = useState<Competitor[]>([]);
   const [loading, setLoading] = useState(true);
   const [newDomain, setNewDomain] = useState("");
@@ -33,7 +33,7 @@ export function Competitors() {
 
   const fetchCompetitors = async () => {
     try {
-      const data = await api.get("/api/competitors");
+      const data = await api.get<Competitor[]>("/api/competitors");
       setCompetitors(data);
     } catch (err) {
       console.error("Failed to fetch competitors:", err);
@@ -55,11 +55,23 @@ export function Competitors() {
       return;
     }
 
+    if (!isReady) {
+      const message =
+        status === "billing_required"
+          ? "Anthropic billing is required. Your API key is valid, but your credit balance is too low. Please add credits or upgrade your plan, then try again."
+          : status === "invalid_api_key"
+            ? "Anthropic API key is invalid. Please update it in Settings."
+            : "Claude AI is currently unavailable. Please check Settings.";
+      toast.error(message);
+      setError(message);
+      return;
+    }
+
     setAnalyzing(true);
     setError(null);
 
     try {
-      const data = await api.post(`/api/competitors?domain=${encodeURIComponent(newDomain)}`, {});
+      const data = await api.post<Competitor>(`/api/competitors?domain=${encodeURIComponent(newDomain)}`, {});
       setCompetitors([data, ...competitors]);
       setNewDomain("");
       toast.success("Competitor analyzed successfully");
@@ -102,12 +114,23 @@ export function Competitors() {
         </p>
       </header>
 
-      {!isConfigured && (
+      {!isConfigured ? (
         <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
           <CardContent className="p-4 flex items-center gap-3">
             <AlertCircle className="size-5 text-amber-600" />
             <p className="text-sm text-amber-700 dark:text-amber-400">
               Claude API Key required. Please configure it in Settings to enable AI-powered competitor analysis.
+            </p>
+          </CardContent>
+        </Card>
+      ) : !isReady && (
+        <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
+          <CardContent className="p-4 flex items-center gap-3">
+            <AlertCircle className="size-5 text-amber-600" />
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              {status === "billing_required"
+                ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+                : "Claude AI is currently unavailable. Please check Settings."}
             </p>
           </CardContent>
         </Card>
@@ -132,7 +155,7 @@ export function Competitors() {
             </div>
             <Button
               onClick={handleAnalyze}
-              disabled={analyzing || !isConfigured}
+              disabled={analyzing || !isReady}
               className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20"
             >
               {analyzing ? <Loader2 className="size-4 animate-spin" /> : <Search className="size-4" />}

@@ -16,13 +16,30 @@ interface ContentIdea {
 }
 
 export function ContentPlanner() {
-  const { isConfigured, generateContent } = useClaude();
+  const { isConfigured, isReady, status, generateContent } = useClaude();
   const [topic, setTopic] = useState("AI SEO strategies");
   const [loading, setLoading] = useState(false);
   const [ideas, setIdeas] = useState<ContentIdea[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const generatePlan = async () => {
+    if (!isConfigured) {
+      const message = "Claude API key required. Please configure it in Settings.";
+      setError(message);
+      return;
+    }
+
+    if (!isReady) {
+      const message =
+        status === "billing_required"
+          ? "Anthropic billing is required. Your API key is valid, but your credit balance is too low. Please add credits or upgrade your plan, then try again."
+          : status === "invalid_api_key"
+            ? "Anthropic API key is invalid. Please update it in Settings."
+            : "Claude AI is currently unavailable. Please check Settings.";
+      setError(message);
+      return;
+    }
+
     setLoading(true);
     setIdeas([]);
     setError(null);
@@ -61,12 +78,23 @@ export function ContentPlanner() {
         </p>
       </header>
 
-      {!isConfigured && (
+      {!isConfigured ? (
         <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
           <CardContent className="p-4 flex items-center gap-3">
             <AlertCircle className="size-5 text-amber-600" />
             <p className="text-sm text-amber-700 dark:text-amber-400">
               Claude API Key required. Please configure it in Settings to enable AI content planning.
+            </p>
+          </CardContent>
+        </Card>
+      ) : !isReady && (
+        <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
+          <CardContent className="p-4 flex items-center gap-3">
+            <AlertCircle className="size-5 text-amber-600" />
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              {status === "billing_required"
+                ? "Anthropic billing is required. Your API key is valid, but your credit balance is too low. Please add credits or upgrade your plan, then try again."
+                : "Claude AI is currently unavailable. Please check Settings."}
             </p>
           </CardContent>
         </Card>
@@ -85,7 +113,7 @@ export function ContentPlanner() {
             <Label htmlFor="topic">Topic / Seed Keyword</Label>
             <Input id="topic" value={topic} onChange={(e) => setTopic(e.target.value)} placeholder="e.g. Technical SEO, Local Marketing..." />
           </div>
-          <Button onClick={generatePlan} disabled={loading || !isConfigured} className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20">
+          <Button onClick={generatePlan} disabled={loading || !isReady} className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20">
             {loading ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
             {loading ? "Generating..." : "Generate Plan"}
           </Button>

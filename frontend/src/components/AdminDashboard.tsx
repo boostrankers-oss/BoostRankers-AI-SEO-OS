@@ -43,8 +43,8 @@ export default function AdminDashboard() {
   const fetchData = async () => {
     try {
       const [companiesRes, usersRes] = await Promise.all([
-        api.get("/api/companies"),
-        api.get("/api/users"),
+        api.get<Company[]>("/api/companies"),
+        api.get<User[]>("/api/users"),
       ]);
       setCompanies(companiesRes);
       setUsers(usersRes);

@@ -24,7 +24,7 @@ const initialAgents = [
 ];
 
 export function AuditEngine() {
-  const { isConfigured } = useClaude();
+  const { isConfigured, isReady, status } = useClaude();
   const [url, setUrl] = useState("https://example.com");
   const [showBudgetDialog, setShowBudgetDialog] = useState(false);
   const [budgetAmount, setBudgetAmount] = useState(10);
@@ -92,6 +92,17 @@ export function AuditEngine() {
     if (running) return;
     if (!isConfigured) {
       toast.error("Claude API key not configured. Please add it in Settings.");
+      return;
+    }
+
+    if (!isReady) {
+      toast.error(
+        status === "billing_required"
+          ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+          : status === "invalid_api_key"
+            ? "Anthropic API key is invalid. Please update it in Settings."
+            : "Claude AI is currently unavailable. Please check Settings."
+      );
       return;
     }
 
@@ -195,12 +206,23 @@ export function AuditEngine() {
         </p>
       </header>
 
-      {!isConfigured && (
+      {!isConfigured ? (
         <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
           <CardContent className="p-4 flex items-center gap-3">
             <AlertCircle className="size-5 text-amber-600" />
             <p className="text-sm text-amber-700 dark:text-amber-400">
               Claude API Key required. Please configure it in Settings to enable AI-powered audit insights.
+            </p>
+          </CardContent>
+        </Card>
+      ) : !isReady && (
+        <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
+          <CardContent className="p-4 flex items-center gap-3">
+            {status === "billing_required" ? <CreditCard className="size-5 text-amber-600" /> : <AlertCircle className="size-5 text-amber-600" />}
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              {status === "billing_required"
+                ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+                : "Claude AI is currently unavailable. Please check Settings."}
             </p>
           </CardContent>
         </Card>

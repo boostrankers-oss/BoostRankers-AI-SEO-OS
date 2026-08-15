@@ -4,7 +4,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
     TrendingUp,
-    TrendingDown,
     Activity,
     FileText,
     Zap,
@@ -72,40 +71,34 @@ interface DashboardChartPoint {
   content: number;
 }
 
-interface DashboardChartsResponse {
-  trend: DashboardChartPoint[];
-}
 
 interface RecentAudit {
-  id: number;
-  url: string;
-  keyword: string;
-  score: number;
-  status: string;
-  created_at: string;
+  id: string | number;
+  website: string;
+  primary_keyword?: string;
+  overall_score: number;
+  status?: string;
+  created_at?: string;
+}
+
+interface DashboardRecentAuditsResponse {
+  items: RecentAudit[];
+}
+
+interface DashboardChartsResponse {
+  items: DashboardChartPoint[];
 }
 
 interface DashboardSystem {
-  database: string;
-  api_latency: number;
-  claude_status: string;
-  crawler_status: string;
-  queue_size: number;
+  database?: string;
+  api?: string;
+  audit_engine?: string;
+  claude_ai?: string;
+  queue?: { running?: number };
+  success_rate?: number;
 }
 
-interface DashboardTask {
-  id: number;
-  title: string;
-  priority: string;
-  status: string;
-}
 
-interface DashboardNotification {
-  id: number;
-  title: string;
-  type: string;
-  created_at: string;
-}
 
 interface DashboardRecommendation {
   title: string;
@@ -113,12 +106,8 @@ interface DashboardRecommendation {
   priority: string;
 }
 
-interface DashboardClient {
-  id: number;
-  name: string;
-  website: string;
-  score: number;
-}
+
+interface DashboardOverviewResponse extends DashboardOverview {}
 
 export function Dashboard({ onRunAudit }: DashboardProps) {
   const [loading, setLoading] = useState(true);
@@ -137,17 +126,11 @@ const [recentAudits, setRecentAudits] =
 const [systemStatus, setSystemStatus] =
   useState<DashboardSystem | null>(null);
 
-const [tasks, setTasks] =
-  useState<DashboardTask[]>([]);
 
-const [notifications, setNotifications] =
-  useState<DashboardNotification[]>([]);
 
 const [recommendations, setRecommendations] =
   useState<DashboardRecommendation[]>([]);
 
-const [clients, setClients] =
-  useState<DashboardClient[]>([]);
 
 const loadDashboard = useCallback(async () => {
   setLoading(true);
@@ -155,24 +138,18 @@ const loadDashboard = useCallback(async () => {
 
   try {
     const [
-		overviewData,
-		chartsData,
-		auditsData,
-		systemData,
-		tasksData,
-		notificationsData,
-		clientsData,
-		 aiData,
-	] = await Promise.all([
-		api.get("/api/dashboard/overview"),
-		api.get("/api/dashboard/charts"),
-		api.get("/api/dashboard/recent-audits"),
-		api.get("/api/dashboard/system"),
-		api.get("/api/dashboard/tasks"),
-		api.get("/api/dashboard/notifications"),
-		api.get("/api/dashboard/clients"),
-		api.get("/api/dashboard/ai"),
-]);
+      overviewData,
+      chartsData,
+      auditsData,
+      systemData,
+      aiData,
+    ] = await Promise.all([
+      api.get<DashboardOverviewResponse>("/api/dashboard/overview"),
+      api.get<DashboardChartsResponse>("/api/dashboard/charts"),
+      api.get<DashboardRecentAuditsResponse>("/api/dashboard/recent-audits"),
+      api.get<DashboardSystem>("/api/dashboard/system"),
+      api.get<DashboardRecommendation[]>("/api/dashboard/ai"),
+    ]);
 
 console.log("Charts API:", chartsData);
 console.log("Is Array:", Array.isArray(chartsData));
@@ -186,13 +163,10 @@ console.log("Is Array:", Array.isArray(chartsData));
 
     setSystemStatus(systemData);
 
-    setTasks(tasksData.items ?? []);
 
-    setNotifications(notificationsData.items ?? []);
 
     setRecommendations(aiData ?? []);
 
-    setClients(clientsData.clients ?? []);
   } catch (err) {
     console.error(err);
 
@@ -488,7 +462,7 @@ if (error) {
 
 				<div className="flex justify-between">
 				<span>Queue</span>
-				<span>{systemStatus?.queue.running}</span>
+				<span>{systemStatus?.queue?.running ?? 0}</span>
 				</div>
 
 				<div className="flex justify-between">

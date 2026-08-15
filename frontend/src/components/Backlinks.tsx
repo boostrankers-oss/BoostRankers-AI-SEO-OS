@@ -37,11 +37,9 @@ import {
   Mail,
   Trash2,
   Search,
-  Filter,
   Download,
   Plus,
   AlertCircle,
-  Wand2,
   CreditCard,
 } from "lucide-react";
 import { useClaude } from "@/components/ClaudeProvider";
@@ -94,13 +92,12 @@ interface Statistics {
 const COLORS = ["#10b981", "#6366f1", "#f59e0b", "#8b5cf6"];
 
 export function Backlinks() {
-  const { isConfigured } = useClaude();
+  const { isConfigured, isReady, status } = useClaude();
   const [stats, setStats] = useState<Statistics | null>(null);
   const [backlinks, setBacklinks] = useState<Backlink[]>([]);
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [outreachEmails, setOutreachEmails] = useState<OutreachEmail[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
 
   // UI state
   const [activeTab, setActiveTab] = useState<
@@ -119,6 +116,26 @@ export function Backlinks() {
   const [showBudgetDialog, setShowBudgetDialog] = useState(false);
   const [budgetAmount, setBudgetAmount] = useState(10);
   const [isAddingBudget, setIsAddingBudget] = useState(false);
+
+  const requireAiReady = (): boolean => {
+    if (!isConfigured) {
+      toast.error("Claude API key not configured. Please add it in Settings.");
+      return false;
+    }
+
+    if (!isReady) {
+      toast.error(
+        status === "billing_required"
+          ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+          : status === "invalid_api_key"
+            ? "Anthropic API key is invalid. Please update it in Settings."
+            : "Claude AI is currently unavailable. Please check Settings."
+      );
+      return false;
+    }
+
+    return true;
+  };
   const [generatingEmail, setGeneratingEmail] = useState<{
     id: string;
     loading: boolean;
@@ -130,28 +147,21 @@ export function Backlinks() {
 
   const fetchAllData = async () => {
     setLoading(true);
-    setError(null);
     try {
       // Use Promise.allSettled to avoid one failure breaking everything
-      const results = await Promise.allSettled([
-        api.get("/api/backlinks/statistics"),
-        api.get("/api/backlinks"),
-        api.get("/api/backlinks/opportunities"),
-        api.get("/api/backlinks/outreach"),
+      const [statsData, backlinksData, oppsData, emailsData] = await Promise.all([
+        api.get<Statistics>("/api/backlinks/statistics"),
+        api.get<Backlink[]>("/api/backlinks"),
+        api.get<Opportunity[]>("/api/backlinks/opportunities"),
+        api.get<OutreachEmail[]>("/api/backlinks/outreach"),
       ]);
 
-      // Extract data or fallback to empty/default
-      const [statsData, backlinksData, oppsData, emailsData] = results.map(r =>
-        r.status === "fulfilled" ? r.value : null
-      );
-
-      setStats(statsData || { total: 0, referring_domains: 0, domain_authority: 0, toxic_links: 0, new_this_month: 0, new_domains: 0, da_change: 0, toxic_fixed: 0, growth_history: [], link_types: {} });
-      setBacklinks(Array.isArray(backlinksData) ? backlinksData : []);
-      setOpportunities(Array.isArray(oppsData) ? oppsData : []);
-      setOutreachEmails(Array.isArray(emailsData) ? emailsData : []);
+      setStats(statsData);
+      setBacklinks(backlinksData);
+      setOpportunities(oppsData);
+      setOutreachEmails(emailsData);
     } catch (err) {
       console.error("Failed to fetch backlink data:", err);
-       setError("Could not load backlink data. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -159,7 +169,7 @@ export function Backlinks() {
 
   const handleAddBacklink = async () => {
     try {
-      const data = await api.post("/api/backlinks", newBacklink);
+      const data = await api.post<Backlink>("/api/backlinks", newBacklink);
       setBacklinks([data, ...backlinks]);
       setIsAddOpen(false);
       setNewBacklink({ source_url: "", target_url: "", anchor_text: "", link_type: "Dofollow" });
@@ -185,9 +195,11 @@ export function Backlinks() {
   };
 
   const handleAnalyze = async (id: string) => {
+    if (!requireAiReady()) return;
+
     setAnalyzingId(id);
     try {
-      const data = await api.post(`/api/backlinks/${id}/analyze`);
+      const data = await api.post<{ analysis: string }>(`/api/backlinks/${id}/analyze`);
       setBacklinks(
         backlinks.map((b) =>
           b.id === id ? { ...b, ai_analysis: data.analysis } : b
@@ -207,8 +219,10 @@ export function Backlinks() {
   };
 
   const handleGenerateOpportunities = async () => {
+    if (!requireAiReady()) return;
+
     try {
-      const data = await api.post("/api/backlinks/opportunities/generate");
+      const data = await api.post<Opportunity[]>("/api/backlinks/opportunities/generate");
       setOpportunities([...data, ...opportunities]);
       toast.success("Opportunities generated");
       fetchAllData();
@@ -225,7 +239,7 @@ export function Backlinks() {
   const handleGenerateEmail = async (oppId: string) => {
     setGeneratingEmail({ id: oppId, loading: true });
     try {
-      const data = await api.post(`/api/backlinks/opportunities/${oppId}/outreach`);
+      const data = await api.post<{ email: string }>(`/api/backlinks/opportunities/${oppId}/outreach`);
       setGeneratedEmail(data.email);
       setActiveTab("outreach");
       toast.success("Email generated");
@@ -248,8 +262,7 @@ export function Backlinks() {
       await api.post(`/api/company/add-credits?amount=${budgetAmount}`, {});
       toast.success(`Added ${budgetAmount} credits.`);
       setShowBudgetDialog(false);
-      setError(null);
-    } catch (error) {
+      } catch (error) {
       console.error("Failed to add credits:", error);
       toast.error("Could not add credits.");
     } finally {
@@ -324,12 +337,23 @@ export function Backlinks() {
         ))}
       </div>
 
-      {!isConfigured && (
+      {!isConfigured ? (
         <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
           <CardContent className="p-4 flex items-center gap-3">
             <AlertCircle className="size-5 text-amber-600" />
             <p className="text-sm text-amber-700 dark:text-amber-400">
               Claude API Key required. Please configure it in Settings to enable AI features.
+            </p>
+          </CardContent>
+        </Card>
+      ) : !isReady && (
+        <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
+          <CardContent className="p-4 flex items-center gap-3">
+            {status === "billing_required" ? <CreditCard className="size-5 text-amber-600" /> : <AlertCircle className="size-5 text-amber-600" />}
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              {status === "billing_required"
+                ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+                : "Claude AI is currently unavailable. Please check Settings."}
             </p>
           </CardContent>
         </Card>
@@ -428,7 +452,7 @@ export function Backlinks() {
                 <ResponsiveContainer width="100%" height={300}>
                   <PieChart>
                     <Pie data={Object.entries(stats.link_types).map(([name, value]) => ({ name, value }))} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={60} outerRadius={90} paddingAngle={5}>
-                      {Object.entries(stats.link_types).map((entry, index) => (
+                      {Object.entries(stats.link_types).map(([,], index) => (
                         <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                       ))}
                     </Pie>
@@ -522,7 +546,7 @@ export function Backlinks() {
                             variant="ghost"
                             size="sm"
                             onClick={() => handleAnalyze(row.id)}
-                            disabled={!isConfigured || analyzingId !== null}
+                            disabled={!isReady || analyzingId !== null}
                             className="text-xs h-7"
                           >
                             <Sparkles className="size-3" /> Analyze
@@ -553,7 +577,7 @@ export function Backlinks() {
             <CardDescription>Discover high-quality link building prospects</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <Button onClick={handleGenerateOpportunities} disabled={!isConfigured} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+            <Button onClick={handleGenerateOpportunities} disabled={!isReady} className="bg-emerald-600 hover:bg-emerald-700 text-white">
               <Sparkles className="size-4" /> Generate New Opportunities
             </Button>
             {opportunities.length === 0 ? (

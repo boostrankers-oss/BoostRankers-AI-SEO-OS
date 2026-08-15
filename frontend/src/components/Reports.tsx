@@ -3,7 +3,6 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
   DialogContent,
@@ -30,7 +29,7 @@ interface Report {
 }
 
 export function Reports() {
-  const { isConfigured, generateContent } = useClaude();
+  const { isConfigured, isReady, status, generateContent } = useClaude();
   const [reports, setReports] = useState<Report[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -46,7 +45,7 @@ export function Reports() {
 
   const fetchReports = async () => {
     try {
-      const data = await api.get("/api/reports");
+      const data = await api.get<Report[]>("/api/reports/");
       setReports(data);
     } catch (err) {
       console.error("Failed to fetch reports:", err);
@@ -57,45 +56,74 @@ export function Reports() {
   };
 
   const handleGenerate = async () => {
-    setGenerating(true);
-    setError(null);
-
-    const prompt = `Generate a comprehensive SEO audit report for ${newReport.client} (URL: ${newReport.url}).
-    Format in Markdown.
-    Include the following sections:
-    1. Executive Summary
-    2. Technical SEO
-    3. Content SEO
-    4. Schema
-    5. EEAT
-    6. AI Search
-    7. Local SEO
-    8. Competitor Analysis
-    9. Action Plan (30/60/90 days)
-    Make it detailed and professional.`;
-
-    try {
-      const response = await generateContent(prompt);
-      const newReportEntry: Report = {
-        id: `r${Date.now()}`,
-        title: newReport.title,
-        client_name: newReport.client,
-        date: new Date().toISOString().split('T')[0],
-        score: Math.floor(Math.random() * 30) + 60,
-        format: "MD",
-        content: response,
-        summary: response.split("\n")[0] || "SEO Audit Report",
-      };
-      setReports([newReportEntry, ...reports]);
-      setIsGenerateOpen(false);
-      setNewReport({ title: "", client: "", url: "" });
-      toast.success("Report generated successfully");
-    } catch (err: any) {
-      setError(err.message || "Failed to generate report.");
-    } finally {
-      setGenerating(false);
+    if (!isConfigured) {
+      const message = "Claude API key required. Please configure it in Settings.";
+      setError(message);
+      toast.error(message);
+      return;
     }
-  };
+
+    if (!isReady) {
+      const message =
+        status === "billing_required"
+          ? "Anthropic billing is required. Your API key is valid, but your credit balance is too low. Please add credits or upgrade your plan, then try again."
+          : status === "invalid_api_key"
+            ? "Anthropic API key is invalid. Please update it in Settings."
+            : "Claude AI is currently unavailable. Please check Settings.";
+      setError(message);
+      toast.error(message);
+      return;
+    }
+
+    setGenerating(true);
+  setError(null);
+
+  const prompt = `Generate a comprehensive SEO audit report for ${newReport.client} (URL: ${newReport.url}).
+	Format in Markdown.
+
+	Include the following sections:
+	1. Executive Summary
+	2. Technical SEO
+	3. Content SEO
+	4. Schema
+	5. EEAT
+	6. AI Search
+	7. Local SEO
+	8. Competitor Analysis
+	9. Action Plan (30/60/90 days)
+
+	Make it detailed and professional.`;
+
+	  try {
+		const response = await generateContent(prompt);
+
+		const newReportEntry: Report = {
+		  id: `r${Date.now()}`,
+		  title: newReport.title,
+		  client_name: newReport.client,
+		  date: new Date().toISOString().split("T")[0],
+		  score: Math.floor(Math.random() * 30) + 60,
+		  format: "MD",
+		  content: response,
+		  summary: response.split("\n")[0] || "SEO Audit Report",
+		};
+
+		setReports((current) => [newReportEntry, ...current]);
+		setIsGenerateOpen(false);
+		setNewReport({
+		  title: "",
+		  client: "",
+		  url: "",
+		});
+
+		toast.success("Report generated successfully");
+	  } catch (err: any) {
+		console.error("Failed to generate report:", err);
+		setError(err?.message || "Failed to generate report.");
+	  } finally {
+		setGenerating(false);
+	  }
+	};
 
   const handleDelete = async (id: string) => {
     try {
@@ -250,9 +278,16 @@ export function Reports() {
             <DialogDescription>AI-powered comprehensive SEO report generation</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
-            {!isConfigured && (
+            {!isConfigured ? (
               <div className="flex items-center gap-2 p-3 rounded-lg text-xs text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-500/10">
                 <AlertCircle className="size-4" /> Configure Claude API key in Settings to use AI features.
+              </div>
+            ) : !isReady && (
+              <div className="flex items-center gap-2 p-3 rounded-lg text-xs text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-500/10">
+                <AlertCircle className="size-4" />
+                {status === "billing_required"
+                  ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+                  : "Claude AI is currently unavailable. Please check Settings."}
               </div>
             )}
             <div className="space-y-2">
@@ -288,7 +323,7 @@ export function Reports() {
             <Button variant="outline" onClick={() => setIsGenerateOpen(false)}>Cancel</Button>
             <Button
               onClick={handleGenerate}
-              disabled={generating || !isConfigured}
+              disabled={generating || !isReady}
               className="bg-emerald-600 hover:bg-emerald-700 text-white"
             >
               {generating ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}

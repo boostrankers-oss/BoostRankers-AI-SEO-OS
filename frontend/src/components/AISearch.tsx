@@ -1,5 +1,5 @@
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Bot, CheckCircle2, AlertTriangle, Zap, MessageSquare } from "lucide-react";
+import { CheckCircle2, AlertTriangle, Zap, MessageSquare } from "lucide-react";
 
 const metrics = [
   { label: "LLM Visibility", value: "82%", status: "good", detail: "High citation rate in AI responses" },

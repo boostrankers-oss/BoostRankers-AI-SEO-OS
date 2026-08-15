@@ -89,7 +89,7 @@ export function Clients() {
   useEffect(() => {
     const fetchClients = async () => {
       try {
-        const data = await api.get("/api/clients");
+        const data = await api.get<Client[]>("/api/clients");
         setClients(data);
       } catch (error) {
         console.error("Failed to fetch clients:", error);
@@ -129,7 +129,7 @@ export function Clients() {
         city: newClient.city || undefined,
         country: newClient.country || undefined,
       };
-      const data = await api.post("/api/clients", payload);
+      const data = await api.post<Client>("/api/clients", payload);
       setClients([data, ...clients]);
       setNewClient(emptyClient);
       setIsAddOpen(false);

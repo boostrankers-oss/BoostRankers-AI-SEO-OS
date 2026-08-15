@@ -7,7 +7,10 @@ from models.user import User
 from models.company import Company
 from api.deps.current_user import get_current_user, get_current_company
 
-router = APIRouter(prefix="/api/reports", tags=["Reports"])
+router = APIRouter(
+    prefix="/reports",
+    tags=["Reports"],
+)
 
 @router.get("/")
 def get_reports(

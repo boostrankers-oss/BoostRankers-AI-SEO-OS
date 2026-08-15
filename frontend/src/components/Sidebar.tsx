@@ -1,9 +1,8 @@
 import { cn } from "@/lib/utils";
-import { useAuth, UserRole } from "@/components/AuthProvider";
+import { UserRole } from "@/components/AuthProvider";
 import { 
   LayoutDashboard, 
   Users, 
-  FolderKanban, 
   FileSearch, 
   FileText, 
   CalendarRange, 
@@ -18,8 +17,6 @@ import {
   Bot, 
   BarChart3, 
   Settings as SettingsIcon, 
-  Bell, 
-  User as UserIcon, 
   LogOut,
   ShieldCheck,
   Moon,
@@ -78,9 +75,9 @@ export function Sidebar({ view, setView, dark, setDark, onLogout, role }: Sideba
         <div className="flex items-center gap-2">
           <span className={cn(
             "px-2 py-0.5 rounded-md text-xs font-medium",
-            role === "Super Admin" ? "bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-400" :
-            role === "Agency Admin" ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400" :
-            role === "Team Member" ? "bg-indigo-50 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-400" :
+            role === "super_admin" ? "bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-400" :
+            role === "agency_admin" ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400" :
+            role === "manager" || role === "seo_specialist" ? "bg-indigo-50 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-400" :
             "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400"
           )}>
             {role}

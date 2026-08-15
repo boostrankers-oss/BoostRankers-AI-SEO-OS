@@ -13,6 +13,18 @@ export interface User {
   is_verified: boolean;
 }
 
+
+interface AuthTokens {
+  access_token: string;
+  refresh_token: string;
+  token_type?: string;
+}
+
+interface AuthResponse {
+  user: User;
+  tokens: AuthTokens;
+}
+
 interface AuthContextType {
   user: User | null;
   login: (email: string, password: string) => Promise<void>;
@@ -40,7 +52,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const login = async (email: string, password: string) => {
     setLoading(true);
     try {
-      const response = await api.post('/api/auth/login', { email, password });
+      const response = await api.post<AuthResponse>('/api/auth/login', { email, password });
       const { user, tokens } = response;
       localStorage.setItem('access_token', tokens.access_token);
       localStorage.setItem('refresh_token', tokens.refresh_token);
@@ -68,7 +80,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         ...data,
         full_name: `${data.first_name} ${data.last_name}`.trim(),
       };
-      const response = await api.post('/api/auth/signup', payload);
+      const response = await api.post<AuthResponse>('/api/auth/signup', payload);
       const { user, tokens } = response;
       localStorage.setItem('access_token', tokens.access_token);
       localStorage.setItem('refresh_token', tokens.refresh_token);

@@ -2,7 +2,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { MapPin, CheckCircle2, XCircle, Star, Phone, Clock } from "lucide-react";
+import { MapPin, CheckCircle2, XCircle, Star, Clock } from "lucide-react";
 
 const audits = [
   { name: "Google Business Profile", status: true, detail: "Claimed and verified" },

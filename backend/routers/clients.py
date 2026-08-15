@@ -5,9 +5,8 @@ from fastapi import (
     Depends,
     Query,
 )
-
 from sqlalchemy.orm import Session
-from fastapi import APIRouter, Depends, Request, Query, HTTPException, status
+
 from database.database import get_db
 
 from schemas.client import (
@@ -21,36 +20,25 @@ from schemas.client import (
 
 from services import client_service
 
+from api.deps.current_user import get_current_company
+from models.company import Company
+
 router = APIRouter(
     prefix="/clients",
     tags=["Clients"],
 )
 
 # ============================================================
-# Temporary Company Dependency
-# Replace with JWT authentication later
+# Authenticated Company Dependency
 # ============================================================
 
-MOCK_COMPANY_ID = "123e4567-e89b-12d3-a456-426614174000"
-
-
-from fastapi import APIRouter, Depends, Request, Query, HTTPException, status
-# ... other imports ...
-
-# Remove the MOCK_COMPANY_ID constant
-# MOCK_COMPANY_ID = "123e4567-e89b-12d3-a456-426614174000"
-
-def get_company_id(request: Request) -> str:
+def get_company_id(
+    company: Company = Depends(get_current_company),
+) -> str:
     """
-    Extract the authenticated user's company ID from the request state.
+    Resolve the company from the authenticated JWT user.
     """
-    company_id = getattr(request.state, "company_id", None)
-    if not company_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Company not found. Please authenticate.",
-        )
-    return company_id
+    return str(company.id)
 
 
 # ============================================================

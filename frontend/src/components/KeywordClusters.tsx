@@ -3,7 +3,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Network, Sparkles, Search, Loader2 } from "lucide-react";
+import { Network, Sparkles, Search, Loader2, AlertCircle } from "lucide-react";
 import { useClaude } from "@/components/ClaudeProvider";
 
 interface Cluster {
@@ -14,15 +14,32 @@ interface Cluster {
 }
 
 export function KeywordClusters() {
-  const { generateContent } = useClaude();
+  const { isConfigured, isReady, status, generateContent } = useClaude();
   const [seedKeyword, setSeedKeyword] = useState("");
   const [loading, setLoading] = useState(false);
   const [clusters, setClusters] = useState<Cluster[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   const handleGenerate = async () => {
     if (!seedKeyword) return;
+
+    if (!isConfigured) {
+      setError("Claude API key required. Please configure it in Settings.");
+      return;
+    }
+
+    if (!isReady) {
+      setError(
+        status === "billing_required"
+          ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+          : "Claude AI is currently unavailable. Please check Settings."
+      );
+      return;
+    }
+
     setLoading(true);
     setClusters([]);
+    setError(null);
 
     const prompt = `Generate 3 distinct SEO keyword clusters for the seed keyword: "${seedKeyword}".
     Return as a JSON array of objects with the following structure:
@@ -36,14 +53,12 @@ export function KeywordClusters() {
       const cleanedResponse = response.replace(/```json/g, '').replace(/```/g, '').trim();
       const parsed = JSON.parse(cleanedResponse);
       setClusters(parsed);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to generate clusters:", error);
-      // Fallback mock data
-      setClusters([
-        { id: "1", name: "Informational", keywords: [`what is ${seedKeyword}`, `${seedKeyword} guide`, `${seedKeyword} meaning`, `${seedKeyword} examples`], intent: "Informational" },
-        { id: "2", name: "Commercial", keywords: [`best ${seedKeyword}`, `${seedKeyword} tools`, `${seedKeyword} software`, `top ${seedKeyword}`], intent: "Commercial" },
-        { id: "3", name: "Transactional", keywords: [`buy ${seedKeyword}`, `${seedKeyword} pricing`, `${seedKeyword} cost`, `${seedKeyword} services`], intent: "Transactional" },
-      ]);
+      setError(
+        error?.message ||
+          "Failed to generate keyword clusters."
+      );
     } finally {
       setLoading(false);
     }
@@ -61,6 +76,36 @@ export function KeywordClusters() {
         </div>
       </div>
 
+      {!isConfigured ? (
+        <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
+          <CardContent className="p-4 flex items-center gap-3">
+            <AlertCircle className="size-5 text-amber-600" />
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              Claude API Key required. Please configure it in Settings to enable AI keyword clustering.
+            </p>
+          </CardContent>
+        </Card>
+      ) : !isReady && (
+        <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
+          <CardContent className="p-4 flex items-center gap-3">
+            <AlertCircle className="size-5 text-amber-600" />
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              {status === "billing_required"
+                ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+                : "Claude AI is currently unavailable. Please check Settings."}
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {error && (
+        <Card className="border-rose-200 dark:border-rose-900/50 bg-rose-50 dark:bg-rose-900/10">
+          <CardContent className="p-4 flex items-center gap-3">
+            <AlertCircle className="size-5 text-rose-600" />
+            <p className="text-sm text-rose-700 dark:text-rose-400">{error}</p>
+          </CardContent>
+        </Card>
+      )}
       <Card>
         <CardHeader>
           <CardTitle>Generate Clusters</CardTitle>
@@ -74,7 +119,7 @@ export function KeywordClusters() {
               onChange={(e) => setSeedKeyword(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleGenerate()}
             />
-            <Button onClick={handleGenerate} disabled={loading || !seedKeyword}>
+            <Button onClick={handleGenerate} disabled={loading || !isReady || !seedKeyword}>
               {loading ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
               Generate
             </Button>

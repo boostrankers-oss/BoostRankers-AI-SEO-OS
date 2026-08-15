@@ -213,6 +213,30 @@ class Company(BaseModel):
     )
 
     # ------------------------------------------------------------------
+    # Anthropic api key (NEW)
+    # -
+
+    anthropic_api_key_encrypted: Mapped[str | None] = mapped_column(
+    Text,
+    nullable=True,
+)
+
+    anthropic_api_status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="not_configured",
+    )
+
+    anthropic_api_last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+     # ------------------------------------------------------------------
+    # End Anthropic api key (NEW)
+    # -
+
+    # ------------------------------------------------------------------
     # Relationships
     # ------------------------------------------------------------------
 
@@ -241,15 +265,15 @@ class Company(BaseModel):
         back_populates="company",
         cascade="all, delete-orphan",
     )
-    
+
     internal_linking_suggestions = relationship(
     "InternalLinkingSuggestion",
     back_populates="company",
     cascade="all, delete-orphan",
     )
-    
+
     competitors = relationship("Competitor", back_populates="company", cascade="all, delete-orphan")
-    
+
     backlinks = relationship("Backlink", back_populates="company", cascade="all, delete-orphan")
     backlink_opportunities = relationship("BacklinkOpportunity", back_populates="company", cascade="all, delete-orphan")
     outreach_emails = relationship("OutreachEmail", back_populates="company", cascade="all, delete-orphan")

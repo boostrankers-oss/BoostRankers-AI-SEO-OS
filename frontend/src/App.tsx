@@ -1,4 +1,5 @@
 import { useState } from "react";
+
 import { AuthScreen } from "@/components/AuthScreen";
 import { Sidebar } from "@/components/Sidebar";
 import { Dashboard } from "@/components/Dashboard";
@@ -23,7 +24,7 @@ import { ClaudeProvider } from "@/components/ClaudeProvider";
 import { AuditProvider } from "@/context/AuditContext";
 import AdminDashboard from "@/components/AdminDashboard";
 
-type ViewKey = 
+export type ViewKey =
   | "dashboard"
   | "clients"
   | "audit"
@@ -42,6 +43,9 @@ type ViewKey =
   | "google"
   | "settings"
   | "admin";
+
+
+  // existing code continues here...
 
 function MainApp() {
   const { user, logout } = useAuth();

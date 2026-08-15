@@ -5,7 +5,7 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { ShieldCheck, Mail, Lock, User as UserIcon, Building2, ArrowRight, AlertCircle } from "lucide-react";
+import { ShieldCheck, Mail, Lock, Building2, ArrowRight, AlertCircle } from "lucide-react";
 import { useAuth, UserRole } from "@/components/AuthProvider";
 import { toast } from "sonner";
 

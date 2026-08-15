@@ -2,17 +2,32 @@ import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Award, Sparkles, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
+import { Award, Sparkles, Loader2, AlertCircle } from "lucide-react";
 import { useClaude } from "@/components/ClaudeProvider";
 
 export function EEAT() {
-  const { generateContent } = useClaude();
+  const { isConfigured, isReady, status, generateContent } = useClaude();
   const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [analysis, setAnalysis] = useState<string | null>(null);
 
   const handleAnalyze = async () => {
     if (!url) return;
+
+    if (!isConfigured) {
+      setAnalysis("Claude API key required. Please configure it in Settings.");
+      return;
+    }
+
+    if (!isReady) {
+      setAnalysis(
+        status === "billing_required"
+          ? "Anthropic billing is required. Your API key is valid, but your credit balance is too low. Please add credits or upgrade your plan, then try again."
+          : "Claude AI is currently unavailable. Please check Settings."
+      );
+      return;
+    }
+
     setLoading(true);
     setAnalysis(null);
 
@@ -50,6 +65,28 @@ export function EEAT() {
         </div>
       </div>
 
+      {!isConfigured ? (
+        <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
+          <CardContent className="p-4 flex items-center gap-3">
+            <AlertCircle className="size-5 text-amber-600" />
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              Claude API Key required. Please configure it in Settings to enable AI-powered E-E-A-T analysis.
+            </p>
+          </CardContent>
+        </Card>
+      ) : !isReady && (
+        <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
+          <CardContent className="p-4 flex items-center gap-3">
+            <AlertCircle className="size-5 text-amber-600" />
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              {status === "billing_required"
+                ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+                : "Claude AI is currently unavailable. Please check Settings."}
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle>E-E-A-T Analysis</CardTitle>
@@ -63,7 +100,7 @@ export function EEAT() {
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAnalyze()}
             />
-            <Button onClick={handleAnalyze} disabled={loading || !url}>
+            <Button onClick={handleAnalyze} disabled={loading || !isReady || !url}>
               {loading ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
               Analyze
             </Button>

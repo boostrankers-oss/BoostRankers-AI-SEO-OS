@@ -25,7 +25,11 @@ from config import settings
 # JWT Configuration
 # ==========================================================
 
-ALGORITHM = "HS256"
+ALGORITHM = getattr(
+    settings,
+    "ALGORITHM",
+    "HS256",
+)
 
 ACCESS_TOKEN_EXPIRE_MINUTES = getattr(
     settings,
@@ -136,17 +140,20 @@ def decode_token(
     )
     
     
-def decode_access_token(token: str) -> dict:
+def decode_access_token(token: str) -> dict[str, Any]:
     """
-    Decode and validate an access JWT using the same
-    secret/algorithm used by create_access_token().
+    Decode and validate an access JWT using exactly the same
+    secret and algorithm used when the token was created.
     """
 
-    payload = jwt.decode(
-        token,
-        JWT_SECRET_KEY,
-        algorithms=[JWT_ALGORITHM],
-    )
+    try:
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+        )
+    except JWTError:
+        raise
 
     if payload.get("type") != "access":
         raise JWTError("Invalid token type")

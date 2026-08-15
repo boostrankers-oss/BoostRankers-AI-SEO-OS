@@ -1,8 +1,8 @@
-"""initial production schema
+"""initial PostgreSQL baseline
 
-Revision ID: 344fbf582bbd
+Revision ID: db92f7f2e85b
 Revises: 
-Create Date: 2026-08-04 23:56:29.201825
+Create Date: 2026-08-14 17:44:11.317210
 
 """
 
@@ -14,7 +14,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '344fbf582bbd'
+revision: str = 'db92f7f2e85b'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -52,6 +52,7 @@ def upgrade() -> None:
     sa.Column('is_verified', sa.Boolean(), nullable=False),
     sa.Column('max_users', sa.Integer(), nullable=False),
     sa.Column('max_projects', sa.Integer(), nullable=False),
+    sa.Column('ai_credits', sa.Integer(), nullable=False),
     sa.Column('id', sa.String(length=36), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
@@ -109,98 +110,98 @@ def upgrade() -> None:
     op.create_index('idx_role_name', 'roles', ['name'], unique=False)
     op.create_index(op.f('ix_roles_id'), 'roles', ['id'], unique=False)
     op.create_index(op.f('ix_roles_name'), 'roles', ['name'], unique=True)
-    op.create_table('clients',
-    sa.Column('id', sa.String(length=36), nullable=False),
+    op.create_table('backlink_opportunities',
     sa.Column('company_id', sa.String(length=36), nullable=False),
-    sa.Column('business_name', sa.String(length=255), nullable=False),
-    sa.Column('legal_name', sa.String(length=255), nullable=True),
-    sa.Column('website', sa.String(length=500), nullable=False),
-    sa.Column('industry', sa.String(length=150), nullable=True),
-    sa.Column('business_type', sa.String(length=150), nullable=True),
-    sa.Column('company_size', sa.Integer(), nullable=True),
-    sa.Column('logo_url', sa.String(length=500), nullable=True),
-    sa.Column('description', sa.Text(), nullable=True),
-    sa.Column('contact_name', sa.String(length=255), nullable=True),
-    sa.Column('designation', sa.String(length=150), nullable=True),
-    sa.Column('email', sa.String(length=255), nullable=True),
-    sa.Column('secondary_email', sa.String(length=255), nullable=True),
-    sa.Column('phone', sa.String(length=50), nullable=True),
-    sa.Column('whatsapp', sa.String(length=50), nullable=True),
-    sa.Column('address_line1', sa.String(length=255), nullable=True),
-    sa.Column('address_line2', sa.String(length=255), nullable=True),
-    sa.Column('city', sa.String(length=100), nullable=True),
-    sa.Column('state', sa.String(length=100), nullable=True),
-    sa.Column('postal_code', sa.String(length=30), nullable=True),
-    sa.Column('country', sa.String(length=100), nullable=True),
-    sa.Column('timezone', sa.String(length=100), nullable=False),
-    sa.Column('currency', sa.String(length=10), nullable=False),
-    sa.Column('primary_keyword', sa.String(length=255), nullable=True),
-    sa.Column('target_location', sa.String(length=255), nullable=True),
-    sa.Column('target_country', sa.String(length=100), nullable=True),
-    sa.Column('target_language', sa.String(length=20), nullable=False),
-    sa.Column('cms', sa.String(length=100), nullable=True),
-    sa.Column('hosting_provider', sa.String(length=255), nullable=True),
-    sa.Column('google_business_profile', sa.String(length=500), nullable=True),
-    sa.Column('google_search_console_connected', sa.Boolean(), nullable=False),
-    sa.Column('google_analytics_connected', sa.Boolean(), nullable=False),
-    sa.Column('google_tag_manager_connected', sa.Boolean(), nullable=False),
-    sa.Column('bing_webmaster_connected', sa.Boolean(), nullable=False),
-    sa.Column('overall_score', sa.Float(), nullable=False),
-    sa.Column('technical_score', sa.Float(), nullable=False),
-    sa.Column('content_score', sa.Float(), nullable=False),
-    sa.Column('eeat_score', sa.Float(), nullable=False),
-    sa.Column('local_seo_score', sa.Float(), nullable=False),
-    sa.Column('backlinks_score', sa.Float(), nullable=False),
-    sa.Column('keyword_score', sa.Float(), nullable=False),
-    sa.Column('schema_score', sa.Float(), nullable=False),
-    sa.Column('core_web_vitals_score', sa.Float(), nullable=False),
-    sa.Column('ai_search_score', sa.Float(), nullable=False),
-    sa.Column('total_keywords', sa.Integer(), nullable=False),
-    sa.Column('ranked_keywords', sa.Integer(), nullable=False),
-    sa.Column('total_backlinks', sa.Integer(), nullable=False),
-    sa.Column('referring_domains', sa.Integer(), nullable=False),
-    sa.Column('total_audits', sa.Integer(), nullable=False),
-    sa.Column('critical_issues', sa.Integer(), nullable=False),
-    sa.Column('warnings', sa.Integer(), nullable=False),
-    sa.Column('passed_checks', sa.Integer(), nullable=False),
+    sa.Column('domain', sa.String(length=255), nullable=False),
+    sa.Column('opportunity_type', sa.String(length=50), nullable=False),
+    sa.Column('domain_authority', sa.Integer(), nullable=False),
+    sa.Column('relevance', sa.String(length=50), nullable=False),
     sa.Column('status', sa.String(length=50), nullable=False),
-    sa.Column('priority', sa.String(length=50), nullable=False),
-    sa.Column('subscription_plan', sa.String(length=50), nullable=False),
-    sa.Column('billing_cycle', sa.String(length=20), nullable=False),
-    sa.Column('is_active', sa.Boolean(), nullable=False),
-    sa.Column('is_archived', sa.Boolean(), nullable=False),
-    sa.Column('first_audit_at', sa.DateTime(timezone=True), nullable=True),
-    sa.Column('last_audit_at', sa.DateTime(timezone=True), nullable=True),
-    sa.Column('next_audit_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('notes', sa.Text(), nullable=True),
-    sa.Column('tags', sa.Text(), nullable=True),
-    sa.Column('source', sa.String(length=100), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('id', sa.String(length=36), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('created_by', sa.String(length=36), nullable=True),
     sa.Column('updated_by', sa.String(length=36), nullable=True),
     sa.ForeignKeyConstraint(['company_id'], ['companies.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
-    op.create_index('idx_client_active', 'clients', ['is_active'], unique=False)
-    op.create_index('idx_client_archived', 'clients', ['is_archived'], unique=False)
-    op.create_index('idx_client_business', 'clients', ['business_name'], unique=False)
-    op.create_index('idx_client_city', 'clients', ['city'], unique=False)
-    op.create_index('idx_client_company', 'clients', ['company_id'], unique=False)
-    op.create_index('idx_client_country', 'clients', ['country'], unique=False)
-    op.create_index('idx_client_email', 'clients', ['email'], unique=False)
-    op.create_index('idx_client_industry', 'clients', ['industry'], unique=False)
-    op.create_index('idx_client_keyword', 'clients', ['primary_keyword'], unique=False)
-    op.create_index('idx_client_last_audit', 'clients', ['last_audit_at'], unique=False)
-    op.create_index('idx_client_score', 'clients', ['overall_score'], unique=False)
-    op.create_index('idx_client_status', 'clients', ['status'], unique=False)
-    op.create_index('idx_client_website', 'clients', ['website'], unique=False)
+    op.create_index(op.f('ix_backlink_opportunities_company_id'), 'backlink_opportunities', ['company_id'], unique=False)
+    op.create_index(op.f('ix_backlink_opportunities_id'), 'backlink_opportunities', ['id'], unique=False)
+    op.create_table('backlinks',
+    sa.Column('company_id', sa.String(length=36), nullable=False),
+    sa.Column('source_url', sa.String(length=500), nullable=False),
+    sa.Column('target_url', sa.String(length=500), nullable=False),
+    sa.Column('anchor_text', sa.String(length=255), nullable=False),
+    sa.Column('link_type', sa.String(length=50), nullable=False),
+    sa.Column('domain_authority', sa.Integer(), nullable=False),
+    sa.Column('spam_score', sa.Integer(), nullable=False),
+    sa.Column('status', sa.String(length=50), nullable=False),
+    sa.Column('ai_analysis', sa.Text(), nullable=True),
+    sa.Column('is_revoked', sa.Boolean(), nullable=False),
+    sa.Column('detected_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('id', sa.String(length=36), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_by', sa.String(length=36), nullable=True),
+    sa.Column('updated_by', sa.String(length=36), nullable=True),
+    sa.ForeignKeyConstraint(['company_id'], ['companies.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_backlinks_company_id'), 'backlinks', ['company_id'], unique=False)
+    op.create_index(op.f('ix_backlinks_id'), 'backlinks', ['id'], unique=False)
+    op.create_table('clients',
+    sa.Column('id', sa.String(length=36), nullable=False),
+    sa.Column('company_id', sa.String(length=36), nullable=False),
+    sa.Column('business_name', sa.String(length=255), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_by', sa.String(length=36), nullable=True),
+    sa.Column('updated_by', sa.String(length=36), nullable=True),
+    sa.ForeignKeyConstraint(['company_id'], ['companies.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
     op.create_index(op.f('ix_clients_business_name'), 'clients', ['business_name'], unique=False)
     op.create_index(op.f('ix_clients_company_id'), 'clients', ['company_id'], unique=False)
-    op.create_index(op.f('ix_clients_email'), 'clients', ['email'], unique=False)
-    op.create_index(op.f('ix_clients_industry'), 'clients', ['industry'], unique=False)
-    op.create_index(op.f('ix_clients_website'), 'clients', ['website'], unique=False)
+    op.create_table('competitors',
+    sa.Column('company_id', sa.String(length=36), nullable=False),
+    sa.Column('domain', sa.String(length=255), nullable=False),
+    sa.Column('traffic', sa.String(length=50), nullable=True),
+    sa.Column('keywords', sa.Integer(), nullable=False),
+    sa.Column('backlinks', sa.Integer(), nullable=False),
+    sa.Column('da', sa.Integer(), nullable=False),
+    sa.Column('gap', sa.Integer(), nullable=False),
+    sa.Column('analysis', sa.Text(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('id', sa.String(length=36), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_by', sa.String(length=36), nullable=True),
+    sa.Column('updated_by', sa.String(length=36), nullable=True),
+    sa.ForeignKeyConstraint(['company_id'], ['companies.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_competitors_company_id'), 'competitors', ['company_id'], unique=False)
+    op.create_index(op.f('ix_competitors_id'), 'competitors', ['id'], unique=False)
+    op.create_table('internal_linking_suggestions',
+    sa.Column('company_id', sa.String(length=36), nullable=False),
+    sa.Column('urls', sa.JSON(), nullable=False),
+    sa.Column('suggestions', sa.JSON(), nullable=False),
+    sa.Column('analysis', sa.Text(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('id', sa.String(length=36), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_by', sa.String(length=36), nullable=True),
+    sa.Column('updated_by', sa.String(length=36), nullable=True),
+    sa.ForeignKeyConstraint(['company_id'], ['companies.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_internal_linking_suggestions_company_id'), 'internal_linking_suggestions', ['company_id'], unique=False)
+    op.create_index(op.f('ix_internal_linking_suggestions_id'), 'internal_linking_suggestions', ['id'], unique=False)
     op.create_table('role_permissions',
     sa.Column('role_id', sa.String(length=36), nullable=False),
     sa.Column('permission_id', sa.String(length=36), nullable=False),
@@ -976,6 +977,25 @@ def upgrade() -> None:
     op.create_index(op.f('ix_audits_status'), 'audits', ['status'], unique=False)
     op.create_index(op.f('ix_audits_user_id'), 'audits', ['user_id'], unique=False)
     op.create_index(op.f('ix_audits_website'), 'audits', ['website'], unique=False)
+    op.create_table('outreach_emails',
+    sa.Column('company_id', sa.String(length=36), nullable=False),
+    sa.Column('opportunity_id', sa.String(length=36), nullable=False),
+    sa.Column('subject', sa.String(length=255), nullable=False),
+    sa.Column('body', sa.Text(), nullable=False),
+    sa.Column('sent_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('status', sa.String(length=50), nullable=False),
+    sa.Column('id', sa.String(length=36), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_by', sa.String(length=36), nullable=True),
+    sa.Column('updated_by', sa.String(length=36), nullable=True),
+    sa.ForeignKeyConstraint(['company_id'], ['companies.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['opportunity_id'], ['backlink_opportunities.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_outreach_emails_company_id'), 'outreach_emails', ['company_id'], unique=False)
+    op.create_index(op.f('ix_outreach_emails_id'), 'outreach_emails', ['id'], unique=False)
     op.create_table('refresh_tokens',
     sa.Column('user_id', sa.String(length=36), nullable=False),
     sa.Column('token', sa.Text(), nullable=False),
@@ -1010,11 +1030,41 @@ def upgrade() -> None:
     op.create_index(op.f('ix_refresh_tokens_id'), 'refresh_tokens', ['id'], unique=False)
     op.create_index(op.f('ix_refresh_tokens_token_family'), 'refresh_tokens', ['token_family'], unique=False)
     op.create_index(op.f('ix_refresh_tokens_user_id'), 'refresh_tokens', ['user_id'], unique=False)
+    op.create_table('reports',
+    sa.Column('company_id', sa.String(length=36), nullable=True),
+    sa.Column('client_id', sa.String(length=36), nullable=True),
+    sa.Column('audit_id', sa.String(length=36), nullable=True),
+    sa.Column('title', sa.String(length=255), nullable=False),
+    sa.Column('content', sa.Text(), nullable=True),
+    sa.Column('summary', sa.Text(), nullable=True),
+    sa.Column('score', sa.Float(), nullable=False),
+    sa.Column('format', sa.String(length=20), nullable=False),
+    sa.Column('generated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('id', sa.String(length=36), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_by', sa.String(length=36), nullable=True),
+    sa.Column('updated_by', sa.String(length=36), nullable=True),
+    sa.ForeignKeyConstraint(['audit_id'], ['audits.id'], ondelete='SET NULL'),
+    sa.ForeignKeyConstraint(['client_id'], ['clients.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['company_id'], ['companies.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_reports_audit_id'), 'reports', ['audit_id'], unique=False)
+    op.create_index(op.f('ix_reports_client_id'), 'reports', ['client_id'], unique=False)
+    op.create_index(op.f('ix_reports_company_id'), 'reports', ['company_id'], unique=False)
+    op.create_index(op.f('ix_reports_id'), 'reports', ['id'], unique=False)
     # ### end Alembic commands ###
 
 
 def downgrade() -> None:
 # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_index(op.f('ix_reports_id'), table_name='reports')
+    op.drop_index(op.f('ix_reports_company_id'), table_name='reports')
+    op.drop_index(op.f('ix_reports_client_id'), table_name='reports')
+    op.drop_index(op.f('ix_reports_audit_id'), table_name='reports')
+    op.drop_table('reports')
     op.drop_index(op.f('ix_refresh_tokens_user_id'), table_name='refresh_tokens')
     op.drop_index(op.f('ix_refresh_tokens_token_family'), table_name='refresh_tokens')
     op.drop_index(op.f('ix_refresh_tokens_id'), table_name='refresh_tokens')
@@ -1023,6 +1073,9 @@ def downgrade() -> None:
     op.drop_index('idx_refresh_revoked', table_name='refresh_tokens')
     op.drop_index('idx_refresh_expiry', table_name='refresh_tokens')
     op.drop_table('refresh_tokens')
+    op.drop_index(op.f('ix_outreach_emails_id'), table_name='outreach_emails')
+    op.drop_index(op.f('ix_outreach_emails_company_id'), table_name='outreach_emails')
+    op.drop_table('outreach_emails')
     op.drop_index(op.f('ix_audits_website'), table_name='audits')
     op.drop_index(op.f('ix_audits_user_id'), table_name='audits')
     op.drop_index(op.f('ix_audits_status'), table_name='audits')
@@ -1056,25 +1109,21 @@ def downgrade() -> None:
     op.drop_index('idx_user_active', table_name='users')
     op.drop_table('users')
     op.drop_table('role_permissions')
-    op.drop_index(op.f('ix_clients_website'), table_name='clients')
-    op.drop_index(op.f('ix_clients_industry'), table_name='clients')
-    op.drop_index(op.f('ix_clients_email'), table_name='clients')
+    op.drop_index(op.f('ix_internal_linking_suggestions_id'), table_name='internal_linking_suggestions')
+    op.drop_index(op.f('ix_internal_linking_suggestions_company_id'), table_name='internal_linking_suggestions')
+    op.drop_table('internal_linking_suggestions')
+    op.drop_index(op.f('ix_competitors_id'), table_name='competitors')
+    op.drop_index(op.f('ix_competitors_company_id'), table_name='competitors')
+    op.drop_table('competitors')
     op.drop_index(op.f('ix_clients_company_id'), table_name='clients')
     op.drop_index(op.f('ix_clients_business_name'), table_name='clients')
-    op.drop_index('idx_client_website', table_name='clients')
-    op.drop_index('idx_client_status', table_name='clients')
-    op.drop_index('idx_client_score', table_name='clients')
-    op.drop_index('idx_client_last_audit', table_name='clients')
-    op.drop_index('idx_client_keyword', table_name='clients')
-    op.drop_index('idx_client_industry', table_name='clients')
-    op.drop_index('idx_client_email', table_name='clients')
-    op.drop_index('idx_client_country', table_name='clients')
-    op.drop_index('idx_client_company', table_name='clients')
-    op.drop_index('idx_client_city', table_name='clients')
-    op.drop_index('idx_client_business', table_name='clients')
-    op.drop_index('idx_client_archived', table_name='clients')
-    op.drop_index('idx_client_active', table_name='clients')
     op.drop_table('clients')
+    op.drop_index(op.f('ix_backlinks_id'), table_name='backlinks')
+    op.drop_index(op.f('ix_backlinks_company_id'), table_name='backlinks')
+    op.drop_table('backlinks')
+    op.drop_index(op.f('ix_backlink_opportunities_id'), table_name='backlink_opportunities')
+    op.drop_index(op.f('ix_backlink_opportunities_company_id'), table_name='backlink_opportunities')
+    op.drop_table('backlink_opportunities')
     op.drop_index(op.f('ix_roles_name'), table_name='roles')
     op.drop_index(op.f('ix_roles_id'), table_name='roles')
     op.drop_index('idx_role_name', table_name='roles')

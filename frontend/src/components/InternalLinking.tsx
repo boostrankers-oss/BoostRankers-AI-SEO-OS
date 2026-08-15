@@ -32,14 +32,21 @@ interface SuggestionRecord {
   created_at: string;
 }
 
+
+interface AnalyzeResponse {
+  id: string;
+  urls: string[];
+  suggestions: Suggestion[];
+  analysis: string;
+  created_at: string;
+}
 export function InternalLinking() {
-  const { isConfigured } = useClaude();
+  const { isConfigured, isReady, status } = useClaude();
   const [urls, setUrls] = useState("");
   const [loading, setLoading] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [analysis, setAnalysis] = useState("");
   const [history, setHistory] = useState<SuggestionRecord[]>([]);
-  const [loadingHistory, setLoadingHistory] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   // Budget dialog state
@@ -54,12 +61,11 @@ export function InternalLinking() {
 
   const fetchHistory = async () => {
     try {
-      const data = await api.get("/api/internal-linking");
+      const data = await api.get<SuggestionRecord[]>("/api/internal-linking/");
       setHistory(data);
     } catch (err) {
       console.error("Failed to fetch history:", err);
     } finally {
-      setLoadingHistory(false);
     }
   };
 
@@ -76,13 +82,25 @@ export function InternalLinking() {
       return;
     }
 
+    if (!isReady) {
+      const message =
+        status === "billing_required"
+          ? "Anthropic billing is required. Your API key is valid, but your credit balance is too low. Please add credits or upgrade your plan, then try again."
+          : status === "invalid_api_key"
+            ? "Anthropic API key is invalid. Please update it in Settings."
+            : "Claude AI is currently unavailable. Please check Settings.";
+      toast.error(message);
+      setError(message);
+      return;
+    }
+
     setLoading(true);
     setError(null);
     setSuggestions([]);
     setAnalysis("");
 
     try {
-      const data = await api.post("/api/internal-linking/analyze", {
+      const data = await api.post<AnalyzeResponse>("/api/internal-linking/analyze", {
         urls: urlList,
       });
       setSuggestions(data.suggestions);
@@ -153,12 +171,23 @@ export function InternalLinking() {
         </div>
       </div>
 
-      {!isConfigured && (
+      {!isConfigured ? (
         <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
           <CardContent className="p-4 flex items-center gap-3">
             <AlertCircle className="size-5 text-amber-600" />
             <p className="text-sm text-amber-700 dark:text-amber-400">
               Claude API Key required. Please configure it in Settings to enable AI-powered internal linking.
+            </p>
+          </CardContent>
+        </Card>
+      ) : !isReady && (
+        <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
+          <CardContent className="p-4 flex items-center gap-3">
+            {status === "billing_required" ? <CreditCard className="size-5 text-amber-600" /> : <AlertCircle className="size-5 text-amber-600" />}
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              {status === "billing_required"
+                ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+                : "Claude AI is currently unavailable. Please check Settings."}
             </p>
           </CardContent>
         </Card>
@@ -184,7 +213,7 @@ export function InternalLinking() {
             </div>
             <Button
               onClick={handleAnalyze}
-              disabled={loading || !isConfigured || !urls.trim()}
+              disabled={loading || !isReady || !urls.trim()}
               className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20"
             >
               {loading ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}

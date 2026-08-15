@@ -9,7 +9,7 @@ import { useClaude } from "@/components/ClaudeProvider";
 import { toast } from "sonner";
 
 export function SchemaGenerator() {
-  const { isConfigured, generateContent } = useClaude();
+  const { isConfigured, isReady, status, generateContent } = useClaude();
   const [type, setType] = useState("Article");
   const [headline, setHeadline] = useState("Boost Rankers AI SEO OS Launches");
   const [author, setAuthor] = useState("Agency Admin");
@@ -20,6 +20,25 @@ export function SchemaGenerator() {
   const [error, setError] = useState<string | null>(null);
 
   const generateSchema = async () => {
+    if (!isConfigured) {
+      const message = "Claude API key required. Please configure it in Settings.";
+      setError(message);
+      toast.error(message);
+      return;
+    }
+
+    if (!isReady) {
+      const message =
+        status === "billing_required"
+          ? "Anthropic billing is required. Your API key is valid, but your credit balance is too low. Please add credits or upgrade your plan, then try again."
+          : status === "invalid_api_key"
+            ? "Anthropic API key is invalid. Please update it in Settings."
+            : "Claude AI is currently unavailable. Please check Settings.";
+      setError(message);
+      toast.error(message);
+      return;
+    }
+
     setLoading(true);
     setError(null);
     setSchema(null);
@@ -71,7 +90,7 @@ export function SchemaGenerator() {
           <CardContent className="space-y-4">
             <div className="space-y-2">
               <Label>Schema Type</Label>
-              <Select value={type} onValueChange={setType}>
+              <Select value={type} onValueChange={(value) => setType(value ?? "Article")}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="Article">Article</SelectItem>
@@ -85,13 +104,23 @@ export function SchemaGenerator() {
             <div className="space-y-2"><Label htmlFor="headline">Headline</Label><Input id="headline" value={headline} onChange={(e) => setHeadline(e.target.value)} /></div>
             <div className="space-y-2"><Label htmlFor="author">Author</Label><Input id="author" value={author} onChange={(e) => setAuthor(e.target.value)} /></div>
             <div className="space-y-2"><Label htmlFor="date">Date Published</Label><Input id="date" type="date" value={date} onChange={(e) => setDate(e.target.value)} /></div>
-            <Button onClick={generateSchema} disabled={loading || !isConfigured} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white">
+            {error && (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>
+            )}
+            <Button onClick={generateSchema} disabled={loading || !isReady} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white">
               {loading ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
               {loading ? "Generating..." : "Generate Schema"}
             </Button>
-            {!isConfigured && (
+            {!isConfigured ? (
               <div className="flex items-center gap-2 p-3 rounded-lg text-xs text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-500/10">
                 <AlertCircle className="size-4" /> Configure Claude API key in Settings to use AI features.
+              </div>
+            ) : !isReady && (
+              <div className="flex items-center gap-2 p-3 rounded-lg text-xs text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-500/10">
+                <AlertCircle className="size-4" />
+                {status === "billing_required"
+                  ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
+                  : "Claude AI is currently unavailable. Please check Settings."}
               </div>
             )}
           </CardContent>
