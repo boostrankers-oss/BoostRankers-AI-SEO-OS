@@ -38,6 +38,7 @@ from routers import (
 from api.v1.auth import router as auth_router
 from routers.ai import router as ai_router
 from routers.ai_settings import router as ai_settings_router
+from routers.google_integration import router as google_integration
 
 # ============================================================
 # Validate required environment
@@ -170,6 +171,12 @@ app.include_router(
     ai_router,
     prefix="/api",
     tags=["AI"],
+)
+
+app.include_router(
+    google_integration,
+    prefix="/api",
+    tags=["Google Integration"],
 )
 
 # ============================================================

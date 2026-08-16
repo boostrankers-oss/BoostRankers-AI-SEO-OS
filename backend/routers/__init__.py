@@ -9,3 +9,4 @@ from .dashboard import router as dashboard
 from .backlinks import router as backlinks
 from .ai import router as ai
 from .ai_settings import router as ai_settings
+from .google_integration import router as google_integration
