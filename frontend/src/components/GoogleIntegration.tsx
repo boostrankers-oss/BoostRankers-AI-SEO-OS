@@ -376,24 +376,83 @@ export function GoogleIntegration() {
                   </Button>
                 </div>
 
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Search Console property</label>
-                  <select
-                    value={gscProperty}
-                    onChange={(event) => void selectProperty("search_console", event.target.value)}
-                    className="w-full h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-                  >
-                    <option value="">Select a property</option>
-                    {gscProperties.map((property) => (
-                      <option key={property.id} value={property.id}>
-                        {property.name}
-                      </option>
-                    ))}
-                  </select>
-                  {gscProperties.length === 0 && (
-                    <p className="text-xs text-slate-500">No Search Console properties are available to this Google account.</p>
-                  )}
-                </div>
+                {selectedProperty ? (
+				  <div className="space-y-3">
+					<div className="flex items-center justify-between">
+					  <label className="text-sm font-semibold">
+						Search Console property
+					  </label>
+
+					  <button
+						type="button"
+						onClick={() => setChangingProperty(true)}
+						className="text-xs text-emerald-400 hover:text-emerald-300"
+					  >
+						Change Property
+					  </button>
+					</div>
+
+					<div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-3">
+					  <div className="flex items-center gap-2 text-sm font-medium">
+						<CheckCircle2 className="size-4 text-emerald-400" />
+						Selected property
+					  </div>
+
+					  <p className="mt-1 break-all text-sm text-slate-300">
+						{selectedProperty}
+					  </p>
+					</div>
+
+					{changingProperty && (
+					  <div className="space-y-2">
+						<select
+						  value={selectedProperty}
+						  onChange={(e) => {
+							handleSelectProperty(e.target.value);
+							setChangingProperty(false);
+						  }}
+						  className="w-full"
+						>
+						  {searchConsoleProperties.map((property) => (
+							<option key={property.id} value={property.id}>
+							  {property.name}
+							</option>
+						  ))}
+						</select>
+
+						<button
+						  type="button"
+						  onClick={() => setChangingProperty(false)}
+						  className="text-xs text-slate-400 hover:text-slate-300"
+						>
+						  Cancel
+						</button>
+					  </div>
+					)}
+				  </div>
+				) : (
+				  <div className="space-y-2">
+					<label className="text-sm font-semibold">
+					  Search Console property
+					</label>
+
+					<select
+					  value=""
+					  onChange={(e) => handleSelectProperty(e.target.value)}
+					  className="w-full"
+					>
+					  <option value="" disabled>
+						Select a property
+					  </option>
+
+					  {searchConsoleProperties.map((property) => (
+						<option key={property.id} value={property.id}>
+						  {property.name}
+						</option>
+					  ))}
+					</select>
+				  </div>
+				)}
 
                 <Button
                   onClick={() => void loadSearchConsoleData()}
