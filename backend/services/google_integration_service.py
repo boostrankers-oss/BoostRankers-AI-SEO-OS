@@ -4,15 +4,31 @@ import base64
 import hashlib
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import HTTPException, status
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
 from models.google_integration import GoogleIntegration
+
+
+# ============================================================
+# Environment
+# ============================================================
+
+# Local development:
+# Load the project-root .env explicitly.
+#
+# Production:
+# Render provides environment variables directly, so this call
+# simply leaves those values intact.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
