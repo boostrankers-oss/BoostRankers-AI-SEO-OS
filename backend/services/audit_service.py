@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
+from services.secret_service import decrypt_secret
 
 from anthropic import (
     APIConnectionError,
@@ -85,17 +86,37 @@ class AuditService:
         """
         Resolve the Anthropic API key.
 
-        Company-specific key has priority over the global key.
+        The company-specific encrypted key is authoritative when configured.
+        The global environment key is used only when the company has not
+        configured its own Anthropic credential.
         """
-        company_key = getattr(company, "anthropic_api_key", None)
 
-        if company_key:
-            company_key = str(company_key).strip()
+        encrypted_key = getattr(
+            company,
+            "anthropic_api_key_encrypted",
+            None,
+        )
 
-        if company_key:
-            return company_key
+        if encrypted_key:
+            try:
+                company_key = decrypt_secret(
+                    str(encrypted_key).strip()
+                ).strip()
 
-        global_key = getattr(settings, "ANTHROPIC_API_KEY", None)
+                if company_key:
+                    return company_key
+
+            except (ValueError, TypeError):
+                logger.exception(
+                    "Failed to decrypt company Anthropic API key."
+                )
+                return None
+
+        global_key = getattr(
+            settings,
+            "ANTHROPIC_API_KEY",
+            None,
+        )
 
         if global_key:
             global_key = str(global_key).strip()
@@ -105,18 +126,17 @@ class AuditService:
     @staticmethod
     def _get_model_name() -> str:
         """
-        Prefer explicit configuration.
+        Resolve the Anthropic model.
 
-        Set ANTHROPIC_MODEL in .env/settings so the deployed
-        application does not depend on a hard-coded model.
+        Prefer the explicitly configured model.
+        Fall back to the currently supported Claude Sonnet 4.6 model.
         """
         configured = getattr(settings, "ANTHROPIC_MODEL", None)
 
         if configured:
             return str(configured).strip()
 
-        # Fallback retained for existing installations.
-        return "claude-sonnet-4-20250514"
+        return "claude-sonnet-4-6"
 
     # =========================================================
     # Provider error classification

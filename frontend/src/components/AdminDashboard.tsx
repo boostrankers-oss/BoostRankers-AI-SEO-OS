@@ -82,21 +82,6 @@ interface PlatformStats {
    Helpers
    ============================================================ */
 
-function formatDate(value?: string | null): string {
-  if (!value) return "—";
-
-  const date = new Date(value);
-
-  if (Number.isNaN(date.getTime())) {
-    return "—";
-  }
-
-  return date.toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
-}
 
 function getUserDisplayName(user: User): string {
   const name = `${user.first_name || ""} ${user.last_name || ""}`.trim();
