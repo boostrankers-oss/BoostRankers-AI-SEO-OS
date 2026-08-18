@@ -259,6 +259,45 @@ class ApiClient {
     return (await response.text()) as T;
   }
 
+  async download(
+    url: string,
+    options: Omit<RequestOptions, "method" | "body"> = {}
+  ): Promise<Blob> {
+    const {
+      auth = true,
+      headers,
+      ...rest
+    } = options;
+
+    const requestHeaders =
+      this.buildHeaders(
+        headers,
+        auth,
+        false
+      );
+
+    const response = await fetch(
+      `${this.baseUrl}${url}`,
+      {
+        ...rest,
+        method: "GET",
+        headers: requestHeaders,
+      }
+    );
+
+    if (!response.ok) {
+      const errorData =
+        await this.parseError(response);
+
+      throw new ApiError(
+        response.status,
+        errorData
+      );
+    }
+
+    return response.blob();
+  }
+
   stream(url: string): EventSource {
     return new EventSource(
       `${this.baseUrl}${url}`

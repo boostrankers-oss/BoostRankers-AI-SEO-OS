@@ -704,8 +704,36 @@ class AuditService:
                     # Parse structured result
                     # ---------------------------------------------
 
+                    # ---------------------------------------------
+# Parse structured Claude result
+# ---------------------------------------------
+
                     try:
-                        parsed = json.loads(content)
+                        clean_content = content.strip()
+
+                        # Remove Markdown code fences when Claude returns
+                        # ```json ... ``` instead of raw JSON.
+                        if clean_content.startswith("```"):
+                            lines = clean_content.splitlines()
+
+                            if lines:
+                                lines = lines[1:]
+
+                            if lines and lines[-1].strip() == "```":
+                                lines = lines[:-1]
+
+                            clean_content = "\n".join(lines).strip()
+
+                        # Remove a leading "json" language marker if present.
+                        if clean_content.lower().startswith("json\n"):
+                            clean_content = clean_content[5:].strip()
+
+                        parsed = json.loads(clean_content)
+
+                        if not isinstance(parsed, dict):
+                            raise ValueError(
+                                "Claude response JSON must be an object."
+                            )
 
                         findings = parsed.get(
                             "findings",
@@ -718,7 +746,9 @@ class AuditService:
                         )
 
                         if not isinstance(findings, list):
-                            findings = [str(findings)]
+                            findings = [
+                                str(findings)
+                            ]
 
                         findings = [
                             str(item).strip()
@@ -732,17 +762,26 @@ class AuditService:
                             ]
 
                         score = int(score)
-                        score = max(0, min(100, score))
+                        score = max(
+                            0,
+                            min(100, score),
+                        )
 
                     except (
                         json.JSONDecodeError,
                         TypeError,
                         ValueError,
                     ):
-                        # Graceful fallback when Claude returns text.
+                        logger.warning(
+                            "Could not parse structured Claude result "
+                            "for agent %s. Raw response retained.",
+                            agent["name"],
+                        )
+
                         findings = [
                             content[:2000]
                         ]
+
                         score = 50
 
                     # ---------------------------------------------
@@ -953,6 +992,44 @@ class AuditService:
             audit.status = AuditStatus.COMPLETED
             audit.completed_at = datetime.now(timezone.utc)
             audit.progress_percentage = 100
+            # -------------------------------------------------
+            # Persist agent scores into the Audit model
+            # -------------------------------------------------
+
+            agent_score_fields = {
+                "Technical SEO Agent": "technical_score",
+                "Content SEO Agent": "content_score",
+                "Local SEO Agent": "local_seo_score",
+                "Schema Agent": "schema_score",
+                "EEAT Agent": "eeat_score",
+                "Backlink Agent": "backlink_score",
+                "AI Search Agent": "ai_search_score",
+            }
+
+            for result in results:
+                agent_name = str(result.get("agent", "")).strip()
+                score = result.get("score")
+
+                field_name = agent_score_fields.get(agent_name)
+
+                if field_name is None:
+                    continue
+
+                try:
+                    numeric_score = float(score)
+                except (TypeError, ValueError):
+                    continue
+
+                numeric_score = max(
+                    0.0,
+                    min(100.0, numeric_score),
+                )
+
+                setattr(
+                    audit,
+                    field_name,
+                    numeric_score,
+                )
             audit.overall_score = average_score
             audit.current_stage = "Completed"
             audit.current_task = "Audit completed successfully"
@@ -990,7 +1067,8 @@ class AuditService:
                 report_service = ReportService(self.db)
 
                 report_service.generate_report_from_audit(
-                    audit
+                    audit,
+                    results,
                 )
 
             except Exception as exc:
