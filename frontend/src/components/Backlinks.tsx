@@ -37,7 +37,6 @@ import {
   Mail,
   Trash2,
   Search,
-  Filter,
   Download,
   Plus,
   AlertCircle,
@@ -59,7 +58,6 @@ interface Backlink {
   status: string;
   ai_analysis: string;
   detected_at: string;
-  target_url?: string;
 }
 
 interface Opportunity {
@@ -94,6 +92,20 @@ interface Statistics {
   link_types: { [key: string]: number };
 }
 
+interface PublishBacklinkResponse {
+  verified: boolean;
+  backlink?: Backlink;
+  message: string;
+}
+
+interface OutreachGenerateResponse {
+  email: OutreachEmail;
+}
+
+interface OutreachSendResponse {
+  message: string;
+}
+
 const COLORS = ["#10b981", "#6366f1", "#f59e0b", "#8b5cf6"];
 
 export function Backlinks() {
@@ -104,7 +116,6 @@ export function Backlinks() {
   const [outreachEmails, setOutreachEmails] = useState<OutreachEmail[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
   // UI state
   const [activeTab, setActiveTab] = useState<
     "dashboard" | "analysis" | "opportunities" | "outreach"
@@ -149,25 +160,43 @@ export function Backlinks() {
 
   const fetchAllData = async () => {
     setLoading(true);
-    setError(null);
     try {
       // Use Promise.allSettled to avoid one failure breaking everything
       const results = await Promise.allSettled([
-        api.get("/api/backlinks/statistics"),
-        api.get("/api/backlinks"),
-        api.get("/api/backlinks/opportunities"),
-        api.get("/api/backlinks/outreach"),
+        api.get<Statistics>("/api/backlinks/statistics"),
+        api.get<Backlink[]>("/api/backlinks"),
+        api.get<Opportunity[]>("/api/backlinks/opportunities"),
+        api.get<OutreachEmail[]>("/api/backlinks/outreach"),
       ]);
 
-      // Extract data or fallback to empty/default
-      const [statsData, backlinksData, oppsData, emailsData] = results.map(r =>
-        r.status === "fulfilled" ? r.value : null
-      );
+      // Extract each response with its declared type.
+      const getSettledValue = <T,>(
+        result: PromiseSettledResult<T>,
+      ): T | null =>
+        result.status === "fulfilled" ? result.value : null;
 
-      setStats(statsData || { total: 0, referring_domains: 0, domain_authority: 0, toxic_links: 0, new_this_month: 0, new_domains: 0, da_change: 0, toxic_fixed: 0, growth_history: [], link_types: {} });
-      setBacklinks(Array.isArray(backlinksData) ? backlinksData : []);
-      setOpportunities(Array.isArray(oppsData) ? oppsData : []);
-      setOutreachEmails(Array.isArray(emailsData) ? emailsData : []);
+      const statsData = getSettledValue(results[0]);
+      const backlinksData = getSettledValue(results[1]);
+      const oppsData = getSettledValue(results[2]);
+      const emailsData = getSettledValue(results[3]);
+
+      setStats(
+        statsData || {
+          total: 0,
+          referring_domains: 0,
+          domain_authority: 0,
+          toxic_links: 0,
+          new_this_month: 0,
+          new_domains: 0,
+          da_change: 0,
+          toxic_fixed: 0,
+          growth_history: [],
+          link_types: {},
+        },
+      );
+      setBacklinks(backlinksData || []);
+      setOpportunities(oppsData || []);
+      setOutreachEmails(emailsData || []);
     } catch (err) {
       console.error("Failed to fetch backlink data:", err);
        setError("Could not load backlink data. Please try again.");
@@ -180,7 +209,7 @@ export function Backlinks() {
     setCreatingBacklink(true);
     setCreateResult(null);
     try {
-      const data = await api.post(
+      const data = await api.post<PublishBacklinkResponse>(
         "/api/backlinks/publish/wordpress",
         wordpressBacklink,
       );
@@ -188,7 +217,7 @@ export function Backlinks() {
       if (data.verified && data.backlink) {
         toast.success("Backlink published and verified.");
         setCreateResult(data.message);
-        setBacklinks((current) => [data.backlink, ...current]);
+        setBacklinks((current) => [data.backlink!, ...current]);
       } else {
         toast.success("WordPress content published; verification is still pending.");
         setCreateResult(data.message || "Published, but not yet verified.");
@@ -216,7 +245,7 @@ export function Backlinks() {
 
   const handleAddBacklink = async () => {
     try {
-      const data = await api.post("/api/backlinks", newBacklink);
+      const data = await api.post<Backlink>("/api/backlinks", newBacklink);
       setBacklinks([data, ...backlinks]);
       setIsAddOpen(false);
       setNewBacklink({ source_url: "", target_url: "", anchor_text: "", link_type: "Dofollow" });
@@ -244,7 +273,7 @@ export function Backlinks() {
   const handleAnalyze = async (id: string) => {
     setAnalyzingId(id);
     try {
-      const data = await api.post(`/api/backlinks/${id}/analyze`);
+      const data = await api.post<{ analysis: string }>(`/api/backlinks/${id}/analyze`);
       setBacklinks(
         backlinks.map((b) =>
           b.id === id ? { ...b, ai_analysis: data.analysis } : b
@@ -265,7 +294,7 @@ export function Backlinks() {
 
   const handleGenerateOpportunities = async () => {
     try {
-      const data = await api.post("/api/backlinks/opportunities/generate");
+      const data = await api.post<Opportunity[]>("/api/backlinks/opportunities/generate");
       setOpportunities([...data, ...opportunities]);
       toast.success("Opportunities generated");
       fetchAllData();
@@ -282,7 +311,7 @@ export function Backlinks() {
   const handleGenerateEmail = async (oppId: string) => {
     setGeneratingEmail({ id: oppId, loading: true });
     try {
-      const data = await api.post(`/api/backlinks/opportunities/${oppId}/outreach`);
+      const data = await api.post<OutreachGenerateResponse>(`/api/backlinks/opportunities/${oppId}/outreach`);
       const generated = data?.email;
       if (!generated?.id) {
         throw new Error("The outreach email was generated but no email record was returned.");
@@ -316,13 +345,13 @@ export function Backlinks() {
         throw new Error("Outreach email not found.");
       }
       if (draft.status !== "sent") {
-        const updated = await api.put(`/api/backlinks/outreach/${emailId}`, {
+        const updated = await api.put<OutreachEmail>(`/api/backlinks/outreach/${emailId}`, {
           subject: draft.subject,
           body: draft.body,
         });
         setGeneratedEmail(updated);
       }
-      const data = await api.post(`/api/backlinks/outreach/${emailId}/send`, {
+      const data = await api.post<OutreachSendResponse>(`/api/backlinks/outreach/${emailId}/send`, {
         recipient_email: recipientEmail.trim(),
       });
       toast.success(data?.message || "Outreach email sent successfully.");
@@ -350,8 +379,7 @@ export function Backlinks() {
       await api.post(`/api/company/add-credits?amount=${budgetAmount}`, {});
       toast.success(`Added ${budgetAmount} credits.`);
       setShowBudgetDialog(false);
-      setError(null);
-    } catch (error) {
+      } catch (error) {
       console.error("Failed to add credits:", error);
       toast.error("Could not add credits.");
     } finally {
@@ -380,12 +408,22 @@ export function Backlinks() {
     toast.success("Backlinks exported");
   };
 
-  if (loading) {
-    return <div className="p-8 flex justify-center items-center">Loading backlink data...</div>;
-  }
+	  if (loading) {
+	  return (
+		<div className="p-8 flex justify-center items-center">
+		  Loading backlink data...
+		</div>
+	  );
+	}
 
-  return (
-    <div className="p-8 space-y-6">
+	return (
+	  <div className="p-8 space-y-6">
+		{error && (
+		  <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-950/30">
+			{error}
+		  </div>
+		)}
+
       <header className="flex items-start justify-between flex-wrap gap-4">
         <div>
           <h2 className="font-serif text-3xl font-bold tracking-tight">Backlink Intelligence</h2>
@@ -533,7 +571,7 @@ export function Backlinks() {
                 <ResponsiveContainer width="100%" height={300}>
                   <PieChart>
                     <Pie data={Object.entries(stats.link_types).map(([name, value]) => ({ name, value }))} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={60} outerRadius={90} paddingAngle={5}>
-                      {Object.entries(stats.link_types).map((entry, index) => (
+                      {Object.entries(stats.link_types).map((_, index) => (
                         <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                       ))}
                     </Pie>
