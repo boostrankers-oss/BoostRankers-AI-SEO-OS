@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from database.database import get_db
 from models.company import Company
 from api.deps.current_user import get_current_company
@@ -13,6 +13,18 @@ class BacklinkCreate(BaseModel):
     link_type: str
     domain_authority: int | None = None
     spam_score: int | None = None
+
+
+
+class WordPressBacklinkCreate(BaseModel):
+    wordpress_site: str = Field(..., min_length=8, max_length=500)
+    wordpress_username: str = Field(..., min_length=1, max_length=255)
+    wordpress_application_password: str = Field(..., min_length=1, max_length=255)
+    title: str = Field(..., min_length=5, max_length=255)
+    content: str = Field(..., min_length=300)
+    target_url: str = Field(..., min_length=8, max_length=500)
+    anchor_text: str = Field(..., min_length=1, max_length=255)
+    status: str = Field(default="publish")
 
 router = APIRouter(prefix="/backlinks", tags=["Backlinks"])
 
@@ -33,14 +45,33 @@ def get_backlinks(
     return service.get_backlinks(company.id)
 
 @router.post("/")
-def add_backlink(
+async def add_backlink(
     data: BacklinkCreate,
     db: Session = Depends(get_db),
     company: Company = Depends(get_current_company),
 ):
     service = BacklinkService(db)
-    backlink = service.add_backlink(company.id, data.dict())
-    return backlink
+    try:
+        backlink = await service.add_backlink(company.id, data.model_dump())
+        return backlink
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/publish/wordpress")
+async def publish_wordpress_backlink(
+    data: WordPressBacklinkCreate,
+    db: Session = Depends(get_db),
+    company: Company = Depends(get_current_company),
+):
+    service = BacklinkService(db)
+    try:
+        return await service.publish_wordpress_backlink(
+            company.id,
+            data.model_dump(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.delete("/{backlink_id}")
 def delete_backlink(
@@ -108,6 +139,60 @@ async def generate_outreach_email(
         return {"email": email}
     except ValueError as e:
         raise HTTPException(status_code=402 if "credits" in str(e) else 400, detail=str(e))
+
+class SendOutreachRequest(BaseModel):
+    recipient_email: str = Field(..., min_length=5, max_length=320)
+
+
+class UpdateOutreachRequest(BaseModel):
+    subject: str = Field(..., min_length=1, max_length=255)
+    body: str = Field(..., min_length=1)
+
+
+@router.put("/outreach/{outreach_id}")
+def update_outreach_email(
+    outreach_id: str,
+    data: UpdateOutreachRequest,
+    db: Session = Depends(get_db),
+    company: Company = Depends(get_current_company),
+):
+    service = BacklinkService(db)
+    try:
+        email = service.update_outreach_email(
+            outreach_id,
+            company.id,
+            data.subject,
+            data.body,
+        )
+        return email
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/outreach/{outreach_id}/send")
+async def send_outreach_email(
+    outreach_id: str,
+    data: SendOutreachRequest,
+    db: Session = Depends(get_db),
+    company: Company = Depends(get_current_company),
+):
+    service = BacklinkService(db)
+    try:
+        email = await service.send_outreach_email(
+            outreach_id,
+            company,
+            data.recipient_email,
+        )
+        return {
+            "success": True,
+            "status": email.status,
+            "sent_at": email.sent_at,
+            "message": "Outreach email sent successfully.",
+            "email": email,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 @router.get("/outreach")
 def get_outreach_emails(

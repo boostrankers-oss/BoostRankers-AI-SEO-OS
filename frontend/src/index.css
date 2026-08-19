@@ -54,3 +54,68 @@
     font-feature-settings: "rlig" 1, "calt" 1;
   }
 }
+
+/* =========================================================
+   MODAL / DIALOG — FORCE SOLID BACKGROUND
+   ========================================================= */
+
+/* Radix / shadcn dialog overlay */
+[data-radix-dialog-overlay] {
+    background: rgba(2, 6, 23, 0.85) !important;
+    opacity: 1 !important;
+    backdrop-filter: none !important;
+}
+
+/* Every dialog/modal container */
+[role="dialog"] {
+    background-color: #0f172a !important;
+    background-image: none !important;
+    opacity: 1 !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    isolation: isolate !important;
+}
+
+/* Prevent Tailwind translucent backgrounds */
+[role="dialog"].bg-background\/95,
+[role="dialog"].bg-background\/90,
+[role="dialog"].bg-background\/80,
+[role="dialog"].bg-background\/75,
+[role="dialog"].bg-background\/70,
+[role="dialog"].bg-background\/60,
+[role="dialog"].bg-background\/50 {
+    background-color: #0f172a !important;
+}
+
+/* Modal children should not inherit transparency */
+[role="dialog"] > * {
+    opacity: 1 !important;
+}
+
+/* Drawer / side modal panels */
+[data-vaul-drawer],
+[data-vaul-drawer] > div {
+    background-color: #0f172a !important;
+    background-image: none !important;
+    opacity: 1 !important;
+    backdrop-filter: none !important;
+}
+
+/* Generic fixed modal panels used by the application */
+.modal,
+.modal-content,
+.modal-container,
+.dialog-content,
+.drawer-content {
+    background-color: #0f172a !important;
+    background-image: none !important;
+    opacity: 1 !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+}
+
+/* Create Real Backlink / Backlink drawer */
+[role="dialog"] {
+    background: #0f172a !important;
+    background-color: #0f172a !important;
+}

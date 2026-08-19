@@ -37,9 +37,11 @@ import {
   Mail,
   Trash2,
   Search,
+  Filter,
   Download,
   Plus,
   AlertCircle,
+  Wand2,
   CreditCard,
 } from "lucide-react";
 import { useClaude } from "@/components/ClaudeProvider";
@@ -52,20 +54,22 @@ interface Backlink {
   target_url: string;
   anchor_text: string;
   link_type: string;
-  domain_authority: number;
+  domain_authority: number | null;
   spam_score: number;
   status: string;
   ai_analysis: string;
   detected_at: string;
+  target_url?: string;
 }
 
 interface Opportunity {
   id: string;
   domain: string;
   opportunity_type: string;
-  domain_authority: number;
+  domain_authority: number | null;
   relevance: string;
   status: string;
+  sent_at?: string | null;
 }
 
 interface OutreachEmail {
@@ -74,17 +78,18 @@ interface OutreachEmail {
   subject: string;
   body: string;
   status: string;
+  sent_at?: string | null;
 }
 
 interface Statistics {
   total: number;
   referring_domains: number;
-  domain_authority: number;
+  domain_authority: number | null;
   toxic_links: number;
   new_this_month: number;
-  new_domains: number;
-  da_change: number;
-  toxic_fixed: number;
+  new_domains: number | null;
+  da_change: number | null;
+  toxic_fixed: number | null;
   growth_history: { month: string; new: number; lost: number }[];
   link_types: { [key: string]: number };
 }
@@ -92,12 +97,13 @@ interface Statistics {
 const COLORS = ["#10b981", "#6366f1", "#f59e0b", "#8b5cf6"];
 
 export function Backlinks() {
-  const { isConfigured, isReady, status } = useClaude();
+  const { isConfigured } = useClaude();
   const [stats, setStats] = useState<Statistics | null>(null);
   const [backlinks, setBacklinks] = useState<Backlink[]>([]);
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [outreachEmails, setOutreachEmails] = useState<OutreachEmail[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   // UI state
   const [activeTab, setActiveTab] = useState<
@@ -105,6 +111,19 @@ export function Backlinks() {
   >("dashboard");
   const [searchQuery, setSearchQuery] = useState("");
   const [isAddOpen, setIsAddOpen] = useState(false);
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [creatingBacklink, setCreatingBacklink] = useState(false);
+  const [createResult, setCreateResult] = useState<string | null>(null);
+  const [wordpressBacklink, setWordpressBacklink] = useState({
+    wordpress_site: "",
+    wordpress_username: "",
+    wordpress_application_password: "",
+    title: "",
+    content: "",
+    target_url: "",
+    anchor_text: "",
+    status: "publish",
+  });
   const [newBacklink, setNewBacklink] = useState({
     source_url: "",
     target_url: "",
@@ -116,60 +135,88 @@ export function Backlinks() {
   const [showBudgetDialog, setShowBudgetDialog] = useState(false);
   const [budgetAmount, setBudgetAmount] = useState(10);
   const [isAddingBudget, setIsAddingBudget] = useState(false);
-
-  const requireAiReady = (): boolean => {
-    if (!isConfigured) {
-      toast.error("Claude API key not configured. Please add it in Settings.");
-      return false;
-    }
-
-    if (!isReady) {
-      toast.error(
-        status === "billing_required"
-          ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
-          : status === "invalid_api_key"
-            ? "Anthropic API key is invalid. Please update it in Settings."
-            : "Claude AI is currently unavailable. Please check Settings."
-      );
-      return false;
-    }
-
-    return true;
-  };
   const [generatingEmail, setGeneratingEmail] = useState<{
     id: string;
     loading: boolean;
   } | null>(null);
-  const [generatedEmail, setGeneratedEmail] = useState<string | null>(null);
+  const [generatedEmail, setGeneratedEmail] = useState<OutreachEmail | null>(null);
+  const [recipientEmail, setRecipientEmail] = useState("");
+  const [sendingOutreach, setSendingOutreach] = useState(false);
+  const [sendEmailId, setSendEmailId] = useState<string | null>(null);
   useEffect(() => {
     fetchAllData();
   }, []);
 
   const fetchAllData = async () => {
     setLoading(true);
+    setError(null);
     try {
       // Use Promise.allSettled to avoid one failure breaking everything
-      const [statsData, backlinksData, oppsData, emailsData] = await Promise.all([
-        api.get<Statistics>("/api/backlinks/statistics"),
-        api.get<Backlink[]>("/api/backlinks"),
-        api.get<Opportunity[]>("/api/backlinks/opportunities"),
-        api.get<OutreachEmail[]>("/api/backlinks/outreach"),
+      const results = await Promise.allSettled([
+        api.get("/api/backlinks/statistics"),
+        api.get("/api/backlinks"),
+        api.get("/api/backlinks/opportunities"),
+        api.get("/api/backlinks/outreach"),
       ]);
 
-      setStats(statsData);
-      setBacklinks(backlinksData);
-      setOpportunities(oppsData);
-      setOutreachEmails(emailsData);
+      // Extract data or fallback to empty/default
+      const [statsData, backlinksData, oppsData, emailsData] = results.map(r =>
+        r.status === "fulfilled" ? r.value : null
+      );
+
+      setStats(statsData || { total: 0, referring_domains: 0, domain_authority: 0, toxic_links: 0, new_this_month: 0, new_domains: 0, da_change: 0, toxic_fixed: 0, growth_history: [], link_types: {} });
+      setBacklinks(Array.isArray(backlinksData) ? backlinksData : []);
+      setOpportunities(Array.isArray(oppsData) ? oppsData : []);
+      setOutreachEmails(Array.isArray(emailsData) ? emailsData : []);
     } catch (err) {
       console.error("Failed to fetch backlink data:", err);
+       setError("Could not load backlink data. Please try again.");
     } finally {
       setLoading(false);
     }
   };
 
+  const handleCreateWordPressBacklink = async () => {
+    setCreatingBacklink(true);
+    setCreateResult(null);
+    try {
+      const data = await api.post(
+        "/api/backlinks/publish/wordpress",
+        wordpressBacklink,
+      );
+
+      if (data.verified && data.backlink) {
+        toast.success("Backlink published and verified.");
+        setCreateResult(data.message);
+        setBacklinks((current) => [data.backlink, ...current]);
+      } else {
+        toast.success("WordPress content published; verification is still pending.");
+        setCreateResult(data.message || "Published, but not yet verified.");
+      }
+
+      setWordpressBacklink({
+        wordpress_site: "",
+        wordpress_username: "",
+        wordpress_application_password: "",
+        title: "",
+        content: "",
+        target_url: "",
+        anchor_text: "",
+        status: "publish",
+      });
+      fetchAllData();
+    } catch (err: any) {
+      const message = err?.data?.detail || err?.message || "Backlink publication failed.";
+      toast.error(message);
+      setCreateResult(message);
+    } finally {
+      setCreatingBacklink(false);
+    }
+  };
+
   const handleAddBacklink = async () => {
     try {
-      const data = await api.post<Backlink>("/api/backlinks", newBacklink);
+      const data = await api.post("/api/backlinks", newBacklink);
       setBacklinks([data, ...backlinks]);
       setIsAddOpen(false);
       setNewBacklink({ source_url: "", target_url: "", anchor_text: "", link_type: "Dofollow" });
@@ -195,11 +242,9 @@ export function Backlinks() {
   };
 
   const handleAnalyze = async (id: string) => {
-    if (!requireAiReady()) return;
-
     setAnalyzingId(id);
     try {
-      const data = await api.post<{ analysis: string }>(`/api/backlinks/${id}/analyze`);
+      const data = await api.post(`/api/backlinks/${id}/analyze`);
       setBacklinks(
         backlinks.map((b) =>
           b.id === id ? { ...b, ai_analysis: data.analysis } : b
@@ -219,10 +264,8 @@ export function Backlinks() {
   };
 
   const handleGenerateOpportunities = async () => {
-    if (!requireAiReady()) return;
-
     try {
-      const data = await api.post<Opportunity[]>("/api/backlinks/opportunities/generate");
+      const data = await api.post("/api/backlinks/opportunities/generate");
       setOpportunities([...data, ...opportunities]);
       toast.success("Opportunities generated");
       fetchAllData();
@@ -239,11 +282,15 @@ export function Backlinks() {
   const handleGenerateEmail = async (oppId: string) => {
     setGeneratingEmail({ id: oppId, loading: true });
     try {
-      const data = await api.post<{ email: string }>(`/api/backlinks/opportunities/${oppId}/outreach`);
-      setGeneratedEmail(data.email);
+      const data = await api.post(`/api/backlinks/opportunities/${oppId}/outreach`);
+      const generated = data?.email;
+      if (!generated?.id) {
+        throw new Error("The outreach email was generated but no email record was returned.");
+      }
+      setGeneratedEmail(generated);
       setActiveTab("outreach");
-      toast.success("Email generated");
-      fetchAllData();
+      toast.success("AI outreach email generated. Enter the recipient and send it.");
+      await fetchAllData();
     } catch (err: any) {
       let msg = err?.data?.detail || "Email generation failed";
       if (msg.includes("credits") || msg.includes("402")) {
@@ -256,13 +303,55 @@ export function Backlinks() {
     }
   };
 
+  const handleSendOutreach = async (emailId: string) => {
+    if (!recipientEmail.trim()) {
+      toast.error("Enter the recipient email address first.");
+      return;
+    }
+    setSendingOutreach(true);
+    setSendEmailId(emailId);
+    try {
+      const draft = generatedEmail?.id === emailId ? generatedEmail : outreachEmails.find((item) => item.id === emailId);
+      if (!draft) {
+        throw new Error("Outreach email not found.");
+      }
+      if (draft.status !== "sent") {
+        const updated = await api.put(`/api/backlinks/outreach/${emailId}`, {
+          subject: draft.subject,
+          body: draft.body,
+        });
+        setGeneratedEmail(updated);
+      }
+      const data = await api.post(`/api/backlinks/outreach/${emailId}/send`, {
+        recipient_email: recipientEmail.trim(),
+      });
+      toast.success(data?.message || "Outreach email sent successfully.");
+      setRecipientEmail("");
+      if (generatedEmail?.id === emailId) {
+        setGeneratedEmail((current) => current ? { ...current, status: "sent" } : current);
+      }
+      await fetchAllData();
+    } catch (err: any) {
+      toast.error(err?.data?.detail || err?.message || "Failed to send outreach email.");
+    } finally {
+      setSendingOutreach(false);
+      setSendEmailId(null);
+    }
+  };
+
+  const openSendDialog = (email: OutreachEmail) => {
+    setGeneratedEmail(email);
+    setSendEmailId(email.id);
+  };
+
   const addBudget = async () => {
     setIsAddingBudget(true);
     try {
       await api.post(`/api/company/add-credits?amount=${budgetAmount}`, {});
       toast.success(`Added ${budgetAmount} credits.`);
       setShowBudgetDialog(false);
-      } catch (error) {
+      setError(null);
+    } catch (error) {
       console.error("Failed to add credits:", error);
       toast.error("Could not add credits.");
     } finally {
@@ -308,8 +397,11 @@ export function Backlinks() {
           <Button variant="outline" className="border-slate-200 dark:border-slate-800" onClick={handleExport}>
             <Download className="size-4" /> Export
           </Button>
-          <Button className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20" onClick={() => setIsAddOpen(true)}>
-            <Plus className="size-4" /> Add Backlink
+          <Button variant="outline" onClick={() => setIsAddOpen(true)}>
+            <Plus className="size-4" /> Track Backlink
+          </Button>
+          <Button className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20" onClick={() => setIsCreateOpen(true)}>
+            <Wand2 className="size-4" /> Create Backlink
           </Button>
         </div>
       </header>
@@ -337,23 +429,12 @@ export function Backlinks() {
         ))}
       </div>
 
-      {!isConfigured ? (
+      {!isConfigured && (
         <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
           <CardContent className="p-4 flex items-center gap-3">
             <AlertCircle className="size-5 text-amber-600" />
             <p className="text-sm text-amber-700 dark:text-amber-400">
               Claude API Key required. Please configure it in Settings to enable AI features.
-            </p>
-          </CardContent>
-        </Card>
-      ) : !isReady && (
-        <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10">
-          <CardContent className="p-4 flex items-center gap-3">
-            {status === "billing_required" ? <CreditCard className="size-5 text-amber-600" /> : <AlertCircle className="size-5 text-amber-600" />}
-            <p className="text-sm text-amber-700 dark:text-amber-400">
-              {status === "billing_required"
-                ? "Anthropic billing is required. Add credits or upgrade your plan, then try again."
-                : "Claude AI is currently unavailable. Please check Settings."}
             </p>
           </CardContent>
         </Card>
@@ -452,7 +533,7 @@ export function Backlinks() {
                 <ResponsiveContainer width="100%" height={300}>
                   <PieChart>
                     <Pie data={Object.entries(stats.link_types).map(([name, value]) => ({ name, value }))} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={60} outerRadius={90} paddingAngle={5}>
-                      {Object.entries(stats.link_types).map(([,], index) => (
+                      {Object.entries(stats.link_types).map((entry, index) => (
                         <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                       ))}
                     </Pie>
@@ -546,7 +627,7 @@ export function Backlinks() {
                             variant="ghost"
                             size="sm"
                             onClick={() => handleAnalyze(row.id)}
-                            disabled={!isReady || analyzingId !== null}
+                            disabled={!isConfigured || analyzingId !== null}
                             className="text-xs h-7"
                           >
                             <Sparkles className="size-3" /> Analyze
@@ -577,7 +658,7 @@ export function Backlinks() {
             <CardDescription>Discover high-quality link building prospects</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <Button onClick={handleGenerateOpportunities} disabled={!isReady} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+            <Button onClick={handleGenerateOpportunities} disabled={!isConfigured} className="bg-emerald-600 hover:bg-emerald-700 text-white">
               <Sparkles className="size-4" /> Generate New Opportunities
             </Button>
             {opportunities.length === 0 ? (
@@ -620,41 +701,148 @@ export function Backlinks() {
             <Card className="border-slate-200 dark:border-slate-800 shadow-sm">
               <CardHeader>
                 <CardTitle className="font-serif flex items-center gap-2">
-                  <Mail className="size-5 text-indigo-600" /> Generated Email
+                  <Mail className="size-5 text-indigo-600" /> AI Outreach Email
                 </CardTitle>
-                <CardDescription>Review and copy your email</CardDescription>
+                <CardDescription>Review the AI draft, enter the prospect's email address, and send through your configured SMTP account.</CardDescription>
               </CardHeader>
-              <CardContent>
-                <Textarea value={generatedEmail} readOnly className="h-[300px] font-mono text-xs" />
+              <CardContent className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label>Subject</Label>
+                    <Input value={generatedEmail.subject} onChange={(e) => setGeneratedEmail({ ...generatedEmail, subject: e.target.value })} disabled={generatedEmail.status === "sent"} />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Recipient Email</Label>
+                    <Input type="email" value={recipientEmail} onChange={(e) => setRecipientEmail(e.target.value)} placeholder="editor@example.com" disabled={generatedEmail.status === "sent"} />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Label>Email Body</Label>
+                  <Textarea value={generatedEmail.body} onChange={(e) => setGeneratedEmail({ ...generatedEmail, body: e.target.value })} className="min-h-[260px]" disabled={generatedEmail.status === "sent"} />
+                </div>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="text-xs text-slate-500">
+                    Status: <span className="font-medium">{generatedEmail.status}</span>
+                    {generatedEmail.sent_at ? ` · Sent ${new Date(generatedEmail.sent_at).toLocaleString()}` : ""}
+                  </div>
+                  <Button
+                    onClick={() => handleSendOutreach(generatedEmail.id)}
+                    disabled={generatedEmail.status === "sent" || sendingOutreach}
+                    className="bg-emerald-600 hover:bg-emerald-700 text-white"
+                  >
+                    {sendingOutreach && sendEmailId === generatedEmail.id ? <Loader2 className="size-4 animate-spin" /> : <Mail className="size-4" />}
+                    {generatedEmail.status === "sent" ? "Already Sent" : "Send Email"}
+                  </Button>
+                </div>
               </CardContent>
             </Card>
           )}
+
           <Card className="border-slate-200 dark:border-slate-800 shadow-sm">
             <CardHeader>
               <CardTitle className="font-serif">Outreach History</CardTitle>
+              <CardDescription>AI-generated drafts and emails actually sent through SMTP.</CardDescription>
             </CardHeader>
             <CardContent>
               {outreachEmails.length === 0 ? (
-                <p className="text-slate-500">No outreach emails yet.</p>
+                <p className="text-slate-500">No outreach emails yet. Generate one from AI Opportunities.</p>
               ) : (
-                outreachEmails.map((email) => (
-                  <div key={email.id} className="border-b py-3">
-                    <p className="font-medium">{email.subject}</p>
-                    <p className="text-xs text-slate-500">Status: {email.status}</p>
-                  </div>
-                ))
+                <div className="space-y-3">
+                  {outreachEmails.map((email) => (
+                    <div key={email.id} className="rounded-lg border border-slate-200 dark:border-slate-800 p-4">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                          <p className="font-medium truncate">{email.subject}</p>
+                          <p className="text-xs text-slate-500 mt-1">Status: {email.status}{email.sent_at ? ` · ${new Date(email.sent_at).toLocaleString()}` : ""}</p>
+                        </div>
+                        <Button size="sm" variant="outline" onClick={() => openSendDialog(email)} disabled={email.status === "sent"}>
+                          <Mail className="size-3" /> {email.status === "sent" ? "Sent" : "Review / Send"}
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               )}
             </CardContent>
           </Card>
         </div>
       )}
 
+      {/* Create Real WordPress Backlink Dialog */}
+      <Dialog open={isCreateOpen} onOpenChange={setIsCreateOpen}>
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="font-serif">Create Real Backlink</DialogTitle>
+            <DialogDescription>
+              Publish a WordPress post on a site you control or are explicitly authorized to publish on.
+              The backlink is counted only after the public page is independently verified.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-4">
+            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/10 dark:text-amber-300">
+              Use a WordPress Application Password, not your normal WordPress password. Credentials are used only for this publication request and are not saved.
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label>WordPress Site</Label>
+                <Input value={wordpressBacklink.wordpress_site} onChange={(e) => setWordpressBacklink({ ...wordpressBacklink, wordpress_site: e.target.value })} placeholder="https://example.com" />
+              </div>
+              <div className="space-y-2">
+                <Label>WordPress Username</Label>
+                <Input value={wordpressBacklink.wordpress_username} onChange={(e) => setWordpressBacklink({ ...wordpressBacklink, wordpress_username: e.target.value })} placeholder="publisher" />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label>Application Password</Label>
+              <Input type="password" value={wordpressBacklink.wordpress_application_password} onChange={(e) => setWordpressBacklink({ ...wordpressBacklink, wordpress_application_password: e.target.value })} placeholder="xxxx xxxx xxxx xxxx" />
+            </div>
+
+            <div className="space-y-2">
+              <Label>Post Title</Label>
+              <Input value={wordpressBacklink.title} onChange={(e) => setWordpressBacklink({ ...wordpressBacklink, title: e.target.value })} placeholder="Useful industry resource" />
+            </div>
+
+            <div className="space-y-2">
+              <Label>Post Content</Label>
+              <Textarea className="min-h-[220px]" value={wordpressBacklink.content} onChange={(e) => setWordpressBacklink({ ...wordpressBacklink, content: e.target.value })} placeholder="Write the article/resource content here. Minimum 300 characters." />
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label>Target URL</Label>
+                <Input value={wordpressBacklink.target_url} onChange={(e) => setWordpressBacklink({ ...wordpressBacklink, target_url: e.target.value })} placeholder="https://your-site.com/page/" />
+              </div>
+              <div className="space-y-2">
+                <Label>Anchor Text</Label>
+                <Input value={wordpressBacklink.anchor_text} onChange={(e) => setWordpressBacklink({ ...wordpressBacklink, anchor_text: e.target.value })} placeholder="commercial cleaning Perth" />
+              </div>
+            </div>
+
+            {createResult && (
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 p-3 text-sm">
+                {createResult}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setIsCreateOpen(false)} disabled={creatingBacklink}>Cancel</Button>
+            <Button onClick={handleCreateWordPressBacklink} disabled={creatingBacklink} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+              {creatingBacklink ? <><Loader2 className="size-4 animate-spin" /> Publishing & Verifying...</> : <><Wand2 className="size-4" /> Publish Real Backlink</>}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Add Backlink Dialog */}
       <Dialog open={isAddOpen} onOpenChange={setIsAddOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Add New Backlink</DialogTitle>
-            <DialogDescription>Manually add a backlink to your profile.</DialogDescription>
+            <DialogTitle>Track Existing Backlink</DialogTitle>
+            <DialogDescription>The source page is checked live first. It will only be added if the target link is actually found.</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
             <div className="space-y-2">
@@ -672,7 +860,7 @@ export function Backlinks() {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setIsAddOpen(false)}>Cancel</Button>
-            <Button onClick={handleAddBacklink} className="bg-emerald-600 hover:bg-emerald-700 text-white">Add</Button>
+            <Button onClick={handleAddBacklink} className="bg-emerald-600 hover:bg-emerald-700 text-white">Verify & Track</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

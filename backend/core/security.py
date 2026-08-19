@@ -23,24 +23,27 @@ import secrets
 import string
 from dataclasses import dataclass
 
-from passlib.context import CryptContext
+import bcrypt
 
 
 # ------------------------------------------------------------------
 # Password Hashing
 # ------------------------------------------------------------------
 
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    deprecated="auto",
-)
-
-
 def hash_password(password: str) -> str:
     """
     Hash password using bcrypt.
+
+    Returns:
+        bcrypt password hash as a UTF-8 string.
     """
-    return pwd_context.hash(password)
+    password_bytes = password.encode("utf-8")
+    salt = bcrypt.gensalt()
+
+    return bcrypt.hashpw(
+        password_bytes,
+        salt,
+    ).decode("utf-8")
 
 
 def verify_password(
@@ -48,12 +51,18 @@ def verify_password(
     hashed_password: str,
 ) -> bool:
     """
-    Verify password.
+    Verify plaintext password against a bcrypt hash.
+
+    Returns:
+        True when the password matches, otherwise False.
     """
-    return pwd_context.verify(
-        plain_password,
-        hashed_password,
-    )
+    try:
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            hashed_password.encode("utf-8"),
+        )
+    except (ValueError, TypeError):
+        return False
 
 
 # ------------------------------------------------------------------
@@ -63,15 +72,27 @@ def verify_password(
 def generate_secure_token(length: int = 64) -> str:
     """
     Cryptographically secure random token.
+
+    Args:
+        length: Number of random bytes used to generate the token.
+
+    Returns:
+        URL-safe secure token.
     """
     return secrets.token_urlsafe(length)
 
 
 def generate_email_verification_token() -> str:
+    """
+    Generate a secure email verification token.
+    """
     return generate_secure_token(48)
 
 
 def generate_password_reset_token() -> str:
+    """
+    Generate a secure password reset token.
+    """
     return generate_secure_token(48)
 
 
@@ -81,11 +102,11 @@ def generate_password_reset_token() -> str:
 
 def generate_api_key(prefix: str = "br") -> str:
     """
+    Generate a secure API key.
+
     Example:
-
-    br_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        br_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     """
-
     return (
         f"{prefix}_"
         f"{secrets.token_urlsafe(32)}"
@@ -107,7 +128,7 @@ PASSWORD_REGEX = {
     "uppercase": r"[A-Z]",
     "lowercase": r"[a-z]",
     "digit": r"[0-9]",
-    "special": r"[!@#$%^&*(),.?\":{}|<>_\-+=/\\[\]]",
+    "special": r'[!@#$%^&*(),.?":{}|<>_\-+=/\\[\]]',
 }
 
 
@@ -200,6 +221,10 @@ def constant_time_compare(
 def generate_random_password(
     length: int = 16,
 ) -> str:
+    """
+    Generate a cryptographically secure random password
+    that satisfies the password-strength requirements.
+    """
 
     alphabet = (
         string.ascii_letters
@@ -225,7 +250,7 @@ def generate_otp(
     digits: int = 6,
 ) -> str:
     """
-    Numeric OTP.
+    Generate a numeric OTP.
     """
 
     return "".join(
@@ -239,6 +264,9 @@ def generate_otp(
 # ------------------------------------------------------------------
 
 def generate_session_id() -> str:
+    """
+    Generate a cryptographically secure session identifier.
+    """
     return secrets.token_hex(32)
 
 
@@ -247,6 +275,9 @@ def generate_session_id() -> str:
 # ------------------------------------------------------------------
 
 def generate_invitation_token() -> str:
+    """
+    Generate a secure invitation token.
+    """
     return generate_secure_token(48)
 
 
@@ -256,9 +287,11 @@ def generate_invitation_token() -> str:
 
 def mask_email(email: str) -> str:
     """
-    john@example.com
+    Mask an email address.
 
-    j***@example.com
+    Example:
+        john@example.com
+        j***@example.com
     """
 
     name, domain = email.split("@")
