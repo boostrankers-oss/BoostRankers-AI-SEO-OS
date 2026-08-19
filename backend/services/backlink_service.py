@@ -472,82 +472,373 @@ Explain the likely SEO value and any risks in 2-4 concise sentences."""
     # ============================================================
 
     async def generate_opportunities(self, company: Company) -> List[dict]:
-        if company.ai_credits <= 0:
-            raise ValueError("Insufficient AI credits. Please add budget.")
+        """
+        Generate real backlink opportunities using Claude.
 
-        encrypted_key = getattr(company, "anthropic_api_key_encrypted", None)
-        api_key = decrypt_secret(encrypted_key) if encrypted_key else getattr(settings, "ANTHROPIC_API_KEY", None)
-        if not api_key:
-            raise ValueError("Claude API key not configured.")
+        Important:
+        - Uses the company's encrypted Anthropic key when available.
+        - Falls back to the global configured key if the company key
+          cannot be decrypted.
+        - Never inserts fake/hard-coded opportunities.
+        - Handles Claude JSON wrapped in markdown code fences.
+        - Deducts one AI credit only after valid opportunities are
+          successfully generated and stored.
+        """
 
-        client = AsyncAnthropic(api_key=api_key)
-        model = getattr(settings, "ANTHROPIC_MODEL", None) or "claude-sonnet-4-6"
-        company_domain = getattr(company, "domain", None) or getattr(company, "website", None) or ""
+        # ---------------------------------------------------------
+        # 1. Check AI credits
+        # ---------------------------------------------------------
+        credits = int(company.ai_credits or 0)
 
-        prompt = f"""Create backlink prospecting ideas for this company/domain: {company_domain}
+        if credits <= 0:
+            raise ValueError(
+                "Insufficient AI credits. Please add budget."
+            )
 
-Return ONLY a JSON array of opportunity ideas. Do not invent or claim that any
-site has agreed to publish a link. Opportunities must be framed as prospects
-that still require permission or editorial acceptance.
-
-Each object must contain:
-- domain
-- type (guest_post, resource_page, partner, directory, local_citation, news_article)
-- relevance (high, medium, low)
-- notes
-
-Do not fabricate Domain Authority or traffic metrics."""
-
-        response = await client.messages.create(
-            model=model,
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}],
+        # ---------------------------------------------------------
+        # 2. Resolve Anthropic API key safely
+        # ---------------------------------------------------------
+        encrypted_key = getattr(
+            company,
+            "anthropic_api_key_encrypted",
+            None,
         )
-        content = "".join(block.text for block in response.content if hasattr(block, "text")).strip()
 
+        global_key = getattr(
+            settings,
+            "ANTHROPIC_API_KEY",
+            None,
+        )
+
+        api_key = None
+
+        # Try the company-specific encrypted key first.
+        if encrypted_key:
+            try:
+                decrypted_key = decrypt_secret(encrypted_key)
+
+                if decrypted_key:
+                    decrypted_key = str(decrypted_key).strip()
+
+                    if decrypted_key:
+                        api_key = decrypted_key
+
+            except Exception as exc:
+                # Do NOT expose the encrypted value or API key.
+                print(
+                    "[BACKLINK OPPORTUNITIES] "
+                    f"Company API key decryption failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        # Fallback to the globally configured Anthropic key.
+        if not api_key and global_key:
+            api_key = str(global_key).strip()
+
+            print(
+                "[BACKLINK OPPORTUNITIES] "
+                "Using global Anthropic API key."
+            )
+
+        if not api_key:
+            raise ValueError(
+                "Claude API key is not configured or could not be decrypted."
+            )
+
+        # ---------------------------------------------------------
+        # 3. Create Anthropic client
+        # ---------------------------------------------------------
+        client = AsyncAnthropic(
+            api_key=api_key
+        )
+
+        model = (
+            getattr(settings, "ANTHROPIC_MODEL", None)
+            or "claude-sonnet-4-6"
+        )
+
+        # ---------------------------------------------------------
+        # 4. Determine company website/domain
+        # ---------------------------------------------------------
+        company_domain = (
+            getattr(company, "domain", None)
+            or getattr(company, "website", None)
+            or ""
+        )
+
+        company_domain = str(company_domain).strip()
+
+        # ---------------------------------------------------------
+        # 5. Build Claude prompt
+        # ---------------------------------------------------------
+        prompt = f"""
+    You are an expert SEO backlink strategist.
+
+    Generate up to 10 realistic backlink prospecting opportunities
+    for this company/domain:
+
+    {company_domain or "the company"}
+
+    Return ONLY a JSON array.
+
+    Each object MUST contain exactly these fields:
+
+    - domain
+    - type
+    - relevance
+    - notes
+
+    Allowed opportunity types:
+
+    - guest_post
+    - resource_page
+    - partner
+    - directory
+    - local_citation
+    - news_article
+
+    Allowed relevance values:
+
+    - high
+    - medium
+    - low
+
+    Important rules:
+
+    1. These are prospects, not confirmed placements.
+    2. Do not claim that any website has agreed to publish a backlink.
+    3. Do not fabricate Domain Authority.
+    4. Do not fabricate traffic numbers.
+    5. Do not include DA or traffic fields.
+    6. Do not return markdown.
+    7. Do not wrap the JSON in ```json fences.
+    8. Return valid JSON only.
+    9. Prefer relevant SEO, marketing, business, technology,
+       industry, local, editorial, resource and partnership prospects.
+    10. Do not return obviously fake domains such as example.com.
+
+    Example format:
+
+    [
+      {{
+        "domain": "example.org",
+        "type": "resource_page",
+        "relevance": "high",
+        "notes": "Relevant industry resource page that may accept
+        a useful editorial contribution."
+      }}
+    ]
+    """
+
+        # ---------------------------------------------------------
+        # 6. Call Claude
+        # ---------------------------------------------------------
+        try:
+            response = await client.messages.create(
+                model=model,
+                max_tokens=1500,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+            )
+
+        except Exception as exc:
+            print(
+                "[BACKLINK OPPORTUNITIES] "
+                f"Claude request failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            raise ValueError(
+                "Claude opportunity generation failed. "
+                "Please check the Anthropic API configuration."
+            ) from exc
+
+        # ---------------------------------------------------------
+        # 7. Extract Claude text
+        # ---------------------------------------------------------
+        content = "".join(
+            block.text
+            for block in response.content
+            if hasattr(block, "text")
+        ).strip()
+
+        if not content:
+            raise ValueError(
+                "Claude returned an empty opportunity response."
+            )
+
+        # ---------------------------------------------------------
+        # 8. Clean common markdown JSON wrappers
+        # ---------------------------------------------------------
+        if content.startswith("```"):
+            lines = content.splitlines()
+
+            # Remove first ```json / ```
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+
+            # Remove closing ```
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+
+            content = "\n".join(lines).strip()
+
+        # ---------------------------------------------------------
+        # 9. Parse JSON
+        # ---------------------------------------------------------
         try:
             data = json.loads(content)
+
         except json.JSONDecodeError as exc:
-            raise ValueError("Claude returned invalid opportunity JSON. No fake opportunities were inserted.") from exc
-
-        if not isinstance(data, list):
-            raise ValueError("Claude returned an invalid opportunity structure.")
-
-        company.ai_credits -= 1
-        opportunities: list[BacklinkOpportunity] = []
-        for item in data[:10]:
-            domain = str(item.get("domain", "")).strip()
-            opportunity_type = str(item.get("type", "")).strip()
-            relevance = str(item.get("relevance", "medium")).strip().lower()
-            notes = str(item.get("notes", "")).strip()
-            if not domain or not opportunity_type:
-                continue
-            if relevance not in {"high", "medium", "low"}:
-                relevance = "medium"
-            opp = BacklinkOpportunity(
-                company_id=company.id,
-                domain=domain,
-                opportunity_type=opportunity_type,
-                domain_authority=0,
-                relevance=relevance,
-                status="pending",
-                notes=notes,
+            print(
+                "[BACKLINK OPPORTUNITIES] "
+                "Claude returned invalid JSON."
             )
-            self.db.add(opp)
-            opportunities.append(opp)
 
-        self.db.commit()
+            print(
+                "[BACKLINK OPPORTUNITIES] "
+                f"Response preview: {content[:1000]}"
+            )
+
+            raise ValueError(
+                "Claude returned invalid opportunity data. "
+                "No opportunities were inserted."
+            ) from exc
+
+        # ---------------------------------------------------------
+        # 10. Validate top-level structure
+        # ---------------------------------------------------------
+        if not isinstance(data, list):
+            raise ValueError(
+                "Claude returned an invalid opportunity structure. "
+                "Expected a JSON array."
+            )
+
+        # ---------------------------------------------------------
+        # 11. Validate and normalize opportunities
+        # ---------------------------------------------------------
+        validated_opportunities = []
+
+        allowed_types = {
+            "guest_post",
+            "resource_page",
+            "partner",
+            "directory",
+            "local_citation",
+            "news_article",
+        }
+
+        allowed_relevance = {
+            "high",
+            "medium",
+            "low",
+        }
+
+        for item in data[:10]:
+
+            if not isinstance(item, dict):
+                continue
+
+            domain = str(
+                item.get("domain", "")
+            ).strip()
+
+            opportunity_type = str(
+                item.get("type", "")
+            ).strip().lower()
+
+            relevance = str(
+                item.get("relevance", "medium")
+            ).strip().lower()
+
+            notes = str(
+                item.get("notes", "")
+            ).strip()
+
+            # Required domain
+            if not domain:
+                continue
+
+            # Required/valid type
+            if opportunity_type not in allowed_types:
+                opportunity_type = "resource_page"
+
+            # Valid relevance
+            if relevance not in allowed_relevance:
+                relevance = "medium"
+
+            validated_opportunities.append(
+                {
+                    "domain": domain,
+                    "type": opportunity_type,
+                    "relevance": relevance,
+                    "notes": notes,
+                }
+            )
+
+        # ---------------------------------------------------------
+        # 12. Do not charge credit if Claude returned nothing useful
+        # ---------------------------------------------------------
+        if not validated_opportunities:
+            raise ValueError(
+                "Claude did not return any valid backlink opportunities. "
+                "No AI credit was deducted."
+            )
+
+        # ---------------------------------------------------------
+        # 13. Save opportunities
+        # ---------------------------------------------------------
+        opportunities: list[BacklinkOpportunity] = []
+
+        try:
+            for item in validated_opportunities:
+
+                opportunity = BacklinkOpportunity(
+                    company_id=company.id,
+                    domain=item["domain"],
+                    opportunity_type=item["type"],
+                    domain_authority=0,
+                    relevance=item["relevance"],
+                    status="pending",
+                    notes=item["notes"],
+                )
+
+                self.db.add(opportunity)
+                opportunities.append(opportunity)
+
+            # One credit per successful AI generation.
+            company.ai_credits = credits - 1
+
+            self.db.commit()
+
+        except Exception:
+            self.db.rollback()
+            raise
+
+        # ---------------------------------------------------------
+        # 14. Refresh generated records
+        # ---------------------------------------------------------
+        for opportunity in opportunities:
+            self.db.refresh(opportunity)
+
+        # ---------------------------------------------------------
+        # 15. Return frontend-safe JSON
+        # ---------------------------------------------------------
         return [
             {
-                "domain": o.domain,
-                "type": o.opportunity_type,
+                "domain": opportunity.domain,
+                "type": opportunity.opportunity_type,
                 "da": None,
-                "relevance": o.relevance,
-                "id": o.id,
-                "status": o.status,
-                "notes": o.notes,
+                "relevance": opportunity.relevance,
+                "id": opportunity.id,
+                "status": opportunity.status,
+                "notes": opportunity.notes,
             }
-            for o in opportunities
+            for opportunity in opportunities
         ]
 
     def get_opportunities(self, company_id: str) -> List[BacklinkOpportunity]:
