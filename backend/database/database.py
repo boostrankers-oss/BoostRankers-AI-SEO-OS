@@ -97,13 +97,49 @@ if DATABASE_URL.startswith("postgresql://"):
 #   Helps detect broken TCP connections instead of allowing
 #   dead connections to remain apparently usable.
 
+# Keep the pool deliberately small for Supabase session-mode pooling.
+# Values can be overridden through environment variables without changing
+# application code. This prevents Render/Uvicorn workers from exhausting
+# the Supabase session connection limit.
+try:
+    DATABASE_POOL_SIZE = max(
+        1,
+        int(os.getenv("DATABASE_POOL_SIZE", "2")),
+    )
+except (TypeError, ValueError):
+    DATABASE_POOL_SIZE = 2
+
+try:
+    DATABASE_MAX_OVERFLOW = max(
+        0,
+        int(os.getenv("DATABASE_MAX_OVERFLOW", "0")),
+    )
+except (TypeError, ValueError):
+    DATABASE_MAX_OVERFLOW = 0
+
+try:
+    DATABASE_POOL_TIMEOUT = max(
+        5,
+        int(os.getenv("DATABASE_POOL_TIMEOUT", "30")),
+    )
+except (TypeError, ValueError):
+    DATABASE_POOL_TIMEOUT = 30
+
+try:
+    DATABASE_POOL_RECYCLE = max(
+        60,
+        int(os.getenv("DATABASE_POOL_RECYCLE", "900")),
+    )
+except (TypeError, ValueError):
+    DATABASE_POOL_RECYCLE = 900
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=900,
-    pool_size=5,
-    max_overflow=5,
-    pool_timeout=30,
+    pool_recycle=DATABASE_POOL_RECYCLE,
+    pool_size=DATABASE_POOL_SIZE,
+    max_overflow=DATABASE_MAX_OVERFLOW,
+    pool_timeout=DATABASE_POOL_TIMEOUT,
     pool_use_lifo=True,
     connect_args={
         "connect_timeout": 15,
@@ -200,6 +236,10 @@ def dispose_database_engine() -> None:
 
 __all__ = [
     "DATABASE_URL",
+    "DATABASE_POOL_SIZE",
+    "DATABASE_MAX_OVERFLOW",
+    "DATABASE_POOL_TIMEOUT",
+    "DATABASE_POOL_RECYCLE",
     "engine",
     "SessionLocal",
     "get_db",

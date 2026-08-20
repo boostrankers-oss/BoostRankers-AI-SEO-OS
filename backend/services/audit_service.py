@@ -607,13 +607,53 @@ class AuditService:
             code, message, retryable = self._classify_anthropic_error(exc)
             return False, message, code, retryable
 
-    async def _run_agent(self, client: AsyncAnthropic, model: str, agent: dict[str, str], url: str, crawl: dict[str, Any], previous: list[dict[str, Any]]) -> dict[str, Any]:
+    async def _run_agent(
+        self,
+        client: AsyncAnthropic,
+        model: str,
+        agent: dict[str, str],
+        url: str,
+        crawl: dict[str, Any],
+        previous: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Run one specialist agent with defensive Claude JSON handling.
+
+        The audit must never assume that an LLM response is valid JSON.
+        Claude can return fenced JSON, surrounding text, or a truncated
+        response when the output-token limit is reached. This method treats
+        provider truncation and malformed JSON as recoverable conditions and
+        performs one controlled retry/repair before reporting an agent error.
+        """
+
+        # Do not send the entire previous result history back to Claude. It can
+        # become unnecessarily large, especially for the Reporting Agent.
+        previous_compact: list[dict[str, Any]] = []
+        for item in previous[-8:]:
+            if not isinstance(item, dict):
+                continue
+            previous_compact.append(
+                {
+                    "agent": str(item.get("agent", "")),
+                    "score": item.get("score", 0),
+                    "findings": [
+                        {
+                            "severity": str(f.get("severity", "info")),
+                            "title": str(f.get("title", "Finding")),
+                            "detail": str(f.get("detail", ""))[:500],
+                        }
+                        for f in item.get("findings", [])[:3]
+                        if isinstance(f, dict)
+                    ],
+                }
+            )
+
         evidence = {
             "website": url,
             "crawl": {k: v for k, v in crawl.items() if k not in {"pages"}},
-            "pages_sample": crawl.get("evidence_pages", [])[:80],
-            "previous_agent_results": previous,
+            "pages_sample": crawl.get("evidence_pages", [])[:60],
+            "previous_agent_results": previous_compact,
         }
+
         prompt = f"""Website SEO audit. You MUST use only the measured crawl evidence below.
 
 SPECIALIST: {agent['name']}
@@ -622,31 +662,175 @@ TASK: {agent['prompt']}
 MEASURED EVIDENCE:
 {json.dumps(evidence, ensure_ascii=False, default=str)}
 
-Return ONLY JSON:
+Return ONLY one valid JSON object. No Markdown. No code fences. No commentary.
+Use exactly this shape:
 {{"score": 0, "findings": [{{"severity":"critical|high|medium|low|info","title":"...","detail":"...","recommendation":"...","evidence":"..."}}]}}
-Score 0-100. If a metric cannot be measured from this crawl, say so instead of inventing it. Keep findings to the most useful 3-6 items."""
-        response = await client.messages.create(model=model, max_tokens=1800, system="You are a senior technical SEO auditor. Be evidence-driven. Never fabricate measurements.", messages=[{"role": "user", "content": prompt}])
-        content = "".join(block.text for block in response.content if getattr(block, "type", None) == "text").strip()
-        if content.startswith("```"):
-            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I | re.S).strip()
-        parsed = json.loads(content)
-        score = max(0, min(100, int(float(parsed.get("score", 50)))))
+
+Rules:
+- Score must be an integer from 0 to 100.
+- Return exactly 3 concise findings when evidence exists; otherwise return an empty findings array.
+- Keep each title/detail/recommendation/evidence short.
+- Never invent a metric, URL, backlink count, ranking, traffic value, or external data.
+- If a requested metric cannot be measured by this crawl, explicitly say that it requires external data.
+"""
+
+        async def request_json(max_tokens: int) -> tuple[str, Any]:
+            response = await client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=(
+                    "You are a senior evidence-driven SEO auditor. "
+                    "Output compact valid JSON only. Never fabricate measurements."
+                ),
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            parts: list[str] = []
+            for block in response.content:
+                if getattr(block, "type", None) == "text":
+                    text = getattr(block, "text", "")
+                    if text:
+                        parts.append(text)
+
+            return "".join(parts).strip(), response
+
+        def clean_json_text(value: str) -> str:
+            text = str(value or "").strip()
+
+            # Remove Markdown fences if a provider/model adds them anyway.
+            fenced = re.search(
+                r"```(?:json)?\s*(.*?)\s*```",
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if fenced:
+                text = fenced.group(1).strip()
+
+            if text.lower().startswith("json\n"):
+                text = text[5:].strip()
+
+            # If Claude surrounds the object with a sentence, recover the
+            # first complete JSON object without accepting arbitrary text.
+            first = text.find("{")
+            if first > 0:
+                text = text[first:]
+
+            return text.strip()
+
+        def parse_json_object(value: str) -> dict[str, Any]:
+            text = clean_json_text(value)
+            if not text:
+                raise ValueError("Anthropic returned an empty response.")
+
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                # JSONDecoder can recover a complete object when harmless
+                # trailing text exists after it.
+                decoder = json.JSONDecoder()
+                parsed, _ = decoder.raw_decode(text)
+
+            if not isinstance(parsed, dict):
+                raise ValueError("Claude response JSON must be an object.")
+
+            return parsed
+
+        content, response = await request_json(3200)
+        stop_reason = getattr(response, "stop_reason", None)
+
+        # A max_tokens stop means the JSON may be physically incomplete.
+        # Never feed truncated JSON to json.loads(); retry with a larger budget.
+        if stop_reason == "max_tokens":
+            logger.warning(
+                "Claude output truncated for %s; retrying with larger budget.",
+                agent["name"],
+            )
+            content, response = await request_json(6000)
+            stop_reason = getattr(response, "stop_reason", None)
+
+            if stop_reason == "max_tokens":
+                raise RuntimeError(
+                    f"Claude output remained truncated for {agent['name']} after retry."
+                )
+
+        if stop_reason == "refusal":
+            raise RuntimeError(
+                f"Claude refused to generate the {agent['name']} result."
+            )
+
+        try:
+            parsed = parse_json_object(content)
+        except (json.JSONDecodeError, TypeError, ValueError, RuntimeError) as parse_exc:
+            logger.warning(
+                "Invalid Claude JSON for %s; attempting one repair. Error: %s",
+                agent["name"],
+                parse_exc,
+            )
+
+            repair_prompt = f"""Repair the following malformed SEO audit response.
+Return ONLY valid JSON with exactly this shape:
+{{"score": 0, "findings": [{{"severity":"critical|high|medium|low|info","title":"...","detail":"...","recommendation":"...","evidence":"..."}}]}}
+Do not add Markdown or explanation. Keep at most 3 concise findings.
+
+Malformed response:
+{content[:14000]}
+"""
+
+            repair_response = await client.messages.create(
+                model=model,
+                max_tokens=2400,
+                system="You repair malformed JSON. Return JSON only.",
+                messages=[{"role": "user", "content": repair_prompt}],
+            )
+
+            repair_parts: list[str] = []
+            for block in repair_response.content:
+                if getattr(block, "type", None) == "text":
+                    text = getattr(block, "text", "")
+                    if text:
+                        repair_parts.append(text)
+
+            repaired = "".join(repair_parts).strip()
+
+            if getattr(repair_response, "stop_reason", None) == "max_tokens":
+                raise RuntimeError(
+                    f"Claude JSON repair was truncated for {agent['name']}."
+                )
+
+            parsed = parse_json_object(repaired)
+
+        score = parsed.get("score", 50)
+        try:
+            score = int(float(score))
+        except (TypeError, ValueError):
+            score = 50
+        score = max(0, min(100, score))
+
         findings = parsed.get("findings", [])
         if not isinstance(findings, list):
             findings = []
-        normalized = []
-        for item in findings:
+
+        normalized: list[dict[str, str]] = []
+        for item in findings[:3]:
             if isinstance(item, dict):
-                normalized.append({
-                    "severity": str(item.get("severity", "info")).lower(),
-                    "title": str(item.get("title", "Finding")),
-                    "detail": str(item.get("detail", "")),
-                    "recommendation": str(item.get("recommendation", "")),
-                    "evidence": str(item.get("evidence", "")),
-                })
-            else:
-                normalized.append({"severity": "info", "title": "Finding", "detail": str(item), "recommendation": "Review this finding.", "evidence": ""})
-        return {"agent": agent["name"], "score": score, "findings": normalized[:8]}
+                severity = str(item.get("severity", "info")).lower().strip()
+                if severity not in {"critical", "high", "medium", "low", "info"}:
+                    severity = "info"
+                normalized.append(
+                    {
+                        "severity": severity,
+                        "title": str(item.get("title", "Finding")).strip()[:300],
+                        "detail": str(item.get("detail", "")).strip()[:1200],
+                        "recommendation": str(item.get("recommendation", "")).strip()[:1200],
+                        "evidence": str(item.get("evidence", "")).strip()[:1200],
+                    }
+                )
+
+        return {
+            "agent": agent["name"],
+            "score": score,
+            "findings": normalized,
+        }
 
     async def run_audit(self, url: str, user: User, company: Company, request: Any = None) -> AsyncGenerator[str, None]:
         audit: Audit | None = None
@@ -762,8 +946,9 @@ Score 0-100. If a metric cannot be measured from this crawl, say so instead of i
             audit.overall_score = average_score if hasattr(audit, "overall_score") else average_score
             audit.current_stage = "Completed"
             audit.current_task = "Audit completed successfully"
-            if audit.started_at and hasattr(audit, "duration_seconds"):
-                audit.duration_seconds = int(max(0, (datetime.now(timezone.utc) - audit.started_at).total_seconds()))
+            # duration_seconds is a computed read-only property on Audit.
+            # completed_at + started_at are persisted; the model calculates
+            # duration_seconds automatically. Never assign to the property.
             score_fields = {"Technical SEO Agent":"technical_score","Content SEO Agent":"content_score","Local SEO Agent":"local_seo_score","Schema Agent":"schema_score","EEAT Agent":"eeat_score","Backlink Agent":"backlink_score","AI Search Agent":"ai_search_score","Internal Linking Agent":"internal_linking_score"}
             for r in results:
                 field = score_fields.get(r.get("agent"))
