@@ -5,8 +5,6 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from models.base import Base
-
 
 # ============================================================
 # Environment
@@ -36,8 +34,30 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 if not DATABASE_URL:
     raise RuntimeError(
-        f"DATABASE_URL environment variable is required. "
+        "DATABASE_URL environment variable is required. "
         f"Expected environment file: {ENV_FILE}"
+    )
+
+
+# ============================================================
+# Normalize PostgreSQL URL
+# ============================================================
+
+# SQLAlchemy expects:
+#
+# postgresql+psycopg2://...
+#
+# Some deployment environments may provide:
+#
+# postgresql://...
+#
+# Normalize it so the application consistently uses psycopg2.
+
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgresql://",
+        "postgresql+psycopg2://",
+        1,
     )
 
 
@@ -45,29 +65,55 @@ if not DATABASE_URL:
 # SQLAlchemy Engine
 # ============================================================
 
-# Important:
-# This application uses Supabase PostgreSQL.
+# IMPORTANT FOR SUPABASE / RENDER
 #
-# pool_pre_ping:
-#   Detects stale/dead pooled connections before using them.
+# pool_pre_ping=True
+#   Checks whether a pooled connection is still alive before
+#   handing it to the application.
 #
-# pool_recycle:
-#   Prevents very old connections from remaining in the pool.
+# pool_recycle=900
+#   Recycles connections after 15 minutes instead of keeping
+#   potentially stale connections for a long period.
 #
-# pool_timeout:
-#   Prevents requests from hanging indefinitely while waiting
-#   for a database connection.
+# pool_size=5
+#   Keeps a small predictable pool suitable for a Render
+#   service and Supabase connection pooler.
+#
+# max_overflow=5
+#   Allows temporary bursts without creating an unlimited
+#   number of PostgreSQL connections.
+#
+# pool_timeout=30
+#   Prevents requests from waiting indefinitely for a connection.
 #
 # connect_args:
-#   Gives PostgreSQL a finite connection timeout.
+#   PostgreSQL connection-level timeout and TCP keepalive
+#   configuration.
+#
+# sslmode=require
+#   Ensures the Supabase PostgreSQL connection uses SSL.
+#
+# keepalives:
+#   Helps detect broken TCP connections instead of allowing
+#   dead connections to remain apparently usable.
 
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=1800,
+    pool_recycle=900,
+    pool_size=5,
+    max_overflow=5,
     pool_timeout=30,
+    pool_use_lifo=True,
     connect_args={
         "connect_timeout": 15,
+        "sslmode": "require",
+
+        # TCP keepalive
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
     },
 )
 
@@ -77,9 +123,10 @@ engine = create_engine(
 # ============================================================
 
 SessionLocal = sessionmaker(
+    bind=engine,
     autocommit=False,
     autoflush=False,
-    bind=engine,
+    expire_on_commit=False,
 )
 
 
@@ -94,10 +141,18 @@ def get_db():
     The session is always closed after the request, including
     when the route raises an exception.
     """
+
     db = SessionLocal()
 
     try:
         yield db
+
+    except Exception:
+        # Make absolutely sure a failed request does not leave
+        # an open transaction attached to the session.
+        db.rollback()
+        raise
+
     finally:
         db.close()
 
@@ -108,7 +163,8 @@ def get_db():
 
 def check_database_connection() -> bool:
     """
-    Verify that the configured PostgreSQL database is reachable.
+    Verify that PostgreSQL is reachable and that a fresh
+    SQLAlchemy connection can successfully execute a query.
 
     Returns:
         True when the database responds successfully.
@@ -116,6 +172,7 @@ def check_database_connection() -> bool:
     Raises:
         Exception when the database cannot be reached.
     """
+
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
 
@@ -130,13 +187,18 @@ def dispose_database_engine() -> None:
     """
     Dispose all SQLAlchemy pooled connections.
 
-    Useful during application shutdown/reload.
+    This should be called during application shutdown/reload
+    so Render/Uvicorn does not retain old database connections.
     """
+
     engine.dispose()
 
 
+# ============================================================
+# Public exports
+# ============================================================
+
 __all__ = [
-    "Base",
     "DATABASE_URL",
     "engine",
     "SessionLocal",
