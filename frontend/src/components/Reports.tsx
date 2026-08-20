@@ -51,6 +51,27 @@ interface Report {
   audit_id?: string | null;
 }
 
+
+function ReportContent({ content }: { content: string }) {
+  const lines = content.split(/\r?\n/);
+  return (
+    <div className="space-y-4 text-sm leading-7 text-slate-700 dark:text-slate-300">
+      {lines.map((raw, index) => {
+        const line = raw.trim();
+        if (!line) return <div key={index} className="h-1" />;
+        if (/^#{1}\s+/.test(line)) return <h2 key={index} className="text-2xl font-bold font-serif text-slate-900 dark:text-white pt-3">{line.replace(/^#\s+/, "")}</h2>;
+        if (/^#{2}\s+/.test(line)) return <h3 key={index} className="text-xl font-semibold text-slate-900 dark:text-white pt-4 border-b pb-2">{line.replace(/^##\s+/, "")}</h3>;
+        if (/^#{3,}\s+/.test(line)) return <h4 key={index} className="text-base font-semibold text-emerald-700 dark:text-emerald-400 pt-2">{line.replace(/^#{3,}\s+/, "")}</h4>;
+        if (/^[-*]\s+/.test(line)) return <div key={index} className="flex gap-3 rounded-lg bg-slate-50 dark:bg-slate-900 px-4 py-2"><span className="text-emerald-600">•</span><span>{line.replace(/^[-*]\s+/, "")}</span></div>;
+        if (/^\d+[.)]\s+/.test(line)) return <div key={index} className="flex gap-3"><span className="font-bold text-emerald-600">{line.match(/^\d+/)?.[0]}.</span><span>{line.replace(/^\d+[.)]\s+/, "")}</span></div>;
+        if (/^>\s+/.test(line)) return <blockquote key={index} className="border-l-4 border-emerald-500 pl-4 italic text-slate-600 dark:text-slate-400">{line.replace(/^>\s+/, "")}</blockquote>;
+        if (/^\|.*\|$/.test(line)) return <div key={index} className="overflow-x-auto rounded-md bg-slate-50 dark:bg-slate-900 px-3 py-1 font-mono text-xs whitespace-pre">{line}</div>;
+        return <p key={index}>{line}</p>;
+      })}
+    </div>
+  );
+}
+
 export function Reports() {
   const [reports, setReports] = useState<Report[]>([]);
   const [loading, setLoading] = useState(true);
@@ -643,10 +664,12 @@ export function Reports() {
 
               <div className="flex-1 min-h-0 overflow-auto rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950">
                 <article className="p-6 lg:p-10">
-                  <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-7 text-slate-700 dark:text-slate-300">
-                    {selectedReport.content ||
-                      "This report does not contain any content."}
-                  </pre>
+                  <ReportContent
+                    content={
+                      selectedReport.content ||
+                      "This report does not contain any content."
+                    }
+                  />
                 </article>
               </div>
             </>

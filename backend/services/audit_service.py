@@ -1,1154 +1,800 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
+import time
+import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from typing import Any, AsyncGenerator
-from services.secret_service import decrypt_secret
+from urllib.parse import urldefrag, urljoin, urlparse, urlunparse
+from urllib.robotparser import RobotFileParser
 
-from anthropic import (
-    APIConnectionError,
-    APIStatusError,
-    AsyncAnthropic,
-    AuthenticationError,
-    RateLimitError,
-)
-
+import httpx
+from anthropic import APIConnectionError, APIStatusError, AsyncAnthropic, AuthenticationError, RateLimitError
 from sqlalchemy.orm import Session
 
 from config import settings
 from models.audit import Audit, AuditStatus
 from models.company import Company
 from models.user import User
-
+from services.secret_service import decrypt_secret
 
 logger = logging.getLogger(__name__)
 
 
-class AuditService:
-    """
-    Production audit orchestration service.
+class _PageParser(HTMLParser):
+    """Small dependency-free HTML extractor for SEO crawling."""
 
-    Responsibilities:
-    - Validate application AI credits.
-    - Validate Anthropic configuration before consuming credits.
-    - Distinguish invalid API keys from billing/quota/rate-limit failures.
-    - Create and persist Audit records.
-    - Stream SSE progress to the frontend.
-    - Stop immediately when the Anthropic provider is unavailable.
-    - Execute all configured SEO agents.
-    - Persist progress using Audit.progress_percentage.
-    - Finalize the audit safely.
-    - Generate the final report.
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self.description = ""
+        self.canonical = ""
+        self.lang = ""
+        self.robots = ""
+        self.h1: list[str] = []
+        self.h2: list[str] = []
+        self.h3: list[str] = []
+        self.text_parts: list[str] = []
+        self.links: list[dict[str, str]] = []
+        self.images: list[dict[str, str]] = []
+        self.schema_types: list[str] = []
+        self.og: dict[str, str] = {}
+        self.twitter: dict[str, str] = {}
+        self._tag_stack: list[str] = []
+        self._capture: str | None = None
+        self._capture_buf: list[str] = []
+        self._schema_capture = False
+        self._schema_buf: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        a = {str(k).lower(): (v or "") for k, v in attrs}
+        self._tag_stack.append(tag)
+        if tag == "html":
+            self.lang = a.get("lang", "").strip()
+        if tag == "title":
+            self._capture = "title"
+            self._capture_buf = []
+        elif tag == "meta":
+            name = (a.get("name") or a.get("property") or "").lower()
+            content = a.get("content", "").strip()
+            if name == "description":
+                self.description = content
+            elif name in {"robots", "googlebot"}:
+                self.robots = content
+            elif name.startswith("og:"):
+                self.og[name] = content
+            elif name.startswith("twitter:"):
+                self.twitter[name] = content
+        elif tag == "link":
+            rel = a.get("rel", "").lower().split()
+            href = a.get("href", "").strip()
+            if "canonical" in rel and href:
+                self.canonical = href
+        elif tag in {"h1", "h2", "h3"}:
+            self._capture = tag
+            self._capture_buf = []
+        elif tag == "a":
+            href = a.get("href", "").strip()
+            if href:
+                self.links.append({
+                    "href": href,
+                    "rel": a.get("rel", ""),
+                    "text": "",
+                })
+                self._capture = "a"
+                self._capture_buf = []
+        elif tag == "img":
+            self.images.append({"src": a.get("src", ""), "alt": a.get("alt", "")})
+        elif tag == "script" and "application/ld+json" in a.get("type", "").lower():
+            self._schema_capture = True
+            self._schema_buf = []
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self._capture == tag:
+            value = " ".join("".join(self._capture_buf).split())
+            if tag == "title":
+                self.title = value
+            elif tag == "h1":
+                self.h1.append(value)
+            elif tag == "h2":
+                self.h2.append(value)
+            elif tag == "h3":
+                self.h3.append(value)
+            elif tag == "a" and self.links:
+                self.links[-1]["text"] = value
+            self._capture = None
+            self._capture_buf = []
+        if tag == "script" and self._schema_capture:
+            raw = "".join(self._schema_buf).strip()
+            self._schema_capture = False
+            self._schema_buf = []
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    self._collect_schema_types(data)
+                except Exception:
+                    self.schema_types.append("Invalid JSON-LD")
+        if self._tag_stack and self._tag_stack[-1] == tag:
+            self._tag_stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        if self._capture:
+            self._capture_buf.append(data)
+        elif not self._schema_capture:
+            cleaned = " ".join(data.split())
+            if cleaned:
+                self.text_parts.append(cleaned)
+        if self._schema_capture:
+            self._schema_buf.append(data)
+
+    def _collect_schema_types(self, value: Any) -> None:
+        if isinstance(value, dict):
+            t = value.get("@type")
+            if isinstance(t, str):
+                self.schema_types.append(t)
+            elif isinstance(t, list):
+                self.schema_types.extend(str(x) for x in t)
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    self._collect_schema_types(child)
+        elif isinstance(value, list):
+            for child in value:
+                self._collect_schema_types(child)
+
+
+class AuditService:
+    """Real website crawler + sequential AI SEO audit orchestrator.
+
+    This service intentionally keeps the existing /api/audits/run endpoint and
+    database model. The crawler runs first and its measured evidence is then
+    supplied to each specialist agent. No synthetic crawl statistics are used.
     """
+
+    MAX_PAGES = 500
+    REQUEST_TIMEOUT = 20.0
+    MAX_HTML_BYTES = 5_000_000
 
     def __init__(self, db: Session):
         self.db = db
 
-    # =========================================================
-    # SSE
-    # =========================================================
-
     @staticmethod
     def _sse(payload: dict[str, Any]) -> str:
-        """
-        Convert a dictionary into a valid SSE event.
-        """
         return f"data: {json.dumps(payload, default=str)}\n\n"
 
-    # =========================================================
-    # DB helpers
-    # =========================================================
-
     def _safe_commit(self) -> None:
-        """
-        Commit the current transaction safely.
-        """
         try:
             self.db.commit()
         except Exception:
             self.db.rollback()
             raise
 
-    def _safe_rollback(self) -> None:
-        try:
-            self.db.rollback()
-        except Exception:
-            logger.exception("Database rollback failed.")
-
-    # =========================================================
-    # Provider configuration
-    # =========================================================
-
     @staticmethod
     def _get_api_key(company: Company) -> str | None:
-        """
-        Resolve the Anthropic API key.
-
-        The company-specific encrypted key is authoritative when configured.
-        The global environment key is used only when the company has not
-        configured its own Anthropic credential.
-        """
-
-        encrypted_key = getattr(
-            company,
-            "anthropic_api_key_encrypted",
-            None,
-        )
-
-        if encrypted_key:
+        encrypted = getattr(company, "anthropic_api_key_encrypted", None)
+        if encrypted:
             try:
-                company_key = decrypt_secret(
-                    str(encrypted_key).strip()
-                ).strip()
-
-                if company_key:
-                    return company_key
-
+                value = decrypt_secret(str(encrypted).strip()).strip()
+                if value:
+                    return value
             except (ValueError, TypeError):
-                logger.exception(
-                    "Failed to decrypt company Anthropic API key."
-                )
+                logger.exception("Could not decrypt company Anthropic API key")
                 return None
-
-        global_key = getattr(
-            settings,
-            "ANTHROPIC_API_KEY",
-            None,
-        )
-
-        if global_key:
-            global_key = str(global_key).strip()
-
-        return global_key or None
+        value = getattr(settings, "ANTHROPIC_API_KEY", None)
+        return str(value).strip() if value else None
 
     @staticmethod
     def _get_model_name() -> str:
-        """
-        Resolve the Anthropic model.
-
-        Prefer the explicitly configured model.
-        Fall back to the currently supported Claude Sonnet 4.6 model.
-        """
-        configured = getattr(settings, "ANTHROPIC_MODEL", None)
-
-        if configured:
-            return str(configured).strip()
-
-        return "claude-sonnet-4-6"
-
-    # =========================================================
-    # Provider error classification
-    # =========================================================
+        value = getattr(settings, "ANTHROPIC_MODEL", None)
+        return str(value).strip() if value else "claude-sonnet-4-6"
 
     @staticmethod
     def _classify_anthropic_error(exc: Exception) -> tuple[str, str, bool]:
-        """
-        Return:
-            (error_code, user_message, retryable)
-        """
-
-        if isinstance(exc, APIStatusError):
-            status_code = getattr(exc, "status_code", None)
-
-            body = getattr(exc, "body", None)
-
-            provider_message = str(exc)
-
-            if isinstance(body, dict):
-                error = body.get("error")
-
-                if isinstance(error, dict):
-                    provider_message = str(
-                        error.get(
-                            "message",
-                            provider_message,
-                        )
-                    )
-
-            normalized_message = provider_message.lower()
-
-            billing_markers = (
-                "credit balance is too low",
-                "insufficient credits",
-                "purchase credits",
-                "plans & billing",
-                "upgrade or purchase credits",
-                "billing",
-            )
-
-            if any(
-                marker in normalized_message
-                for marker in billing_markers
-            ):
-                return (
-                    "billing_required",
-                    (
-                        "Anthropic AI is unavailable because the "
-                        "Anthropic credit balance is too low. "
-                        "Please add credits or upgrade your Anthropic "
-                        "plan, then run the audit again."
-                    ),
-                    True,
-                )
-
-            if status_code == 402:
-                return (
-                    "billing_required",
-                    (
-                        "Anthropic billing is required. "
-                        "Please add credits or update your billing."
-                    ),
-                    True,
-                )
-
-            if status_code == 403:
-                return (
-                    "provider_forbidden",
-                    (
-                        "The Anthropic account or API key does not "
-                        "have permission to perform this request."
-                    ),
-                    False,
-                )
-
-            if status_code == 429:
-                return (
-                    "rate_limit_or_quota",
-                    (
-                        "Anthropic usage quota or rate limit was reached. "
-                        "Please try again later or check billing."
-                    ),
-                    True,
-                )
-
-            if status_code and status_code >= 500:
-                return (
-                    "provider_server_error",
-                    "Anthropic is temporarily unavailable. Please try again.",
-                    True,
-                )
-
-            return (
-                "provider_error",
-                f"Anthropic error: {provider_message}",
-                True,
-            )
-
         if isinstance(exc, AuthenticationError):
-            return (
-                "invalid_api_key",
-                (
-                    "Anthropic rejected the API key. "
-                    "Please open Settings and enter a valid Anthropic API key."
-                ),
-                False,
-            )
-
+            return "invalid_api_key", "Anthropic rejected the API key. Please update it in Settings.", False
         if isinstance(exc, RateLimitError):
-            return (
-                "rate_limit_or_quota",
-                (
-                    "Anthropic is currently limiting this API request or "
-                    "the account has reached its usage quota. "
-                    "Please check your Anthropic usage and billing, then try again."
-                ),
-                True,
-            )
-
+            return "rate_limit_or_quota", "Anthropic usage quota or rate limit was reached. Check billing and try again.", True
         if isinstance(exc, APIConnectionError):
-            return (
-                "provider_connection_error",
-                (
-                    "The application could not connect to Anthropic. "
-                    "Please check your internet connection and try again."
-                ),
-                True,
-            )
-
+            return "provider_connection_error", "Could not connect to Anthropic. Check the server connection and try again.", True
         if isinstance(exc, APIStatusError):
-            status_code = getattr(exc, "status_code", None)
-
-            if status_code == 402:
-                return (
-                    "provider_billing",
-                    (
-                        "Anthropic billing is required before this AI audit "
-                        "can run. Please add funds or update your Anthropic "
-                        "billing, then try again."
-                    ),
-                    True,
-                )
-
-            if status_code == 403:
-                return (
-                    "provider_forbidden",
-                    (
-                        "The Anthropic account is not permitted to use this "
-                        "API request. Please check the API key, workspace, "
-                        "permissions, and billing settings."
-                    ),
-                    False,
-                )
-
-            if status_code and status_code >= 500:
-                return (
-                    "provider_server_error",
-                    (
-                        "Anthropic is temporarily unavailable. "
-                        "Please try again shortly."
-                    ),
-                    True,
-                )
-
-        return (
-            "provider_error",
-            (
-                "Anthropic could not process the AI request. "
-                f"Provider error: {str(exc)}"
-            ),
-            True,
-        )
-
-    # =========================================================
-    # Provider preflight
-    # =========================================================
-
-    async def _check_anthropic_availability(
-        self,
-        client: AsyncAnthropic,
-        model: str,
-    ) -> tuple[bool, str, str | None, bool]:
-        """
-        Perform a minimal Anthropic request before creating the audit.
-
-        Returns:
-            available,
-            user_message,
-            error_code,
-            retryable
-        """
-
-        try:
-            response = await client.messages.create(
-                model=model,
-                max_tokens=8,
-                system=(
-                    "You are a health-check endpoint for an SEO application. "
-                    "Reply with exactly: OK"
-                ),
-                messages=[
-                    {
-                        "role": "user",
-                        "content": "Reply with OK.",
-                    }
-                ],
-            )
-
-            if not response:
-                return (
-                    False,
-                    "Anthropic returned an empty health-check response.",
-                    "provider_empty_response",
-                    True,
-                )
-
-            return True, "", None, False
-
-        except Exception as exc:
-            code, message, retryable = self._classify_anthropic_error(exc)
-
-            logger.warning(
-                "Anthropic preflight failed: code=%s retryable=%s error=%s",
-                code,
-                retryable,
-                exc,
-            )
-
-            return False, message, code, retryable
-
-    # =========================================================
-    # Agent configuration
-    # =========================================================
+            code = getattr(exc, "status_code", None)
+            body = getattr(exc, "body", None)
+            message = str(exc)
+            if isinstance(body, dict) and isinstance(body.get("error"), dict):
+                message = str(body["error"].get("message", message))
+            low = message.lower()
+            if code == 402 or "credit balance" in low or "billing" in low:
+                return "billing_required", "Anthropic billing or credits are required. Please check your Anthropic plan.", True
+            if code == 403:
+                return "provider_forbidden", "The Anthropic account or key is not permitted to make this request.", False
+            if code == 429:
+                return "rate_limit_or_quota", "Anthropic rate limit or quota reached. Try again later.", True
+            if code and code >= 500:
+                return "provider_server_error", "Anthropic is temporarily unavailable. Try again shortly.", True
+            return "provider_error", f"Anthropic error: {message}", True
+        return "provider_error", f"Anthropic error: {exc}", True
 
     @staticmethod
     def _agents() -> list[dict[str, str]]:
         return [
-            {
-                "name": "Technical SEO Agent",
-                "prompt": (
-                    "Analyze the site's technical SEO, including "
-                    "crawlability, indexability, canonical tags, redirects, "
-                    "sitemap, robots.txt, HTTP status handling, and Core Web "
-                    "Vitals. Provide 3 important findings."
-                ),
-            },
-            {
-                "name": "Content SEO Agent",
-                "prompt": (
-                    "Analyze content quality, keyword usage, headings, "
-                    "readability, thin content, duplicate content, topical "
-                    "coverage, and content depth. Provide 3 important findings."
-                ),
-            },
-            {
-                "name": "Local SEO Agent",
-                "prompt": (
-                    "Analyze local search presence including NAP "
-                    "consistency, Google Business Profile, citations, "
-                    "reviews, local landing pages, and local keyword "
-                    "targeting. Provide 3 important findings."
-                ),
-            },
-            {
-                "name": "Schema Agent",
-                "prompt": (
-                    "Analyze structured data and schema.org implementation. "
-                    "Identify missing schemas, invalid schemas, rich-result "
-                    "opportunities, and entity relationships. Provide 3 "
-                    "important findings."
-                ),
-            },
-            {
-                "name": "EEAT Agent",
-                "prompt": (
-                    "Analyze Experience, Expertise, Authoritativeness, and "
-                    "Trust signals including author information, contact "
-                    "details, policies, references, credentials, and trust "
-                    "elements. Provide 3 important findings."
-                ),
-            },
-            {
-                "name": "Internal Linking Agent",
-                "prompt": (
-                    "Analyze internal linking structure, orphan pages, "
-                    "click depth, anchor text distribution, topical "
-                    "relationships, and link equity flow. Provide 3 important "
-                    "findings."
-                ),
-            },
-            {
-                "name": "Competitor Agent",
-                "prompt": (
-                    "Analyze competitive SEO opportunities including keyword "
-                    "gaps, content gaps, backlink gaps, SERP weaknesses, and "
-                    "authority differences. Provide 3 important findings."
-                ),
-            },
-            {
-                "name": "Backlink Agent",
-                "prompt": (
-                    "Analyze backlink profile quality, referring domains, "
-                    "anchor text diversity, authority, relevance, and "
-                    "potential toxic-link patterns. Provide 3 important findings."
-                ),
-            },
-            {
-                "name": "AI Search Agent",
-                "prompt": (
-                    "Analyze AI-search readiness including entity signals, "
-                    "semantic coverage, answer-engine optimization, "
-                    "machine-readable information, and visibility in AI "
-                    "search experiences. Provide 3 important findings."
-                ),
-            },
-            {
-                "name": "Reporting Agent",
-                "prompt": (
-                    "Compile the audit findings into an executive-level "
-                    "summary. Highlight the most important problems, "
-                    "priorities, opportunities, and recommended next actions. "
-                    "Provide a 5-point summary."
-                ),
-            },
+            {"name": "Technical SEO Agent", "description": "HTTP status, crawlability, indexability, canonicals, robots and sitemap", "prompt": "Analyze only technical evidence from the crawl. Check HTTP status, redirects, indexability, canonicals, robots.txt, sitemap, crawl errors and page metadata. Do not invent facts."},
+            {"name": "Content SEO Agent", "description": "Titles, meta descriptions, headings, content depth and duplicates", "prompt": "Analyze measured titles, descriptions, headings, word counts, duplicate hashes and page content patterns. Give actionable findings tied to measured URLs/counts."},
+            {"name": "Local SEO Agent", "description": "Local relevance and on-site trust signals", "prompt": "Analyze only what the crawl can prove about local SEO: location terms, contact/about pages, Organization/LocalBusiness schema and local landing-page signals. Explicitly say when off-site GBP/citation data was not crawled."},
+            {"name": "Schema Agent", "description": "JSON-LD and structured-data coverage", "prompt": "Analyze JSON-LD schema types and invalid JSON-LD observations from the crawl. Identify missing or inconsistent structured-data opportunities without claiming Google validation results."},
+            {"name": "EEAT Agent", "description": "Experience, expertise, authority and trust signals", "prompt": "Analyze crawl evidence for About, Contact, author, policy, credentials, references and organization/entity signals. Do not invent credentials or external authority."},
+            {"name": "Internal Linking Agent", "description": "Internal graph, orphan pages, anchors and click depth", "prompt": "Analyze the measured internal-link graph. Identify orphan pages, pages with few inbound links, pages with excessive outbound links, broken internal links, anchor-text patterns and crawl depth."},
+            {"name": "Competitor Agent", "description": "Competitive opportunities supported by site evidence", "prompt": "Use only the site's own crawl evidence. Do not fabricate competitor rankings, backlink gaps or SERP positions. Explain which competitive analysis requires external data."},
+            {"name": "Backlink Agent", "description": "Backlink profile readiness and limitations", "prompt": "Do not pretend a site crawl measures backlinks. Review only internal evidence relevant to link acquisition readiness and clearly state that external backlink metrics require a backlink provider or GSC data."},
+            {"name": "AI Search Agent", "description": "Entity, answerability and machine-readable content", "prompt": "Analyze entity/schema coverage, headings, concise answer sections, page semantics, organization information and crawlable content for AI-search readiness."},
+            {"name": "Reporting Agent", "description": "Executive summary and prioritized remediation plan", "prompt": "Compile the measured crawl evidence and specialist results into a concise executive summary. Prioritize issues by impact and effort. Never report zero when the crawler measured a non-zero value."},
         ]
 
-    # =========================================================
-    # Main audit
-    # =========================================================
-
-    async def run_audit(
-        self,
-        url: str,
-        user: User,
-        company: Company,
-        request: Any = None,
-    ) -> AsyncGenerator[str, None]:
-
-        audit: Audit | None = None
-        results: list[dict[str, Any]] = []
-
-        agents = self._agents()
-        total_agents = len(agents)
-
+    @staticmethod
+    def _normalize_url(url: str, base: str | None = None) -> str | None:
         try:
-            # -------------------------------------------------
-            # Validate application credits
-            # -------------------------------------------------
+            absolute = urljoin(base or "", url.strip())
+            absolute, _ = urldefrag(absolute)
+            p = urlparse(absolute)
+            if p.scheme not in {"http", "https"} or not p.netloc:
+                return None
+            path = p.path or "/"
+            return urlunparse((p.scheme.lower(), p.netloc.lower(), path, "", p.query, ""))
+        except Exception:
+            return None
 
-            ai_credits = int(getattr(company, "ai_credits", 0) or 0)
+    @staticmethod
+    def _same_domain(url: str, root: str) -> bool:
+        return urlparse(url).netloc.lower().removeprefix("www.") == urlparse(root).netloc.lower().removeprefix("www.")
 
-            if ai_credits <= 0:
-                yield self._sse(
-                    {
-                        "type": "billing_required",
-                        "source": "application",
-                        "message": (
-                            "You do not have enough AI credits to run "
-                            "this audit. Please add AI credits or upgrade "
-                            "your Boost Rankers plan."
-                        ),
-                        "retryable": False,
-                    }
-                )
-                return
+    @staticmethod
+    def _xml_urls(body: str) -> tuple[list[str], list[str]]:
+        urls: list[str] = []
+        sitemaps: list[str] = []
+        try:
+            root = ET.fromstring(body)
+            tag = root.tag.lower()
+            if tag.endswith("sitemapindex"):
+                for loc in root.iter():
+                    if loc.tag.lower().endswith("loc") and loc.text:
+                        sitemaps.append(loc.text.strip())
+            else:
+                for loc in root.iter():
+                    if loc.tag.lower().endswith("loc") and loc.text:
+                        urls.append(loc.text.strip())
+        except ET.ParseError:
+            urls.extend(re.findall(r"<loc>\s*(.*?)\s*</loc>", body, re.I | re.S))
+        return urls, sitemaps
 
-            # -------------------------------------------------
-            # Validate API key before consuming app credit
-            # -------------------------------------------------
+    async def _fetch(self, client: httpx.AsyncClient, url: str) -> tuple[httpx.Response | None, float, str | None]:
+        started = time.perf_counter()
+        try:
+            response = await client.get(url, follow_redirects=True, headers={"User-Agent": "BoostRankersAISEOOS/1.0 (+SEO audit crawler)"})
+            elapsed = (time.perf_counter() - started) * 1000
+            return response, elapsed, None
+        except httpx.HTTPError as exc:
+            elapsed = (time.perf_counter() - started) * 1000
+            return None, elapsed, str(exc)
 
-            api_key = self._get_api_key(company)
+    async def _discover_sitemap(self, client: httpx.AsyncClient, root: str, robots_body: str | None) -> tuple[list[str], str | None, bool]:
+        candidates: list[str] = []
+        if robots_body:
+            for line in robots_body.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    value = line.split(":", 1)[1].strip()
+                    if value:
+                        candidates.append(value)
+        candidates += [urljoin(root, "/sitemap.xml"), urljoin(root, "/sitemap_index.xml")]
+        seen: set[str] = set()
+        found_url: str | None = None
+        discovered: list[str] = []
+        queue = deque(candidates)
+        while queue and len(seen) < 20:
+            candidate = self._normalize_url(queue.popleft())
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            response, _, _ = await self._fetch(client, candidate)
+            if not response or response.status_code >= 400:
+                continue
+            content_type = response.headers.get("content-type", "")
+            if "xml" not in content_type and not candidate.endswith((".xml", ".xml.gz")):
+                continue
+            found_url = found_url or candidate
+            urls, indexes = self._xml_urls(response.text[:2_000_000])
+            discovered.extend(self._normalize_url(x) for x in urls if self._normalize_url(x))
+            queue.extend(indexes)
+        return list(dict.fromkeys(discovered)), found_url, bool(found_url)
 
-            if not api_key:
-                yield self._sse(
-                    {
-                        "type": "ai_provider_unavailable",
-                        "code": "missing_api_key",
-                        "message": (
-                            "Anthropic AI is not configured. "
-                            "Please add a valid Anthropic API key in Settings."
-                        ),
-                        "retryable": False,
-                    }
-                )
-                return
+    async def _crawl(self, root: str, emit) -> dict[str, Any]:
+        root = self._normalize_url(root) or root
+        parsed_root = urlparse(root)
+        origin = f"{parsed_root.scheme}://{parsed_root.netloc}"
+        robots_url = origin + "/robots.txt"
+        started = time.perf_counter()
+        pages: dict[str, dict[str, Any]] = {}
+        discovered_order: list[str] = []
+        queue = deque([root])
+        queued: set[str] = {root}
+        inbound: defaultdict[str, set[str]] = defaultdict(set)
+        all_internal_targets: set[str] = set()
+        external_links = 0
+        broken_external = 0
+        broken_internal = 0
+        robots_found = False
+        robots_valid = False
+        robots_body = ""
+        sitemap_urls: list[str] = []
+        sitemap_url: str | None = None
+        sitemap_found = False
+        sitemap_valid = False
 
-            model = self._get_model_name()
-
-            # -------------------------------------------------
-            # Create Anthropic client
-            # -------------------------------------------------
-
-            client = AsyncAnthropic(
-                api_key=api_key,
-            )
-
-            # -------------------------------------------------
-            # Provider preflight BEFORE consuming credit
-            # -------------------------------------------------
-
-            (
-                provider_available,
-                provider_message,
-                provider_error_code,
-                provider_retryable,
-            ) = await self._check_anthropic_availability(
-                client,
-                model,
-            )
-
-            if not provider_available:
-                yield self._sse(
-                    {
-                        "type": "ai_provider_unavailable",
-                        "code": provider_error_code,
-                        "message": provider_message,
-                        "retryable": provider_retryable,
-                    }
-                )
-                return
-
-            # -------------------------------------------------
-            # Client disconnect check
-            # -------------------------------------------------
-
-            if request is not None:
+        limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
+        async with httpx.AsyncClient(timeout=self.REQUEST_TIMEOUT, limits=limits, max_redirects=8) as client:
+            robots_response, robots_ms, robots_error = await self._fetch(client, robots_url)
+            if robots_response and robots_response.status_code == 200:
+                robots_found = True
+                robots_body = robots_response.text[:1_000_000]
+                rp = RobotFileParser()
                 try:
-                    if await request.is_disconnected():
-                        return
+                    rp.parse(robots_body.splitlines())
+                    robots_valid = True
                 except Exception:
-                    pass
+                    robots_valid = False
+            await emit({"type": "crawl_stage", "stage": "robots", "message": f"robots.txt: {'found' if robots_found else 'not found'}", "progress": 3})
 
-            # -------------------------------------------------
-            # NOW consume one application AI credit
-            # -------------------------------------------------
+            sitemap_urls, sitemap_url, sitemap_found = await self._discover_sitemap(client, root, robots_body or None)
+            sitemap_valid = bool(sitemap_found and sitemap_urls)
+            for u in sitemap_urls:
+                if self._same_domain(u, root) and u not in queued and len(queued) < self.MAX_PAGES * 2:
+                    queue.append(u)
+                    queued.add(u)
+            await emit({"type": "crawl_stage", "stage": "sitemap", "message": f"Sitemap: {'found' if sitemap_found else 'not found'} ({len(sitemap_urls)} URLs discovered)", "progress": 7})
 
-            company.ai_credits = ai_credits - 1
-            self._safe_commit()
-
-            # -------------------------------------------------
-            # Create audit record
-            # -------------------------------------------------
-
-            audit = Audit(
-                website=url,
-                company_id=company.id,
-                user_id=user.id,
-                status=AuditStatus.RUNNING,
-                started_at=datetime.now(timezone.utc),
-                progress_percentage=0,
-            )
-
-            self.db.add(audit)
-            self._safe_commit()
-            self.db.refresh(audit)
-
-            # -------------------------------------------------
-            # Initial SSE event
-            # -------------------------------------------------
-
-            yield self._sse(
-                {
-                    "type": "started",
-                    "audit_id": str(audit.id),
-                    "total_agents": total_agents,
-                    "completed_agents": 0,
-                    "progress": 0,
-                    "message": "Audit started successfully.",
-                }
-            )
-
-            await asyncio.sleep(0)
-
-            # -------------------------------------------------
-            # Agent loop
-            # -------------------------------------------------
-
-            for idx, agent in enumerate(agents):
-
-                # Check client disconnect
-                if request is not None:
+            while queue and len(pages) < self.MAX_PAGES:
+                current = queue.popleft()
+                if current in pages:
+                    continue
+                if not self._same_domain(current, root):
+                    continue
+                if robots_found:
+                    rp = RobotFileParser()
                     try:
-                        if await request.is_disconnected():
-                            logger.info(
-                                "Client disconnected during audit %s",
-                                audit.id,
-                            )
-                            return
+                        rp.set_url(robots_url)
+                        rp.parse(robots_body.splitlines())
+                        if not rp.can_fetch("BoostRankersAISEOOS", current):
+                            pages[current] = {"url": current, "status": 0, "blocked_by_robots": True, "links": [], "text": "", "word_count": 0, "schema_types": []}
+                            continue
                     except Exception:
                         pass
 
-                # Current agent progress BEFORE execution
-                progress = int(
-                    (idx / total_agents) * 100
-                )
+                response, response_ms, fetch_error = await self._fetch(client, current)
+                item: dict[str, Any] = {
+                    "url": current,
+                    "status": response.status_code if response else 0,
+                    "response_ms": round(response_ms, 2),
+                    "error": fetch_error,
+                    "final_url": current,
+                    "redirects": [],
+                    "content_type": "",
+                    "title": "",
+                    "description": "",
+                    "canonical": "",
+                    "robots": "",
+                    "lang": "",
+                    "h1": [],
+                    "h2": [],
+                    "h3": [],
+                    "word_count": 0,
+                    "links": [],
+                    "images": [],
+                    "schema_types": [],
+                    "og": {},
+                    "twitter": {},
+                    "hash": "",
+                }
+                if response:
+                    item["final_url"] = str(response.url)
+                    item["redirects"] = [str(h.url) for h in response.history]
+                    item["content_type"] = response.headers.get("content-type", "")
+                    body = response.content[: self.MAX_HTML_BYTES]
+                    if "text/html" in item["content_type"].lower() or body.lstrip().startswith(b"<"):
+                        text = body.decode(response.encoding or "utf-8", errors="ignore")
+                        parser = _PageParser()
+                        parser.feed(text)
+                        item.update({
+                            "title": parser.title,
+                            "description": parser.description,
+                            "canonical": self._normalize_url(parser.canonical, current) if parser.canonical else "",
+                            "robots": parser.robots,
+                            "lang": parser.lang,
+                            "h1": parser.h1,
+                            "h2": parser.h2,
+                            "h3": parser.h3,
+                            "word_count": len(re.findall(r"\b[\w'-]+\b", " ".join(parser.text_parts))),
+                            "images": parser.images,
+                            "schema_types": sorted(set(parser.schema_types)),
+                            "og": parser.og,
+                            "twitter": parser.twitter,
+                        })
+                        text_for_hash = " ".join(parser.text_parts).lower()
+                        item["hash"] = hashlib.sha256(text_for_hash.encode("utf-8", errors="ignore")).hexdigest() if text_for_hash else ""
+                        for link in parser.links:
+                            target = self._normalize_url(link.get("href", ""), current)
+                            if not target:
+                                continue
+                            link["url"] = target
+                            item["links"].append(link)
+                            if self._same_domain(target, root):
+                                all_internal_targets.add(target)
+                                inbound[target].add(current)
+                                if target not in queued and target not in pages and len(queued) < self.MAX_PAGES * 2:
+                                    queue.append(target)
+                                    queued.add(target)
+                            else:
+                                external_links += 1
+                pages[current] = item
+                discovered_order.append(current)
+                crawl_pct = 8 + int((len(pages) / self.MAX_PAGES) * 55)
+                await emit({
+                    "type": "crawl_progress",
+                    "stage": "crawl",
+                    "url": current,
+                    "pages_crawled": len(pages),
+                    "pages_discovered": len(queued),
+                    "progress": min(63, crawl_pct),
+                    "message": f"Crawled {len(pages)} page(s) — {current}",
+                })
 
-                audit.current_stage = agent["name"]
-                audit.current_task = agent["prompt"]
-                audit.progress_percentage = progress
+        # Validate internal targets after discovery; a URL is broken if its fetched status is 4xx/5xx.
+        for source, page in pages.items():
+            for link in page.get("links", []):
+                target = link.get("url")
+                if not target or not self._same_domain(target, root):
+                    continue
+                target_page = pages.get(target)
+                if target_page and (target_page.get("status", 0) >= 400 or target_page.get("status", 0) == 0):
+                    broken_internal += 1
+        for target in all_internal_targets:
+            if target not in pages and len(pages) >= self.MAX_PAGES:
+                continue
 
+        successful = sum(1 for p in pages.values() if 200 <= int(p.get("status", 0)) < 400)
+        failed = sum(1 for p in pages.values() if int(p.get("status", 0)) >= 400 or int(p.get("status", 0)) == 0)
+        redirects = sum(1 for p in pages.values() if p.get("redirects"))
+        internal_links = sum(sum(1 for l in p.get("links", []) if self._same_domain(l.get("url", ""), root)) for p in pages.values())
+        external_links = sum(sum(1 for l in p.get("links", []) if l.get("url") and not self._same_domain(l.get("url", ""), root)) for p in pages.values())
+        duplicate_groups: dict[str, list[str]] = defaultdict(list)
+        title_groups: dict[str, list[str]] = defaultdict(list)
+        for u, p in pages.items():
+            if p.get("hash"):
+                duplicate_groups[p["hash"]].append(u)
+            if p.get("title"):
+                title_groups[p["title"].strip().lower()].append(u)
+        duplicate_pages = sum(max(0, len(v) - 1) for v in duplicate_groups.values())
+        duplicate_titles = sum(max(0, len(v) - 1) for v in title_groups.values())
+        orphan_pages = [u for u, p in pages.items() if u != root and not inbound.get(u)]
+        noindex_pages = [u for u, p in pages.items() if "noindex" in p.get("robots", "").lower()]
+        missing_titles = [u for u, p in pages.items() if not p.get("title")]
+        missing_descriptions = [u for u, p in pages.items() if not p.get("description")]
+        missing_h1 = [u for u, p in pages.items() if not p.get("h1")]
+        multiple_h1 = [u for u, p in pages.items() if len(p.get("h1", [])) > 1]
+        missing_canonical = [u for u, p in pages.items() if not p.get("canonical") and int(p.get("status", 0)) < 400]
+        schema_pages = [u for u, p in pages.items() if p.get("schema_types")]
+        schema_types = sorted(set(t for p in pages.values() for t in p.get("schema_types", [])))
+        total_words = sum(int(p.get("word_count", 0)) for p in pages.values())
+        response_times = [float(p.get("response_ms", 0)) for p in pages.values() if p.get("response_ms")]
+        status_counts = Counter(str(p.get("status", 0)) for p in pages.values())
+        depth: dict[str, int] = {root: 0}
+        changed = True
+        while changed:
+            changed = False
+            for source, p in pages.items():
+                if source not in depth:
+                    continue
+                for link in p.get("links", []):
+                    target = link.get("url")
+                    if target in pages and target not in depth and self._same_domain(target, root):
+                        depth[target] = depth[source] + 1
+                        changed = True
+        deep_pages = [u for u, d in depth.items() if d > 4]
+        crawl_duration_ms = int((time.perf_counter() - started) * 1000)
+        evidence_pages = []
+        for u in list(pages)[:80]:
+            p = pages[u]
+            evidence_pages.append({
+                "url": u,
+                "status": p.get("status"),
+                "response_ms": p.get("response_ms"),
+                "title": p.get("title"),
+                "description": p.get("description"),
+                "h1": p.get("h1", [])[:3],
+                "word_count": p.get("word_count", 0),
+                "canonical": p.get("canonical"),
+                "robots": p.get("robots"),
+                "schema_types": p.get("schema_types", []),
+                "internal_outbound": sum(1 for l in p.get("links", []) if l.get("url") and self._same_domain(l["url"], root)),
+                "internal_inbound": len(inbound.get(u, set())),
+                "depth": depth.get(u, -1),
+            })
+        return {
+            "root": root,
+            "pages": pages,
+            "pages_discovered": len(queued),
+            "pages_crawled": len(pages),
+            "pages_successful": successful,
+            "pages_failed": failed,
+            "internal_links": internal_links,
+            "external_links": external_links,
+            "broken_internal_links": broken_internal,
+            "broken_external_links": broken_external,
+            "orphan_pages": orphan_pages[:100],
+            "orphan_pages_count": len(orphan_pages),
+            "deep_pages": deep_pages[:100],
+            "noindex_pages": noindex_pages[:100],
+            "missing_titles": missing_titles[:100],
+            "missing_descriptions": missing_descriptions[:100],
+            "missing_h1": missing_h1[:100],
+            "multiple_h1": multiple_h1[:100],
+            "missing_canonical": missing_canonical[:100],
+            "duplicate_pages": duplicate_pages,
+            "duplicate_titles": duplicate_titles,
+            "schema_found": bool(schema_pages),
+            "schema_pages": len(schema_pages),
+            "schema_types": schema_types,
+            "robots_found": robots_found,
+            "robots_valid": robots_valid,
+            "robots_url": robots_url,
+            "sitemap_found": sitemap_found,
+            "sitemap_valid": sitemap_valid,
+            "sitemap_url": sitemap_url,
+            "sitemap_urls": len(sitemap_urls),
+            "total_words": total_words,
+            "average_words": round(total_words / len(pages), 1) if pages else 0,
+            "average_response_ms": round(sum(response_times) / len(response_times), 1) if response_times else 0,
+            "status_counts": dict(status_counts),
+            "redirects": redirects,
+            "depth_average": round(sum(depth.values()) / len(depth), 2) if depth else 0,
+            "max_depth": max(depth.values()) if depth else 0,
+            "crawl_duration_ms": crawl_duration_ms,
+            "evidence_pages": evidence_pages,
+        }
+
+    def _persist_crawl(self, audit: Audit, crawl: dict[str, Any]) -> None:
+        """Persist measured crawl counters into existing Audit columns only."""
+        mapping = {
+            "pages_discovered": "pages_discovered", "pages_crawled": "pages_crawled", "pages_successful": "pages_successful",
+            "pages_failed": "pages_failed", "internal_links": "internal_links", "external_links": "external_links",
+            "broken_internal_links": "broken_internal_links", "broken_external_links": "broken_external_links",
+            "orphan_pages_count": "orphan_pages_count", "schema_found": "schema_found", "robots_found": "robots_txt_found",
+            "robots_valid": "robots_txt_valid", "sitemap_found": "sitemap_found", "sitemap_valid": "sitemap_valid",
+            "duplicate_pages": "duplicate_pages", "duplicate_titles": "duplicate_titles", "total_words": "total_words",
+            "average_words": "average_words_per_page", "average_response_ms": "average_response_time", "crawl_duration_ms": "crawl_duration_ms",
+            "redirects": "redirects_found", "depth_average": "crawl_depth_average",
+        }
+        for source, target in mapping.items():
+            if hasattr(audit, target):
                 try:
-                    self._safe_commit()
+                    setattr(audit, target, crawl.get(source, 0))
                 except Exception:
-                    self._safe_rollback()
-                    raise
+                    logger.debug("Could not persist audit field %s", target)
+        statuses = crawl.get("status_counts", {})
+        for code in (200, 301, 302, 304, 400, 401, 403, 404, 410, 429, 500, 502, 503):
+            field = f"status_{code}"
+            if hasattr(audit, field):
+                setattr(audit, field, int(statuses.get(str(code), 0)))
+        if hasattr(audit, "status_other"):
+            known = sum(int(statuses.get(str(c), 0)) for c in (200,301,302,304,400,401,403,404,410,429,500,502,503))
+            setattr(audit, "status_other", max(0, len(crawl.get("pages", {})) - known))
+        for source, field in (("missing_titles", "missing_titles"), ("missing_descriptions", "missing_meta_descriptions"), ("missing_h1", "missing_h1"), ("multiple_h1", "multiple_h1"), ("missing_canonical", "canonical_missing")):
+            if hasattr(audit, field):
+                setattr(audit, field, len(crawl.get(source, [])))
+        for field, value in (("total_titles", len(crawl.get("pages", {}))), ("total_meta_descriptions", len(crawl.get("pages", {}))), ("pages_with_h1", len(crawl.get("pages", {})) - len(crawl.get("missing_h1", []))), ("indexable_pages", len(crawl.get("pages", {})) - len(crawl.get("noindex_pages", []))), ("noindex_pages", len(crawl.get("noindex_pages", []))), ("average_internal_links_per_page", crawl.get("internal_links", 0) / max(1, len(crawl.get("pages", {}))))):
+            if hasattr(audit, field):
+                setattr(audit, field, value)
 
-                yield self._sse(
-                    {
-                        "type": "agent_start",
-                        "agent": agent["name"],
-                        "agent_index": idx,
-                        "total_agents": total_agents,
-                        "completed_agents": idx,
-                        "progress": progress,
-                    }
-                )
+    async def _check_anthropic_availability(self, client: AsyncAnthropic, model: str) -> tuple[bool, str, str | None, bool]:
+        try:
+            response = await client.messages.create(model=model, max_tokens=8, system="Reply with exactly OK.", messages=[{"role": "user", "content": "OK"}])
+            return bool(response), "" if response else "Anthropic returned an empty response.", None if response else "provider_empty_response", not bool(response)
+        except Exception as exc:
+            code, message, retryable = self._classify_anthropic_error(exc)
+            return False, message, code, retryable
 
+    async def _run_agent(self, client: AsyncAnthropic, model: str, agent: dict[str, str], url: str, crawl: dict[str, Any], previous: list[dict[str, Any]]) -> dict[str, Any]:
+        evidence = {
+            "website": url,
+            "crawl": {k: v for k, v in crawl.items() if k not in {"pages"}},
+            "pages_sample": crawl.get("evidence_pages", [])[:80],
+            "previous_agent_results": previous,
+        }
+        prompt = f"""Website SEO audit. You MUST use only the measured crawl evidence below.
+
+SPECIALIST: {agent['name']}
+TASK: {agent['prompt']}
+
+MEASURED EVIDENCE:
+{json.dumps(evidence, ensure_ascii=False, default=str)}
+
+Return ONLY JSON:
+{{"score": 0, "findings": [{{"severity":"critical|high|medium|low|info","title":"...","detail":"...","recommendation":"...","evidence":"..."}}]}}
+Score 0-100. If a metric cannot be measured from this crawl, say so instead of inventing it. Keep findings to the most useful 3-6 items."""
+        response = await client.messages.create(model=model, max_tokens=1800, system="You are a senior technical SEO auditor. Be evidence-driven. Never fabricate measurements.", messages=[{"role": "user", "content": prompt}])
+        content = "".join(block.text for block in response.content if getattr(block, "type", None) == "text").strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I | re.S).strip()
+        parsed = json.loads(content)
+        score = max(0, min(100, int(float(parsed.get("score", 50)))))
+        findings = parsed.get("findings", [])
+        if not isinstance(findings, list):
+            findings = []
+        normalized = []
+        for item in findings:
+            if isinstance(item, dict):
+                normalized.append({
+                    "severity": str(item.get("severity", "info")).lower(),
+                    "title": str(item.get("title", "Finding")),
+                    "detail": str(item.get("detail", "")),
+                    "recommendation": str(item.get("recommendation", "")),
+                    "evidence": str(item.get("evidence", "")),
+                })
+            else:
+                normalized.append({"severity": "info", "title": "Finding", "detail": str(item), "recommendation": "Review this finding.", "evidence": ""})
+        return {"agent": agent["name"], "score": score, "findings": normalized[:8]}
+
+    async def run_audit(self, url: str, user: User, company: Company, request: Any = None) -> AsyncGenerator[str, None]:
+        audit: Audit | None = None
+        results: list[dict[str, Any]] = []
+        agents = self._agents()
+        total_agents = len(agents)
+        if not url.startswith(("http://", "https://")):
+            yield self._sse({"type": "error", "message": "Please enter a valid http:// or https:// website URL."})
+            return
+        try:
+            ai_credits = int(getattr(company, "ai_credits", 0) or 0)
+            if ai_credits <= 0:
+                yield self._sse({"type": "billing_required", "source": "application", "message": "You do not have enough AI credits to run this audit.", "retryable": False})
+                return
+            api_key = self._get_api_key(company)
+            if not api_key:
+                yield self._sse({"type": "ai_provider_unavailable", "code": "missing_api_key", "message": "Anthropic AI is not configured. Add a valid API key in Settings.", "retryable": False})
+                return
+            model = self._get_model_name()
+            client = AsyncAnthropic(api_key=api_key)
+            ok, message, code, retryable = await self._check_anthropic_availability(client, model)
+            if not ok:
+                yield self._sse({"type": "ai_provider_unavailable", "code": code, "message": message, "retryable": retryable})
+                return
+            if request is not None and await request.is_disconnected():
+                return
+
+            company.ai_credits = ai_credits - 1
+            self._safe_commit()
+            audit = Audit(website=url, company_id=company.id, user_id=user.id, status=AuditStatus.RUNNING, started_at=datetime.now(timezone.utc), progress_percentage=0)
+            self.db.add(audit)
+            self._safe_commit()
+            self.db.refresh(audit)
+            yield self._sse({"type": "started", "audit_id": str(audit.id), "total_agents": total_agents, "completed_agents": 0, "progress": 0, "message": "Audit started. Real crawler is initializing."})
+
+            async def emit(event: dict[str, Any]) -> None:
+                # Placeholder callback; actual events are collected by queue below.
                 await asyncio.sleep(0)
 
-                # -------------------------------------------------
-                # Execute Claude agent
-                # -------------------------------------------------
-
+            # Use an async queue so crawl progress can be streamed while crawling.
+            event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            async def crawl_emit(event: dict[str, Any]) -> None:
+                await event_queue.put(event)
+            crawl_task = asyncio.create_task(self._crawl(url, crawl_emit))
+            while not crawl_task.done():
                 try:
-                    response = await client.messages.create(
-                        model=model,
-                        max_tokens=1200,
-                        system=(
-                            "You are an expert SEO auditing agent. "
-                            "Return ONLY valid JSON in this exact shape: "
-                            "{\"findings\": [\"...\"], \"score\": 0}. "
-                            "The score must be an integer between 0 and 100. "
-                            "Findings must be concise, evidence-based, and "
-                            "actionable. Do not invent technical facts that "
-                            "cannot be inferred from the provided information."
-                        ),
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"Website URL: {url}\n\n"
-                                    f"Specialist: {agent['name']}\n\n"
-                                    f"Task: {agent['prompt']}\n\n"
-                                    "Return JSON only."
-                                ),
-                            }
-                        ],
-                    )
+                    event = await asyncio.wait_for(event_queue.get(), timeout=0.25)
+                    yield self._sse(event)
+                except asyncio.TimeoutError:
+                    if request is not None and await request.is_disconnected():
+                        crawl_task.cancel()
+                        return
+            crawl = await crawl_task
+            while not event_queue.empty():
+                yield self._sse(await event_queue.get())
 
-                    content_parts: list[str] = []
+            self._persist_crawl(audit, crawl)
+            audit.progress_percentage = 65
+            audit.current_stage = "Website Crawler"
+            audit.current_task = "Real crawl completed; specialist analysis starting"
+            self._safe_commit()
+            yield self._sse({
+                "type": "crawl_complete", "progress": 65, "audit_id": str(audit.id),
+                "metrics": {k: crawl[k] for k in ("pages_discovered","pages_crawled","pages_successful","internal_links","external_links","broken_internal_links","orphan_pages_count","sitemap_found","robots_found","schema_found","duplicate_pages")},
+                "message": f"Real crawl complete: {crawl['pages_crawled']} page(s) analyzed.",
+            })
 
-                    for block in response.content:
-                        if getattr(block, "type", None) == "text":
-                            content_parts.append(block.text)
-
-                    content = "".join(content_parts).strip()
-
-                    if not content:
-                        raise RuntimeError(
-                            "Anthropic returned an empty response."
-                        )
-
-                    # ---------------------------------------------
-                    # Parse structured result
-                    # ---------------------------------------------
-
-                    # ---------------------------------------------
-# Parse structured Claude result
-# ---------------------------------------------
-
-                    try:
-                        clean_content = content.strip()
-
-                        # Remove Markdown code fences when Claude returns
-                        # ```json ... ``` instead of raw JSON.
-                        if clean_content.startswith("```"):
-                            lines = clean_content.splitlines()
-
-                            if lines:
-                                lines = lines[1:]
-
-                            if lines and lines[-1].strip() == "```":
-                                lines = lines[:-1]
-
-                            clean_content = "\n".join(lines).strip()
-
-                        # Remove a leading "json" language marker if present.
-                        if clean_content.lower().startswith("json\n"):
-                            clean_content = clean_content[5:].strip()
-
-                        parsed = json.loads(clean_content)
-
-                        if not isinstance(parsed, dict):
-                            raise ValueError(
-                                "Claude response JSON must be an object."
-                            )
-
-                        findings = parsed.get(
-                            "findings",
-                            [],
-                        )
-
-                        score = parsed.get(
-                            "score",
-                            50,
-                        )
-
-                        if not isinstance(findings, list):
-                            findings = [
-                                str(findings)
-                            ]
-
-                        findings = [
-                            str(item).strip()
-                            for item in findings
-                            if str(item).strip()
-                        ]
-
-                        if not findings:
-                            findings = [
-                                "No specific findings were returned."
-                            ]
-
-                        score = int(score)
-                        score = max(
-                            0,
-                            min(100, score),
-                        )
-
-                    except (
-                        json.JSONDecodeError,
-                        TypeError,
-                        ValueError,
-                    ):
-                        logger.warning(
-                            "Could not parse structured Claude result "
-                            "for agent %s. Raw response retained.",
-                            agent["name"],
-                        )
-
-                        findings = [
-                            content[:2000]
-                        ]
-
-                        score = 50
-
-                    # ---------------------------------------------
-                    # Stream findings
-                    # ---------------------------------------------
-
-                    for finding in findings:
-                        yield self._sse(
-                            {
-                                "type": "log",
-                                "agent": agent["name"],
-                                "message": finding,
-                            }
-                        )
-
-                        await asyncio.sleep(0)
-
-                    results.append(
-                        {
-                            "agent": agent["name"],
-                            "findings": findings,
-                            "score": score,
-                        }
-                    )
-
-                    # ---------------------------------------------
-                    # Completed agent
-                    # ---------------------------------------------
-
-                    completed_agents = idx + 1
-
-                    progress = int(
-                        (completed_agents / total_agents) * 100
-                    )
-
-                    audit.progress_percentage = progress
-                    audit.current_stage = agent["name"]
+            previous: list[dict[str, Any]] = []
+            for idx, agent in enumerate(agents):
+                if request is not None and await request.is_disconnected():
+                    return
+                start_progress = 65 + int((idx / total_agents) * 30)
+                audit.current_stage = agent["name"]
+                audit.current_task = agent["description"]
+                audit.progress_percentage = start_progress
+                self._safe_commit()
+                yield self._sse({"type": "agent_start", "agent": agent["name"], "agent_index": idx, "total_agents": total_agents, "completed_agents": idx, "progress": start_progress, "description": agent["description"]})
+                try:
+                    result = await self._run_agent(client, model, agent, url, crawl, previous)
+                    results.append(result)
+                    previous.append(result)
+                    end_progress = 65 + int(((idx + 1) / total_agents) * 30)
+                    audit.progress_percentage = end_progress
                     audit.current_task = "Completed"
-
-                    try:
-                        self._safe_commit()
-                    except Exception:
-                        self._safe_rollback()
-                        raise
-
-                    yield self._sse(
-                        {
-                            "type": "agent_complete",
-                            "agent": agent["name"],
-                            "agent_index": idx,
-                            "total_agents": total_agents,
-                            "completed_agents": completed_agents,
-                            "progress": progress,
-                            "score": score,
-                        }
-                    )
-
+                    self._safe_commit()
+                    for finding in result["findings"]:
+                        yield self._sse({"type": "log", "agent": agent["name"], "message": f"[{finding['severity'].upper()}] {finding['title']}: {finding['detail']}"})
+                    yield self._sse({"type": "agent_complete", "agent": agent["name"], "agent_index": idx, "total_agents": total_agents, "completed_agents": idx + 1, "progress": end_progress, "score": result["score"]})
                 except AuthenticationError as exc:
-                    # -------------------------------------------------
-                    # INVALID API KEY
-                    # Stop immediately. Do NOT execute remaining agents.
-                    # -------------------------------------------------
-
-                    code, message, retryable = (
-                        self._classify_anthropic_error(exc)
-                    )
-
-                    logger.error(
-                        "Anthropic authentication failed during audit %s",
-                        getattr(audit, "id", None),
-                    )
-
-                    if audit is not None:
-                        audit.status = AuditStatus.FAILED
-                        audit.error_message = message
-                        audit.current_task = "Anthropic authentication failed"
-
-                        try:
-                            self._safe_commit()
-                        except Exception:
-                            self._safe_rollback()
-
-                    yield self._sse(
-                        {
-                            "type": "provider_error",
-                            "code": code,
-                            "agent": agent["name"],
-                            "message": message,
-                            "retryable": retryable,
-                            "audit_id": str(audit.id) if audit else None,
-                        }
-                    )
-
+                    code, msg, retry = self._classify_anthropic_error(exc)
+                    audit.status = AuditStatus.FAILED
+                    audit.error_message = msg
+                    self._safe_commit()
+                    yield self._sse({"type": "provider_error", "code": code, "agent": agent["name"], "message": msg, "retryable": retry, "audit_id": str(audit.id)})
                     return
-
-                except RateLimitError as exc:
-                    # -------------------------------------------------
-                    # QUOTA / RATE LIMIT
-                    # Stop immediately.
-                    # -------------------------------------------------
-
-                    code, message, retryable = (
-                        self._classify_anthropic_error(exc)
-                    )
-
-                    logger.warning(
-                        "Anthropic rate limit/quota during audit %s",
-                        getattr(audit, "id", None),
-                    )
-
-                    if audit is not None:
-                        audit.status = AuditStatus.FAILED
-                        audit.error_message = message
-                        audit.current_task = "Anthropic quota/rate limit"
-
-                        try:
-                            self._safe_commit()
-                        except Exception:
-                            self._safe_rollback()
-
-                    yield self._sse(
-                        {
-                            "type": "provider_error",
-                            "code": code,
-                            "agent": agent["name"],
-                            "message": message,
-                            "retryable": retryable,
-                            "audit_id": str(audit.id) if audit else None,
-                        }
-                    )
-
+                except (RateLimitError, APIConnectionError, APIStatusError) as exc:
+                    code, msg, retry = self._classify_anthropic_error(exc)
+                    audit.status = AuditStatus.FAILED
+                    audit.error_message = msg
+                    self._safe_commit()
+                    yield self._sse({"type": "provider_error", "code": code, "agent": agent["name"], "message": msg, "retryable": retry, "audit_id": str(audit.id)})
                     return
-
                 except Exception as exc:
-                    # -------------------------------------------------
-                    # Other agent-specific error
-                    # -------------------------------------------------
+                    logger.exception("Audit agent failed: %s", agent["name"])
+                    result = {"agent": agent["name"], "score": 0, "findings": [{"severity":"critical","title":"Agent execution failed","detail":str(exc),"recommendation":"Review the server log and rerun the audit.","evidence":""}]}
+                    results.append(result)
+                    yield self._sse({"type": "agent_error", "agent": agent["name"], "message": str(exc), "progress": 65 + int(((idx + 1) / total_agents) * 30)})
 
-                    logger.exception(
-                        "Audit agent failed: %s",
-                        agent["name"],
-                    )
-
-                    error_message = str(exc)
-
-                    findings = [
-                        f"Agent error: {error_message}"
-                    ]
-
-                    results.append(
-                        {
-                            "agent": agent["name"],
-                            "findings": findings,
-                            "score": 0,
-                        }
-                    )
-
-                    # Don't kill the entire audit for one ordinary
-                    # agent failure.
-                    yield self._sse(
-                        {
-                            "type": "agent_error",
-                            "agent": agent["name"],
-                            "message": error_message,
-                            "progress": int(
-                                ((idx + 1) / total_agents) * 100
-                            ),
-                        }
-                    )
-
-                    audit.current_task = (
-                        f"{agent['name']} failed; continuing audit"
-                    )
-
-                    audit.progress_percentage = int(
-                        ((idx + 1) / total_agents) * 100
-                    )
-
-                    try:
-                        self._safe_commit()
-                    except Exception:
-                        self._safe_rollback()
-                        raise
-
-            # -------------------------------------------------
-            # Final score
-            # -------------------------------------------------
-
-            average_score = (
-                sum(
-                    float(result["score"])
-                    for result in results
-                )
-                / len(results)
-                if results
-                else 0.0
-            )
-
-            average_score = round(
-                max(0.0, min(100.0, average_score)),
-                2,
-            )
-
-            # -------------------------------------------------
-            # Complete audit
-            # -------------------------------------------------
-
+            average_score = round(sum(float(r.get("score", 0)) for r in results) / max(1, len(results)), 2)
             audit.status = AuditStatus.COMPLETED
             audit.completed_at = datetime.now(timezone.utc)
             audit.progress_percentage = 100
-            # -------------------------------------------------
-            # Persist agent scores into the Audit model
-            # -------------------------------------------------
-
-            agent_score_fields = {
-                "Technical SEO Agent": "technical_score",
-                "Content SEO Agent": "content_score",
-                "Local SEO Agent": "local_seo_score",
-                "Schema Agent": "schema_score",
-                "EEAT Agent": "eeat_score",
-                "Backlink Agent": "backlink_score",
-                "AI Search Agent": "ai_search_score",
-            }
-
-            for result in results:
-                agent_name = str(result.get("agent", "")).strip()
-                score = result.get("score")
-
-                field_name = agent_score_fields.get(agent_name)
-
-                if field_name is None:
-                    continue
-
-                try:
-                    numeric_score = float(score)
-                except (TypeError, ValueError):
-                    continue
-
-                numeric_score = max(
-                    0.0,
-                    min(100.0, numeric_score),
-                )
-
-                setattr(
-                    audit,
-                    field_name,
-                    numeric_score,
-                )
-            audit.overall_score = average_score
+            audit.overall_score = average_score if hasattr(audit, "overall_score") else average_score
             audit.current_stage = "Completed"
             audit.current_task = "Audit completed successfully"
-
-            started_at = audit.started_at
-
-            if started_at:
-                duration = (
-                    datetime.now(timezone.utc) - started_at
-                ).total_seconds()
-
-                if hasattr(audit, "duration_seconds"):
-                    try:
-                        # Only write when the model attribute is
-                        # actually writable.
-                        audit.duration_seconds = int(
-                            max(0, duration)
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Could not persist duration_seconds."
-                        )
-
+            if audit.started_at and hasattr(audit, "duration_seconds"):
+                audit.duration_seconds = int(max(0, (datetime.now(timezone.utc) - audit.started_at).total_seconds()))
+            score_fields = {"Technical SEO Agent":"technical_score","Content SEO Agent":"content_score","Local SEO Agent":"local_seo_score","Schema Agent":"schema_score","EEAT Agent":"eeat_score","Backlink Agent":"backlink_score","AI Search Agent":"ai_search_score","Internal Linking Agent":"internal_linking_score"}
+            for r in results:
+                field = score_fields.get(r.get("agent"))
+                if field and hasattr(audit, field):
+                    setattr(audit, field, float(r.get("score", 0)))
             self._safe_commit()
 
-            # -------------------------------------------------
-            # Generate report
-            # -------------------------------------------------
-
-            report_warning: str | None = None
-
+            report_warning = None
             try:
                 from services.report_service import ReportService
-
-                report_service = ReportService(self.db)
-
-                report_service.generate_report_from_audit(
-                    audit,
-                    results,
-                )
-
+                ReportService(self.db).generate_report_from_audit(audit, results)
             except Exception as exc:
-                logger.exception(
-                    "Report generation failed for audit %s",
-                    audit.id,
-                )
+                logger.exception("Report generation failed for audit %s", audit.id)
+                report_warning = f"Audit completed, but report generation failed: {exc}"
+                yield self._sse({"type":"warning","message":report_warning})
 
-                report_warning = (
-                    "Audit completed, but report generation failed. "
-                    f"Reason: {exc}"
-                )
-
-                yield self._sse(
-                    {
-                        "type": "warning",
-                        "message": report_warning,
-                    }
-                )
-
-            # -------------------------------------------------
-            # Final event
-            # -------------------------------------------------
-
-            yield self._sse(
-                {
-                    "type": "complete",
-                    "audit_id": str(audit.id),
-                    "completed_agents": total_agents,
-                    "total_agents": total_agents,
-                    "progress": 100,
-                    "score": average_score,
-                    "results": results,
-                    "report_warning": report_warning,
-                }
-            )
-
+            yield self._sse({"type":"complete","audit_id":str(audit.id),"completed_agents":total_agents,"total_agents":total_agents,"progress":100,"score":average_score,"crawl_metrics":{k:crawl[k] for k in ("pages_discovered","pages_crawled","pages_successful","internal_links","external_links","broken_internal_links","orphan_pages_count","sitemap_found","robots_found","schema_found","duplicate_pages")},"results":results,"report_warning":report_warning})
         except asyncio.CancelledError:
-            logger.info(
-                "Audit stream cancelled. audit=%s",
-                getattr(audit, "id", None),
-            )
-
             if audit is not None:
                 audit.status = AuditStatus.CANCELLED
                 audit.current_task = "Audit cancelled"
-
-                try:
-                    self._safe_commit()
-                except Exception:
-                    self._safe_rollback()
-
+                self._safe_commit()
             raise
-
         except Exception as exc:
-            # -----------------------------------------------------
-            # Unexpected audit-level failure
-            # -----------------------------------------------------
-
-            logger.exception(
-                "Unhandled audit streaming error."
-            )
-
+            logger.exception("Unhandled audit streaming error")
             if audit is not None:
                 audit.status = AuditStatus.FAILED
                 audit.error_message = str(exc)
                 audit.current_task = "Audit failed"
-
                 try:
                     self._safe_commit()
                 except Exception:
-                    self._safe_rollback()
-
-            yield self._sse(
-                {
-                    "type": "error",
-                    "message": (
-                        "Audit failed unexpectedly. "
-                        f"Reason: {exc}"
-                    ),
-                    "audit_id": str(audit.id) if audit else None,
-                }
-            )
+                    self.db.rollback()
+            yield self._sse({"type":"error","message":f"Audit failed unexpectedly. Reason: {exc}","audit_id":str(audit.id) if audit else None})
