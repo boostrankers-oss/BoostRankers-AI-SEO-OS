@@ -1,7 +1,18 @@
-import { createContext, useContext, useState, ReactNode } from 'react';
-import { api } from '@/lib/api';
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  ReactNode,
+} from "react";
+import { api } from "@/lib/api";
 
-export type UserRole = "super_admin" | "agency_admin" | "manager" | "seo_specialist" | "client";
+export type UserRole =
+  | "super_admin"
+  | "agency_admin"
+  | "manager"
+  | "seo_specialist"
+  | "client";
 
 export interface User {
   id: string;
@@ -12,7 +23,6 @@ export interface User {
   company_id: string | null;
   is_verified: boolean;
 }
-
 
 interface AuthTokens {
   access_token: string;
@@ -36,30 +46,129 @@ interface AuthContextType {
     last_name: string;
     company_name?: string;
   }) => Promise<void>;
-  logout: () => void;
+  logout: () => Promise<void>;
   loading: boolean;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(() => {
-    const stored = localStorage.getItem('boost_user');
-    return stored ? JSON.parse(stored) : null;
-  });
-  const [loading, setLoading] = useState(false);
+function saveSession(user: User, tokens: AuthTokens): void {
+  localStorage.setItem("access_token", tokens.access_token);
+  localStorage.setItem("refresh_token", tokens.refresh_token);
+  localStorage.setItem("boost_user", JSON.stringify(user));
+}
 
-  const login = async (email: string, password: string) => {
-    setLoading(true);
+function clearSession(): void {
+  localStorage.removeItem("access_token");
+  localStorage.removeItem("refresh_token");
+  localStorage.removeItem("boost_user");
+}
+
+export function AuthProvider({
+  children,
+}: {
+  children: ReactNode;
+}) {
+  const [user, setUser] = useState<User | null>(() => {
     try {
-      const response = await api.post<AuthResponse>('/api/auth/login', { email, password });
-      const { user, tokens } = response;
-      localStorage.setItem('access_token', tokens.access_token);
-      localStorage.setItem('refresh_token', tokens.refresh_token);
-      setUser(user);
-      localStorage.setItem('boost_user', JSON.stringify(user));
+      const stored = localStorage.getItem("boost_user");
+      return stored ? (JSON.parse(stored) as User) : null;
+    } catch {
+      localStorage.removeItem("boost_user");
+      return null;
+    }
+  });
+
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const restoreSession = async () => {
+      const accessToken = localStorage.getItem("access_token");
+      const refreshToken = localStorage.getItem("refresh_token");
+
+      if (!accessToken || !refreshToken) {
+        if (mounted) {
+          setUser(null);
+          setLoading(false);
+        }
+        return;
+      }
+
+      try {
+        const currentUser = await api.get<User>("/api/auth/me");
+
+        if (mounted) {
+          setUser(currentUser);
+          localStorage.setItem(
+            "boost_user",
+            JSON.stringify(currentUser)
+          );
+        }
+      } catch (error) {
+        console.warn(
+          "Session restoration failed. Clearing local session.",
+          error
+        );
+
+        clearSession();
+
+        if (mounted) {
+          setUser(null);
+        }
+      } finally {
+        if (mounted) {
+          setLoading(false);
+        }
+      }
+    };
+
+    restoreSession();
+
+    const handleAuthExpired = () => {
+      if (!mounted) return;
+
+      clearSession();
+      setUser(null);
+      setLoading(false);
+    };
+
+    window.addEventListener("auth:expired", handleAuthExpired);
+
+    return () => {
+      mounted = false;
+      window.removeEventListener(
+        "auth:expired",
+        handleAuthExpired
+      );
+    };
+  }, []);
+
+  const login = async (
+    email: string,
+    password: string
+  ): Promise<void> => {
+    setLoading(true);
+
+    try {
+      const response = await api.post<AuthResponse>(
+        "/api/auth/login",
+        {
+          email,
+          password,
+        },
+        {
+          auth: false,
+        }
+      );
+
+      const { user: loggedInUser, tokens } = response;
+
+      saveSession(loggedInUser, tokens);
+      setUser(loggedInUser);
     } catch (error) {
-      console.error('Login failed:', error);
+      console.error("Login failed:", error);
       throw error;
     } finally {
       setLoading(false);
@@ -73,36 +182,78 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     first_name: string;
     last_name: string;
     company_name?: string;
-  }) => {
+  }): Promise<void> => {
     setLoading(true);
+
     try {
       const payload = {
         ...data,
         full_name: `${data.first_name} ${data.last_name}`.trim(),
       };
-      const response = await api.post<AuthResponse>('/api/auth/signup', payload);
-      const { user, tokens } = response;
-      localStorage.setItem('access_token', tokens.access_token);
-      localStorage.setItem('refresh_token', tokens.refresh_token);
-      setUser(user);
-      localStorage.setItem('boost_user', JSON.stringify(user));
+
+      /*
+       * The supplied backend auth router exposes /register,
+       * not /signup.
+       */
+      const response = await api.post<AuthResponse>(
+        "/api/auth/register",
+        payload,
+        {
+          auth: false,
+        }
+      );
+
+      const { user: registeredUser, tokens } = response;
+
+      saveSession(registeredUser, tokens);
+      setUser(registeredUser);
     } catch (error) {
-      console.error('Signup failed:', error);
+      console.error("Signup failed:", error);
       throw error;
     } finally {
       setLoading(false);
     }
   };
 
-  const logout = () => {
-    localStorage.removeItem('access_token');
-    localStorage.removeItem('refresh_token');
-    localStorage.removeItem('boost_user');
-    setUser(null);
+  const logout = async (): Promise<void> => {
+    const refreshToken =
+      localStorage.getItem("refresh_token");
+
+    try {
+      if (refreshToken) {
+        await api.post(
+          "/api/auth/logout",
+          {
+            refresh_token: refreshToken,
+          },
+          {
+            auth: false,
+            skipRefresh: true,
+          }
+        );
+      }
+    } catch (error) {
+      /*
+       * Logout must still clear the local session when the
+       * network/server is unavailable.
+       */
+      console.warn("Server logout failed:", error);
+    } finally {
+      clearSession();
+      setUser(null);
+    }
   };
 
   return (
-    <AuthContext.Provider value={{ user, login, signup, logout, loading }}>
+    <AuthContext.Provider
+      value={{
+        user,
+        login,
+        signup,
+        logout,
+        loading,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );
@@ -110,6 +261,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
 export function useAuth() {
   const context = useContext(AuthContext);
-  if (!context) throw new Error('useAuth must be used within AuthProvider');
+
+  if (!context) {
+    throw new Error(
+      "useAuth must be used within AuthProvider"
+    );
+  }
+
   return context;
 }

@@ -15,21 +15,64 @@ class ApiError extends Error {
 
 type RequestOptions = RequestInit & {
   auth?: boolean;
+  skipRefresh?: boolean;
 };
+
+interface RefreshResponse {
+  access_token?: string;
+  refresh_token?: string;
+  token_type?: string;
+  expires_in?: number;
+  refresh_expires_in?: number;
+  tokens?: {
+    access_token?: string;
+    refresh_token?: string;
+    token_type?: string;
+    expires_in?: number;
+    refresh_expires_in?: number;
+  };
+}
 
 class ApiClient {
   private readonly baseUrl: string;
+  private refreshPromise: Promise<boolean> | null = null;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
   }
 
   private getToken(): string | null {
-    if (typeof window === "undefined") {
-      return null;
+    if (typeof window === "undefined") return null;
+    return localStorage.getItem("access_token");
+  }
+
+  private getRefreshToken(): string | null {
+    if (typeof window === "undefined") return null;
+    return localStorage.getItem("refresh_token");
+  }
+
+  private clearAuthStorage(): void {
+    if (typeof window === "undefined") return;
+
+    localStorage.removeItem("access_token");
+    localStorage.removeItem("refresh_token");
+    localStorage.removeItem("boost_user");
+
+    window.dispatchEvent(new CustomEvent("auth:expired"));
+  }
+
+  private saveTokens(data: RefreshResponse): boolean {
+    const tokens = data.tokens ?? data;
+    const accessToken = tokens.access_token;
+    const refreshToken = tokens.refresh_token;
+
+    if (!accessToken || !refreshToken) {
+      return false;
     }
 
-    return localStorage.getItem("access_token");
+    localStorage.setItem("access_token", accessToken);
+    localStorage.setItem("refresh_token", refreshToken);
+    return true;
   }
 
   private buildHeaders(
@@ -40,31 +83,22 @@ class ApiClient {
     const requestHeaders = new Headers(headers);
 
     if (hasBody && !requestHeaders.has("Content-Type")) {
-      requestHeaders.set(
-        "Content-Type",
-        "application/json"
-      );
+      requestHeaders.set("Content-Type", "application/json");
     }
 
     if (auth) {
       const token = this.getToken();
 
       if (token) {
-        requestHeaders.set(
-          "Authorization",
-          `Bearer ${token}`
-        );
+        requestHeaders.set("Authorization", `Bearer ${token}`);
       }
     }
 
     return requestHeaders;
   }
 
-  private async parseError(
-    response: Response
-  ): Promise<unknown> {
-    const contentType =
-      response.headers.get("content-type") || "";
+  private async parseError(response: Response): Promise<unknown> {
+    const contentType = response.headers.get("content-type") || "";
 
     try {
       if (contentType.includes("application/json")) {
@@ -77,53 +111,106 @@ class ApiClient {
     }
   }
 
+  private async refreshAccessToken(): Promise<boolean> {
+    const refreshToken = this.getRefreshToken();
+
+    if (!refreshToken) {
+      this.clearAuthStorage();
+      return false;
+    }
+
+    if (this.refreshPromise) {
+      return this.refreshPromise;
+    }
+
+    this.refreshPromise = (async () => {
+      try {
+        const response = await fetch(`${this.baseUrl}/api/auth/refresh`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            refresh_token: refreshToken,
+          }),
+        });
+
+        if (!response.ok) {
+          return false;
+        }
+
+        const data = (await response.json()) as RefreshResponse;
+        return this.saveTokens(data);
+      } catch (error) {
+        console.error("Token refresh failed:", error);
+        return false;
+      } finally {
+        this.refreshPromise = null;
+      }
+    })();
+
+    const refreshed = await this.refreshPromise;
+
+    if (!refreshed) {
+      this.clearAuthStorage();
+    }
+
+    return refreshed;
+  }
+
   private async request<T>(
     endpoint: string,
-    options: RequestOptions = {}
+    options: RequestOptions = {},
+    retry = true
   ): Promise<T> {
     const {
       auth = true,
+      skipRefresh = false,
       headers,
       body,
       ...rest
     } = options;
 
-    const hasBody =
-      body !== undefined &&
-      body !== null;
+    const hasBody = body !== undefined && body !== null;
 
-    const requestHeaders =
-      this.buildHeaders(
-        headers,
-        auth,
-        hasBody
-      );
-
-    const response = await fetch(
-      `${this.baseUrl}${endpoint}`,
-      {
-        ...rest,
-        headers: requestHeaders,
-        body,
-      }
+    const requestHeaders = this.buildHeaders(
+      headers,
+      auth,
+      hasBody
     );
 
-    if (!response.ok) {
-      const errorData =
-        await this.parseError(response);
+    const response = await fetch(`${this.baseUrl}${endpoint}`, {
+      ...rest,
+      headers: requestHeaders,
+      body,
+    });
 
-      throw new ApiError(
-        response.status,
-        errorData
-      );
+    if (response.status === 401 && auth && retry && !skipRefresh) {
+      const refreshed = await this.refreshAccessToken();
+
+      if (refreshed) {
+        return this.request<T>(
+          endpoint,
+          {
+            ...options,
+            skipRefresh: true,
+          },
+          false
+        );
+      }
+    }
+
+    if (!response.ok) {
+      const errorData = await this.parseError(response);
+
+      throw new ApiError(response.status, errorData);
     }
 
     if (response.status === 204) {
       return {} as T;
     }
 
-    const contentType =
-      response.headers.get("content-type") || "";
+    const contentType = response.headers.get("content-type") || "";
 
     if (contentType.includes("application/json")) {
       return (await response.json()) as T;
@@ -206,51 +293,52 @@ class ApiClient {
     const form = new FormData();
     form.append(field, file);
 
-    const token = this.getToken();
-
-    const headers = new Headers(
-      options.headers
-    );
-
-    /*
-     * Do NOT set Content-Type manually for FormData.
-     * The browser must generate the multipart boundary.
-     */
+    const headers = new Headers(options.headers);
     headers.delete("Content-Type");
 
+    const token = this.getToken();
+
     if (token) {
-      headers.set(
-        "Authorization",
-        `Bearer ${token}`
-      );
+      headers.set("Authorization", `Bearer ${token}`);
     }
 
-    const response = await fetch(
-      `${this.baseUrl}${url}`,
-      {
-        ...options,
-        method: "POST",
-        headers,
-        body: form,
+    const response = await fetch(`${this.baseUrl}${url}`, {
+      ...options,
+      method: "POST",
+      headers,
+      body: form,
+    });
+
+    if (response.status === 401 && options.auth !== false) {
+      const refreshed = await this.refreshAccessToken();
+
+      if (refreshed) {
+        const retryHeaders = new Headers(options.headers);
+        retryHeaders.delete("Content-Type");
+
+        const newToken = this.getToken();
+        if (newToken) {
+          retryHeaders.set("Authorization", `Bearer ${newToken}`);
+        }
+
+        return this.upload<T>(url, file, field, {
+          ...options,
+          headers: retryHeaders,
+          auth: true,
+        });
       }
-    );
+    }
 
     if (!response.ok) {
-      const errorData =
-        await this.parseError(response);
-
-      throw new ApiError(
-        response.status,
-        errorData
-      );
+      const errorData = await this.parseError(response);
+      throw new ApiError(response.status, errorData);
     }
 
     if (response.status === 204) {
       return {} as T;
     }
 
-    const contentType =
-      response.headers.get("content-type") || "";
+    const contentType = response.headers.get("content-type") || "";
 
     if (contentType.includes("application/json")) {
       return (await response.json()) as T;
@@ -269,43 +357,43 @@ class ApiClient {
       ...rest
     } = options;
 
-    const requestHeaders =
-      this.buildHeaders(
-        headers,
-        auth,
-        false
-      );
-
-    const response = await fetch(
-      `${this.baseUrl}${url}`,
-      {
-        ...rest,
-        method: "GET",
-        headers: requestHeaders,
-      }
+    const requestHeaders = this.buildHeaders(
+      headers,
+      auth,
+      false
     );
 
-    if (!response.ok) {
-      const errorData =
-        await this.parseError(response);
+    let response = await fetch(`${this.baseUrl}${url}`, {
+      ...rest,
+      method: "GET",
+      headers: requestHeaders,
+    });
 
-      throw new ApiError(
-        response.status,
-        errorData
-      );
+    if (response.status === 401 && auth) {
+      const refreshed = await this.refreshAccessToken();
+
+      if (refreshed) {
+        response = await fetch(`${this.baseUrl}${url}`, {
+          ...rest,
+          method: "GET",
+          headers: this.buildHeaders(headers, true, false),
+        });
+      }
+    }
+
+    if (!response.ok) {
+      const errorData = await this.parseError(response);
+      throw new ApiError(response.status, errorData);
     }
 
     return response.blob();
   }
 
   stream(url: string): EventSource {
-    return new EventSource(
-      `${this.baseUrl}${url}`
-    );
+    return new EventSource(`${this.baseUrl}${url}`);
   }
 }
 
-export const api =
-  new ApiClient(API_BASE_URL);
+export const api = new ApiClient(API_BASE_URL);
 
 export { ApiError };
