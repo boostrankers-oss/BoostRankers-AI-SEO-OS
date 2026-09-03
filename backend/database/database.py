@@ -104,26 +104,26 @@ if DATABASE_URL.startswith("postgresql://"):
 try:
     DATABASE_POOL_SIZE = max(
         1,
-        int(os.getenv("DATABASE_POOL_SIZE", "2")),
+        int(os.getenv("DATABASE_POOL_SIZE", "5")),
     )
 except (TypeError, ValueError):
-    DATABASE_POOL_SIZE = 2
+    DATABASE_POOL_SIZE = 5
 
 try:
     DATABASE_MAX_OVERFLOW = max(
         0,
-        int(os.getenv("DATABASE_MAX_OVERFLOW", "0")),
+        int(os.getenv("DATABASE_MAX_OVERFLOW", "5")),
     )
 except (TypeError, ValueError):
-    DATABASE_MAX_OVERFLOW = 0
+    DATABASE_MAX_OVERFLOW = 5
 
 try:
     DATABASE_POOL_TIMEOUT = max(
         5,
-        int(os.getenv("DATABASE_POOL_TIMEOUT", "30")),
+        int(os.getenv("DATABASE_POOL_TIMEOUT", "60")),
     )
 except (TypeError, ValueError):
-    DATABASE_POOL_TIMEOUT = 30
+    DATABASE_POOL_TIMEOUT = 60
 
 try:
     DATABASE_POOL_RECYCLE = max(

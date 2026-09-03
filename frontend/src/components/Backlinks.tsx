@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, type ClipboardEvent, type FormEvent } from "react";
 import {
   ResponsiveContainer,
   AreaChart,
@@ -42,6 +42,16 @@ import {
   AlertCircle,
   Wand2,
   CreditCard,
+  Bold,
+  Italic,
+  List,
+  ListOrdered,
+  Heading2,
+  Link as LinkIcon,
+  Quote,
+  RemoveFormatting,
+  Undo2,
+  Redo2,
 } from "lucide-react";
 import { useClaude } from "@/components/ClaudeProvider";
 import { cn } from "@/lib/utils";
@@ -92,21 +102,196 @@ interface Statistics {
   link_types: { [key: string]: number };
 }
 
-interface PublishBacklinkResponse {
+type PublishWordPressResponse = {
   verified: boolean;
   backlink?: Backlink;
   message: string;
-}
+};
 
-interface OutreachGenerateResponse {
-  email: OutreachEmail;
-}
+type AnalyzeBacklinkResponse = {
+  analysis: string;
+};
 
-interface OutreachSendResponse {
+type GenerateEmailResponse = {
+  email?: OutreachEmail;
+};
+
+type MessageResponse = {
   message: string;
-}
+};
 
 const COLORS = ["#10b981", "#6366f1", "#f59e0b", "#8b5cf6"];
+
+const RICH_TEXT_ALLOWED_TAGS = new Set([
+  "P",
+  "BR",
+  "H1",
+  "H2",
+  "H3",
+  "STRONG",
+  "B",
+  "EM",
+  "I",
+  "UL",
+  "OL",
+  "LI",
+  "BLOCKQUOTE",
+  "A",
+]);
+
+/**
+ * Keep the backlink editor intentionally dependency-free.
+ * WordPress receives semantic HTML instead of a plain-text blob.
+ */
+function sanitizeRichTextHtml(html: string): string {
+  if (!html.trim()) return "";
+
+  const doc = new DOMParser().parseFromString(html, "text/html");
+
+  const cleanNode = (node: Node): Node | null => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      return document.createTextNode(node.textContent || "");
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return null;
+
+    const element = node as HTMLElement;
+    const tag = element.tagName.toUpperCase();
+
+    if (!RICH_TEXT_ALLOWED_TAGS.has(tag)) {
+      const fragment = document.createDocumentFragment();
+      Array.from(element.childNodes).forEach((child) => {
+        const cleaned = cleanNode(child);
+        if (cleaned) fragment.appendChild(cleaned);
+      });
+      return fragment;
+    }
+
+    const clean = document.createElement(tag.toLowerCase());
+
+    if (tag === "A") {
+      const href = element.getAttribute("href") || "";
+      try {
+        const parsed = new URL(href, window.location.origin);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          clean.setAttribute("href", parsed.href);
+          clean.setAttribute("target", "_blank");
+          clean.setAttribute("rel", "noopener noreferrer");
+        }
+      } catch {
+        // Drop invalid links while retaining their text.
+      }
+    }
+
+    Array.from(element.childNodes).forEach((child) => {
+      const cleaned = cleanNode(child);
+      if (cleaned) clean.appendChild(cleaned);
+    });
+
+    return clean;
+  };
+
+  const output = document.createElement("div");
+  Array.from(doc.body.childNodes).forEach((child) => {
+    const cleaned = cleanNode(child);
+    if (cleaned) output.appendChild(cleaned);
+  });
+
+  return output.innerHTML.trim();
+}
+
+function plainTextToRichHtml(text: string): string {
+  const normalized = text.replace(/\r\n?/g, "\n").trim();
+  if (!normalized) return "";
+
+  const lines = normalized.split("\n");
+  const blocks: string[] = [];
+  let paragraph: string[] = [];
+  let listType: "ul" | "ol" | null = null;
+  let listItems: string[] = [];
+
+  const escapeHtml = (value: string) =>
+    value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
+  const flushParagraph = () => {
+    if (paragraph.length) {
+      blocks.push(`<p>${escapeHtml(paragraph.join(" "))}</p>`);
+      paragraph = [];
+    }
+  };
+
+  const flushList = () => {
+    if (listType && listItems.length) {
+      blocks.push(`<${listType}>${listItems.map((item) => `<li>${item}</li>`).join("")}</${listType}>`);
+    }
+    listType = null;
+    listItems = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    if (!line) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    // Markdown headings pasted into the editor.
+    const markdownHeading = line.match(/^#{1,3}\s+(.+)$/);
+    if (markdownHeading) {
+      flushParagraph();
+      flushList();
+      const level = Math.min(markdownHeading[0].match(/^#+/)?.[0].length || 2, 3);
+      blocks.push(`<h${level}>${escapeHtml(markdownHeading[1].trim())}</h${level}>`);
+      continue;
+    }
+
+    // Common article structure: "1. Heading", "2. Heading", etc.
+    const numberedHeading = line.match(/^(\d+)\.\s+(.+)$/);
+    if (numberedHeading) {
+      flushParagraph();
+      flushList();
+      blocks.push(`<h2>${escapeHtml(numberedHeading[2].trim())}</h2>`);
+      continue;
+    }
+
+    const bullet = line.match(/^[-*•]\s+(.+)$/);
+    if (bullet) {
+      flushParagraph();
+      if (listType !== "ul") {
+        flushList();
+        listType = "ul";
+      }
+      listItems.push(escapeHtml(bullet[1].trim()));
+      continue;
+    }
+
+    const ordered = line.match(/^\d+[.)]\s+(.+)$/);
+    if (ordered) {
+      flushParagraph();
+      if (listType !== "ol") {
+        flushList();
+        listType = "ol";
+      }
+      listItems.push(escapeHtml(ordered[1].trim()));
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line);
+  }
+
+  flushParagraph();
+  flushList();
+
+  return blocks.join("\n");
+}
 
 export function Backlinks() {
   const { isConfigured } = useClaude();
@@ -116,6 +301,7 @@ export function Backlinks() {
   const [outreachEmails, setOutreachEmails] = useState<OutreachEmail[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
   // UI state
   const [activeTab, setActiveTab] = useState<
     "dashboard" | "analysis" | "opportunities" | "outreach"
@@ -135,6 +321,70 @@ export function Backlinks() {
     anchor_text: "",
     status: "publish",
   });
+
+  const [richTextMode, setRichTextMode] = useState<"visual" | "html">("visual");
+  const [editorHtml, setEditorHtml] = useState("");
+
+  const updateWordPressContent = (content: string) => {
+    setEditorHtml(content);
+    setWordpressBacklink((current) => ({ ...current, content }));
+  };
+
+  const syncEditorHtml = (html: string) => {
+    const clean = sanitizeRichTextHtml(html);
+    updateWordPressContent(clean);
+    return clean;
+  };
+
+  const runEditorCommand = (command: string, value?: string) => {
+    document.execCommand(command, false, value);
+    const editor = document.getElementById("wordpress-backlink-editor");
+    if (editor) {
+      syncEditorHtml(editor.innerHTML);
+      editor.focus();
+    }
+  };
+
+  const insertEditorLink = () => {
+    const url = window.prompt("Enter the URL for the selected text:");
+    if (!url?.trim()) return;
+    runEditorCommand("createLink", url.trim());
+  };
+
+  const handleEditorPaste = (event: ClipboardEvent<HTMLDivElement>) => {
+    event.preventDefault();
+
+    const html = event.clipboardData.getData("text/html");
+    const plain = event.clipboardData.getData("text/plain");
+
+    if (html.trim()) {
+      const clean = sanitizeRichTextHtml(html);
+      document.execCommand("insertHTML", false, clean || plainTextToRichHtml(plain));
+    } else {
+      document.execCommand("insertHTML", false, plainTextToRichHtml(plain));
+    }
+
+    const editor = event.currentTarget;
+    syncEditorHtml(editor.innerHTML);
+  };
+
+  const handleEditorInput = (event: FormEvent<HTMLDivElement>) => {
+    syncEditorHtml(event.currentTarget.innerHTML);
+  };
+
+  const resetWordPressEditor = () => {
+    setEditorHtml("");
+    setWordpressBacklink({
+      wordpress_site: "",
+      wordpress_username: "",
+      wordpress_application_password: "",
+      title: "",
+      content: "",
+      target_url: "",
+      anchor_text: "",
+      status: "publish",
+    });
+  };
   const [newBacklink, setNewBacklink] = useState({
     source_url: "",
     target_url: "",
@@ -160,43 +410,49 @@ export function Backlinks() {
 
   const fetchAllData = async () => {
     setLoading(true);
+    setError(null);
     try {
       // Use Promise.allSettled to avoid one failure breaking everything
       const results = await Promise.allSettled([
-        api.get<Statistics>("/api/backlinks/statistics"),
-        api.get<Backlink[]>("/api/backlinks"),
-        api.get<Opportunity[]>("/api/backlinks/opportunities"),
-        api.get<OutreachEmail[]>("/api/backlinks/outreach"),
+        api.get("/api/backlinks/statistics"),
+        api.get("/api/backlinks"),
+        api.get("/api/backlinks/opportunities"),
+        api.get("/api/backlinks/outreach"),
       ]);
 
-      // Extract each response with its declared type.
-      const getSettledValue = <T,>(
-        result: PromiseSettledResult<T>,
-      ): T | null =>
-        result.status === "fulfilled" ? result.value : null;
+      // Extract typed data or fallback to empty/default values.
+      const statsData: Statistics | null =
+        results[0].status === "fulfilled" ? (results[0].value as Statistics) : null;
+      const backlinksData: Backlink[] =
+        results[1].status === "fulfilled" && Array.isArray(results[1].value)
+          ? (results[1].value as Backlink[])
+          : [];
+      const oppsData: Opportunity[] =
+        results[2].status === "fulfilled" && Array.isArray(results[2].value)
+          ? (results[2].value as Opportunity[])
+          : [];
+      const emailsData: OutreachEmail[] =
+        results[3].status === "fulfilled" && Array.isArray(results[3].value)
+          ? (results[3].value as OutreachEmail[])
+          : [];
 
-      const statsData = getSettledValue(results[0]);
-      const backlinksData = getSettledValue(results[1]);
-      const oppsData = getSettledValue(results[2]);
-      const emailsData = getSettledValue(results[3]);
+      const defaultStats: Statistics = {
+        total: 0,
+        referring_domains: 0,
+        domain_authority: 0,
+        toxic_links: 0,
+        new_this_month: 0,
+        new_domains: 0,
+        da_change: 0,
+        toxic_fixed: 0,
+        growth_history: [],
+        link_types: {},
+      };
 
-      setStats(
-        statsData || {
-          total: 0,
-          referring_domains: 0,
-          domain_authority: 0,
-          toxic_links: 0,
-          new_this_month: 0,
-          new_domains: 0,
-          da_change: 0,
-          toxic_fixed: 0,
-          growth_history: [],
-          link_types: {},
-        },
-      );
-      setBacklinks(backlinksData || []);
-      setOpportunities(oppsData || []);
-      setOutreachEmails(emailsData || []);
+      setStats(statsData ?? defaultStats);
+      setBacklinks(backlinksData);
+      setOpportunities(oppsData);
+      setOutreachEmails(emailsData);
     } catch (err) {
       console.error("Failed to fetch backlink data:", err);
        setError("Could not load backlink data. Please try again.");
@@ -206,33 +462,40 @@ export function Backlinks() {
   };
 
   const handleCreateWordPressBacklink = async () => {
+    const contentHtml = sanitizeRichTextHtml(editorHtml);
+    const contentText = contentHtml.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+
+    if (contentText.length < 300) {
+      const message = "Post content must contain at least 300 readable characters.";
+      setCreateResult(message);
+      toast.error(message);
+      return;
+    }
+
     setCreatingBacklink(true);
     setCreateResult(null);
     try {
-      const data = await api.post<PublishBacklinkResponse>(
+      const data = (await api.post(
         "/api/backlinks/publish/wordpress",
-        wordpressBacklink,
-      );
+        {
+          ...wordpressBacklink,
+          content: sanitizeRichTextHtml(editorHtml),
+        },
+      )) as PublishWordPressResponse;
 
-      if (data.verified && data.backlink) {
+      const publishedBacklink: Backlink | undefined = data.backlink;
+
+      if (data.verified && publishedBacklink !== undefined) {
         toast.success("Backlink published and verified.");
         setCreateResult(data.message);
-        setBacklinks((current) => [data.backlink!, ...current]);
+        setBacklinks((current) => [publishedBacklink, ...current]);
       } else {
         toast.success("WordPress content published; verification is still pending.");
         setCreateResult(data.message || "Published, but not yet verified.");
       }
 
-      setWordpressBacklink({
-        wordpress_site: "",
-        wordpress_username: "",
-        wordpress_application_password: "",
-        title: "",
-        content: "",
-        target_url: "",
-        anchor_text: "",
-        status: "publish",
-      });
+      resetWordPressEditor();
+      setRichTextMode("visual");
       fetchAllData();
     } catch (err: any) {
       const message = err?.data?.detail || err?.message || "Backlink publication failed.";
@@ -245,7 +508,7 @@ export function Backlinks() {
 
   const handleAddBacklink = async () => {
     try {
-      const data = await api.post<Backlink>("/api/backlinks", newBacklink);
+      const data = (await api.post("/api/backlinks", newBacklink)) as Backlink;
       setBacklinks([data, ...backlinks]);
       setIsAddOpen(false);
       setNewBacklink({ source_url: "", target_url: "", anchor_text: "", link_type: "Dofollow" });
@@ -273,7 +536,7 @@ export function Backlinks() {
   const handleAnalyze = async (id: string) => {
     setAnalyzingId(id);
     try {
-      const data = await api.post<{ analysis: string }>(`/api/backlinks/${id}/analyze`);
+      const data = (await api.post(`/api/backlinks/${id}/analyze`)) as AnalyzeBacklinkResponse;
       setBacklinks(
         backlinks.map((b) =>
           b.id === id ? { ...b, ai_analysis: data.analysis } : b
@@ -294,7 +557,7 @@ export function Backlinks() {
 
   const handleGenerateOpportunities = async () => {
     try {
-      const data = await api.post<Opportunity[]>("/api/backlinks/opportunities/generate");
+      const data = (await api.post("/api/backlinks/opportunities/generate")) as Opportunity[];
       setOpportunities([...data, ...opportunities]);
       toast.success("Opportunities generated");
       fetchAllData();
@@ -311,7 +574,7 @@ export function Backlinks() {
   const handleGenerateEmail = async (oppId: string) => {
     setGeneratingEmail({ id: oppId, loading: true });
     try {
-      const data = await api.post<OutreachGenerateResponse>(`/api/backlinks/opportunities/${oppId}/outreach`);
+      const data = (await api.post(`/api/backlinks/opportunities/${oppId}/outreach`)) as GenerateEmailResponse;
       const generated = data?.email;
       if (!generated?.id) {
         throw new Error("The outreach email was generated but no email record was returned.");
@@ -345,15 +608,15 @@ export function Backlinks() {
         throw new Error("Outreach email not found.");
       }
       if (draft.status !== "sent") {
-        const updated = await api.put<OutreachEmail>(`/api/backlinks/outreach/${emailId}`, {
+        const updated = (await api.put(`/api/backlinks/outreach/${emailId}`, {
           subject: draft.subject,
           body: draft.body,
-        });
+        })) as OutreachEmail;
         setGeneratedEmail(updated);
       }
-      const data = await api.post<OutreachSendResponse>(`/api/backlinks/outreach/${emailId}/send`, {
+      const data = (await api.post(`/api/backlinks/outreach/${emailId}/send`, {
         recipient_email: recipientEmail.trim(),
-      });
+      })) as MessageResponse;
       toast.success(data?.message || "Outreach email sent successfully.");
       setRecipientEmail("");
       if (generatedEmail?.id === emailId) {
@@ -379,7 +642,8 @@ export function Backlinks() {
       await api.post(`/api/company/add-credits?amount=${budgetAmount}`, {});
       toast.success(`Added ${budgetAmount} credits.`);
       setShowBudgetDialog(false);
-      } catch (error) {
+      setError(null);
+    } catch (error) {
       console.error("Failed to add credits:", error);
       toast.error("Could not add credits.");
     } finally {
@@ -408,21 +672,17 @@ export function Backlinks() {
     toast.success("Backlinks exported");
   };
 
-	  if (loading) {
-	  return (
-		<div className="p-8 flex justify-center items-center">
-		  Loading backlink data...
-		</div>
-	  );
-	}
+  if (loading) {
+    return <div className="p-8 flex justify-center items-center">Loading backlink data...</div>;
+  }
 
-	return (
-	  <div className="p-8 space-y-6">
-		{error && (
-		  <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-950/30">
-			{error}
-		  </div>
-		)}
+  return (
+    <div className="p-8 space-y-6">
+      {error && (
+        <div className="rounded-lg border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/30 dark:text-rose-300">
+          {error}
+        </div>
+      )}
 
       <header className="flex items-start justify-between flex-wrap gap-4">
         <div>
@@ -571,7 +831,7 @@ export function Backlinks() {
                 <ResponsiveContainer width="100%" height={300}>
                   <PieChart>
                     <Pie data={Object.entries(stats.link_types).map(([name, value]) => ({ name, value }))} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={60} outerRadius={90} paddingAngle={5}>
-                      {Object.entries(stats.link_types).map((_, index) => (
+                      {Object.entries(stats.link_types).map(([, _value], index) => (
                         <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                       ))}
                     </Pie>
@@ -844,8 +1104,112 @@ export function Backlinks() {
             </div>
 
             <div className="space-y-2">
-              <Label>Post Content</Label>
-              <Textarea className="min-h-[220px]" value={wordpressBacklink.content} onChange={(e) => setWordpressBacklink({ ...wordpressBacklink, content: e.target.value })} placeholder="Write the article/resource content here. Minimum 300 characters." />
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <Label>Post Content</Label>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                    Use semantic headings, lists, links and emphasis. Formatting is preserved in WordPress.
+                  </p>
+                </div>
+                <div className="flex items-center rounded-md border border-slate-200 dark:border-slate-700 overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => setRichTextMode("visual")}
+                    className={cn(
+                      "px-3 py-1.5 text-xs font-medium transition-colors",
+                      richTextMode === "visual"
+                        ? "bg-emerald-600 text-white"
+                        : "text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    )}
+                  >
+                    Visual
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const editor = document.getElementById("wordpress-backlink-editor");
+                      if (editor) syncEditorHtml(editor.innerHTML);
+                      setRichTextMode("html");
+                    }}
+                    className={cn(
+                      "px-3 py-1.5 text-xs font-medium transition-colors",
+                      richTextMode === "html"
+                        ? "bg-emerald-600 text-white"
+                        : "text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    )}
+                  >
+                    HTML
+                  </button>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden bg-white dark:bg-slate-950 shadow-sm">
+                {richTextMode === "visual" ? (
+                  <>
+                    <div className="flex flex-wrap items-center gap-1 border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-2">
+                      <button type="button" title="Heading 2" onMouseDown={(e) => e.preventDefault()} onClick={() => runEditorCommand("formatBlock", "h2")} className="inline-flex h-8 items-center gap-1 rounded px-2 text-xs font-semibold hover:bg-slate-200 dark:hover:bg-slate-800">
+                        <Heading2 className="size-4" /> H2
+                      </button>
+                      <button type="button" title="Bold" onMouseDown={(e) => e.preventDefault()} onClick={() => runEditorCommand("bold")} className="inline-flex h-8 w-8 items-center justify-center rounded hover:bg-slate-200 dark:hover:bg-slate-800">
+                        <Bold className="size-4" />
+                      </button>
+                      <button type="button" title="Italic" onMouseDown={(e) => e.preventDefault()} onClick={() => runEditorCommand("italic")} className="inline-flex h-8 w-8 items-center justify-center rounded hover:bg-slate-200 dark:hover:bg-slate-800">
+                        <Italic className="size-4" />
+                      </button>
+                      <span className="mx-1 h-5 w-px bg-slate-200 dark:bg-slate-700" />
+                      <button type="button" title="Bulleted list" onMouseDown={(e) => e.preventDefault()} onClick={() => runEditorCommand("insertUnorderedList")} className="inline-flex h-8 w-8 items-center justify-center rounded hover:bg-slate-200 dark:hover:bg-slate-800">
+                        <List className="size-4" />
+                      </button>
+                      <button type="button" title="Numbered list" onMouseDown={(e) => e.preventDefault()} onClick={() => runEditorCommand("insertOrderedList")} className="inline-flex h-8 w-8 items-center justify-center rounded hover:bg-slate-200 dark:hover:bg-slate-800">
+                        <ListOrdered className="size-4" />
+                      </button>
+                      <button type="button" title="Quote" onMouseDown={(e) => e.preventDefault()} onClick={() => runEditorCommand("formatBlock", "blockquote")} className="inline-flex h-8 w-8 items-center justify-center rounded hover:bg-slate-200 dark:hover:bg-slate-800">
+                        <Quote className="size-4" />
+                      </button>
+                      <button type="button" title="Add link" onMouseDown={(e) => e.preventDefault()} onClick={insertEditorLink} className="inline-flex h-8 w-8 items-center justify-center rounded hover:bg-slate-200 dark:hover:bg-slate-800">
+                        <LinkIcon className="size-4" />
+                      </button>
+                      <span className="mx-1 h-5 w-px bg-slate-200 dark:bg-slate-700" />
+                      <button type="button" title="Undo" onMouseDown={(e) => e.preventDefault()} onClick={() => runEditorCommand("undo")} className="inline-flex h-8 w-8 items-center justify-center rounded hover:bg-slate-200 dark:hover:bg-slate-800">
+                        <Undo2 className="size-4" />
+                      </button>
+                      <button type="button" title="Redo" onMouseDown={(e) => e.preventDefault()} onClick={() => runEditorCommand("redo")} className="inline-flex h-8 w-8 items-center justify-center rounded hover:bg-slate-200 dark:hover:bg-slate-800">
+                        <Redo2 className="size-4" />
+                      </button>
+                      <button type="button" title="Clear formatting" onMouseDown={(e) => e.preventDefault()} onClick={() => runEditorCommand("removeFormat")} className="inline-flex h-8 w-8 items-center justify-center rounded hover:bg-slate-200 dark:hover:bg-slate-800">
+                        <RemoveFormatting className="size-4" />
+                      </button>
+                    </div>
+
+                    <div
+                      id="wordpress-backlink-editor"
+                      contentEditable={!creatingBacklink}
+                      suppressContentEditableWarning
+                      onInput={handleEditorInput}
+                      onPaste={handleEditorPaste}
+                      dangerouslySetInnerHTML={{ __html: editorHtml }}
+                      className="min-h-[260px] max-h-[420px] overflow-y-auto p-4 text-sm leading-7 text-slate-800 dark:text-slate-100 outline-none prose prose-slate dark:prose-invert max-w-none empty:before:text-slate-400 empty:before:content-['Write_or_paste_your_article_here...'] [&_h1]:mb-3 [&_h1]:mt-5 [&_h1]:text-2xl [&_h1]:font-bold [&_h2]:mb-2 [&_h2]:mt-5 [&_h2]:text-xl [&_h2]:font-bold [&_h3]:mb-2 [&_h3]:mt-4 [&_h3]:text-lg [&_h3]:font-semibold [&_p]:mb-3 [&_ul]:my-3 [&_ol]:my-3 [&_li]:ml-5 [&_a]:text-emerald-600 [&_a]:underline"
+                    />
+                  </>
+                ) : (
+                  <textarea
+                    value={editorHtml}
+                    onChange={(e) => updateWordPressContent(e.target.value)}
+                    spellCheck={false}
+                    className="min-h-[260px] max-h-[420px] w-full resize-y bg-transparent p-4 font-mono text-xs leading-6 text-slate-800 dark:text-slate-100 outline-none"
+                    aria-label="WordPress post HTML"
+                  />
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+                <span>
+                  Semantic HTML is sent to WordPress; unsafe tags and attributes are removed.
+                </span>
+                <span>
+                  {editorHtml.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().length} characters
+                </span>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

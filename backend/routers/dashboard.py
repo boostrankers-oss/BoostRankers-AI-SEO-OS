@@ -1,11 +1,14 @@
+import logging
 from fastapi import APIRouter, Depends
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from database.database import get_db
 from pydantic import BaseModel
 from models.audit import Audit, AuditStatus
 from models.client import Client
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/dashboard",
@@ -445,65 +448,97 @@ def dashboard_system(
 ):
     """
     Dashboard system health.
+
+    Uses a single aggregate query for audit counters so this endpoint
+    places minimal pressure on the SQLAlchemy connection pool while
+    long-running SEO/Claude audits are active.
     """
 
-    total = db.query(func.count(Audit.id)).scalar() or 0
+    try:
+        stats = (
+            db.query(
+                func.count(Audit.id).label("total"),
+                func.sum(
+                    case(
+                        (Audit.status == AuditStatus.PENDING, 1),
+                        else_=0,
+                    )
+                ).label("pending"),
+                func.sum(
+                    case(
+                        (Audit.status == AuditStatus.QUEUED, 1),
+                        else_=0,
+                    )
+                ).label("queued"),
+                func.sum(
+                    case(
+                        (Audit.status == AuditStatus.RUNNING, 1),
+                        else_=0,
+                    )
+                ).label("running"),
+                func.sum(
+                    case(
+                        (Audit.status == AuditStatus.COMPLETED, 1),
+                        else_=0,
+                    )
+                ).label("completed"),
+                func.sum(
+                    case(
+                        (Audit.status == AuditStatus.FAILED, 1),
+                        else_=0,
+                    )
+                ).label("failed"),
+            )
+            .one()
+        )
 
-    pending = (
-        db.query(func.count(Audit.id))
-        .filter(Audit.status == AuditStatus.PENDING)
-        .scalar()
-        or 0
-    )
+        total = int(stats.total or 0)
+        pending = int(stats.pending or 0)
+        queued = int(stats.queued or 0)
+        running = int(stats.running or 0)
+        completed = int(stats.completed or 0)
+        failed = int(stats.failed or 0)
 
-    queued = (
-        db.query(func.count(Audit.id))
-        .filter(Audit.status == AuditStatus.QUEUED)
-        .scalar()
-        or 0
-    )
+        success_rate = (
+            round((completed / total) * 100, 1)
+            if total > 0
+            else 100.0
+        )
 
-    running = (
-        db.query(func.count(Audit.id))
-        .filter(Audit.status == AuditStatus.RUNNING)
-        .scalar()
-        or 0
-    )
+        return {
+            "database": "connected",
+            "api": "online",
+            "audit_engine": "online",
+            "claude_ai": "configured",
+            "queue": {
+                "pending": pending,
+                "queued": queued,
+                "running": running,
+            },
+            "completed": completed,
+            "failed": failed,
+            "success_rate": success_rate,
+        }
 
-    completed = (
-        db.query(func.count(Audit.id))
-        .filter(Audit.status == AuditStatus.COMPLETED)
-        .scalar()
-        or 0
-    )
+    except Exception:
+        logger.exception("Dashboard system health query failed.")
 
-    failed = (
-        db.query(func.count(Audit.id))
-        .filter(Audit.status == AuditStatus.FAILED)
-        .scalar()
-        or 0
-    )
+        return {
+            "database": "degraded",
+            "api": "online",
+            "audit_engine": "online",
+            "claude_ai": "configured",
+            "queue": {
+                "pending": 0,
+                "queued": 0,
+                "running": 0,
+            },
+            "completed": 0,
+            "failed": 0,
+            "success_rate": 0.0,
+        }
 
-    success_rate = 100.0
 
-    if total:
-        success_rate = round((completed / total) * 100, 1)
-
-    return {
-        "database": "connected",
-        "api": "online",
-        "audit_engine": "online",
-        "claude_ai": "configured",
-        "queue": {
-            "pending": pending,
-            "queued": queued,
-            "running": running,
-        },
-        "completed": completed,
-        "failed": failed,
-        "success_rate": success_rate,
-    }
-    
 @router.get("/tasks")
 def dashboard_tasks(
     db: Session = Depends(get_db),

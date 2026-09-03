@@ -812,86 +812,129 @@ class InternalLinkingService:
         content: str,
     ) -> dict[str, Any]:
         """
-        Parse JSON even when Claude accidentally wraps it
-        in markdown code fences or surrounding text.
+        Parse a Claude response defensively.
+
+        Claude is instructed to return JSON only, but production code
+        must not assume that the model will always obey perfectly.
+        This parser handles:
+        - plain JSON
+        - ```json ... ``` fenced JSON
+        - harmless text before/after the JSON object
+        - trailing commas before } or ]
+
+        It deliberately does NOT invent or reconstruct missing data.
         """
 
         if not content:
-            raise ValueError(
-                "Claude returned an empty response."
-            )
+            raise ValueError("Claude returned an empty response.")
 
-        text = content.strip()
+        text = str(content).strip()
 
-        # Remove markdown fences.
+        # Remove markdown fences anywhere around the response.
         text = re.sub(
-            r"^```(?:json)?\s*",
+            r"^\s*```(?:json)?\s*",
             "",
             text,
             flags=re.IGNORECASE,
         )
-
         text = re.sub(
-            r"\s*```$",
+            r"\s*```\s*$",
             "",
             text,
-        )
+            flags=re.IGNORECASE,
+        ).strip()
 
-        text = text.strip()
-
+        # Fast path: the whole response is already valid JSON.
         try:
-            parsed = json.loads(
-                text
-            )
-
-            if not isinstance(
-                parsed,
-                dict,
-            ):
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
                 raise ValueError(
                     "Claude returned JSON, but it was not an object."
                 )
-
             return parsed
-
         except json.JSONDecodeError:
             pass
 
-        # ----------------------------------------------------
-        # Try to locate the first JSON object.
-        # ----------------------------------------------------
-
+        # Find a balanced JSON object while respecting quoted strings.
+        # Using rfind('}') is unsafe when Claude adds text containing
+        # braces, so scan the response structurally instead.
         start = text.find("{")
-        end = text.rfind("}")
-
-        if start == -1 or end == -1 or end <= start:
+        if start < 0:
             raise ValueError(
-                "Claude returned an invalid JSON response."
+                "Claude returned no JSON object."
             )
 
-        candidate = text[
-            start : end + 1
-        ]
+        depth = 0
+        in_string = False
+        escaped = False
+        end = None
+
+        for index in range(start, len(text)):
+            char = text[index]
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                continue
+
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+
+        if end is None:
+            raise ValueError(
+                "Claude returned incomplete JSON. "
+                "The response appears to have been truncated."
+            )
+
+        candidate = text[start:end + 1].strip()
+
+        # Conservative cleanup for a common model formatting mistake:
+        # trailing commas immediately before a closing JSON token.
+        candidate = re.sub(
+            r",(\s*[}\]])",
+            r"\1",
+            candidate,
+        )
 
         try:
-            parsed = json.loads(
-                candidate
-            )
-
+            parsed = json.loads(candidate)
         except json.JSONDecodeError as exc:
             raise ValueError(
-                "Claude returned an invalid JSON response."
+                "Claude returned malformed JSON. "
+                "Please try the analysis again."
             ) from exc
 
-        if not isinstance(
-            parsed,
-            dict,
-        ):
+        if not isinstance(parsed, dict):
             raise ValueError(
                 "Claude returned JSON in an unexpected format."
             )
 
         return parsed
+
+    @staticmethod
+    def _response_text(response: Any) -> str:
+        """Extract text blocks from an Anthropic Messages response."""
+        parts: list[str] = []
+
+        for block in getattr(response, "content", []) or []:
+            block_text = getattr(block, "text", None)
+            if block_text:
+                parts.append(str(block_text))
+
+        return "\n".join(parts).strip()
 
     # ========================================================
     # NORMALIZE AI RESPONSE
@@ -1192,7 +1235,8 @@ class InternalLinkingService:
             prompt = f"""
 You are an expert technical SEO and internal-linking strategist.
 
-Your task is to identify REAL, useful internal-linking opportunities.
+Identify ONLY REAL internal-linking opportunities supported by the
+supplied page content and discovered URLs.
 
 SOURCE URLS:
 {chr(10).join(f"- {url}" for url in source_urls)}
@@ -1204,39 +1248,26 @@ SOURCE PAGE CONTEXT:
 {source_context}
 
 RULES:
-
-1. Only recommend links between URLs provided in SOURCE URLS and
-   DISCOVERED INTERNAL TARGET URLS.
-
-2. Never invent URLs.
-
-3. Never use an external domain.
-
-4. Never recommend a URL that is not present in the discovered
-   candidate list.
-
-5. Never recommend a source URL linking to itself.
-
-6. Anchor text must be natural, descriptive, and relevant to the
-   target page.
-
+1. A source MUST be one of SOURCE URLS.
+2. A target MUST be one of DISCOVERED INTERNAL TARGET URLS or another
+   supplied SOURCE URL.
+3. Never invent, rewrite, shorten, or guess a URL.
+4. Never use an external domain.
+5. Never recommend a source linking to itself.
+6. Anchor text must be natural and relevant to the target.
 7. Avoid repetitive exact-match keyword anchors.
+8. Recommend only contextually useful links.
+9. If there is no defensible opportunity, return an empty suggestions array.
+10. Return at most 12 suggestions.
+11. Keep "analysis" under 500 characters.
+12. Return ONLY one valid JSON object.
+13. Do NOT use Markdown, code fences, comments, or explanatory text.
+14. Escape any quotation marks inside JSON strings correctly.
+15. Keep the JSON compact.
 
-8. Prefer contextual links that genuinely help the reader.
-
-9. Prioritize commercially and topically important pages when
-   the page context supports doing so.
-
-10. If there are no suitable internal-linking opportunities,
-    return an empty suggestions array rather than inventing one.
-
-11. Return ONLY valid JSON.
-
-Return exactly this structure:
-
+Return exactly:
 {{
-  "analysis": "A concise SEO analysis explaining the strongest
-  internal linking opportunities and why they are useful.",
+  "analysis": "Brief evidence-based explanation.",
   "suggestions": [
     {{
       "source": "https://example.com/source-page/",
@@ -1249,62 +1280,87 @@ Return exactly this structure:
 
             # ------------------------------------------------
             # Claude request.
+            #
+            # We intentionally keep the requested output small.
+            # A large candidate set can otherwise cause Claude to hit
+            # max_tokens in the middle of a JSON object.
             # ------------------------------------------------
 
-            response = await client.messages.create(
-                model=model,
-                max_tokens=4096,
-                system=(
-                    "You are a professional SEO internal-linking "
-                    "expert. Return only valid JSON when requested."
-                ),
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
-                ],
-            )
+            async def _request_json(
+                request_prompt: str,
+                max_tokens: int,
+            ) -> dict[str, Any]:
+                response = await client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    system=(
+                        "You are a professional SEO internal-linking "
+                        "expert. For this request, output ONLY one "
+                        "syntactically valid JSON object. Never use "
+                        "Markdown or code fences."
+                    ),
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": request_prompt,
+                        }
+                    ],
+                )
 
-            # ------------------------------------------------
-            # Extract text response safely.
-            # ------------------------------------------------
+                content = self._response_text(response)
 
-            response_parts: list[str] = []
+                if not content:
+                    raise ValueError(
+                        "Claude returned an empty response."
+                    )
 
-            for block in getattr(
-                response,
-                "content",
-                [],
-            ):
-
-                block_text = getattr(
-                    block,
-                    "text",
+                stop_reason = getattr(
+                    response,
+                    "stop_reason",
                     None,
                 )
 
-                if block_text:
-                    response_parts.append(
-                        block_text
-                    )
+                try:
+                    return self._extract_json(content)
+                except ValueError as exc:
+                    # Give the caller a precise error when Claude stopped
+                    # because its output token budget was exhausted.
+                    if stop_reason == "max_tokens":
+                        raise ValueError(
+                            "Claude's JSON response was truncated because "
+                            "the output limit was reached."
+                        ) from exc
+                    raise
 
-            content = "\n".join(
-                response_parts
-            ).strip()
-
-            if not content:
-                raise ValueError(
-                    "Claude returned an empty response."
+            try:
+                data = await _request_json(
+                    prompt,
+                    max_tokens=2048,
                 )
+            except ValueError as first_error:
+                # One controlled retry with an even smaller output contract.
+                # This handles occasional model formatting/truncation without
+                # fabricating or repairing missing recommendations.
+                retry_prompt = prompt + """
 
-            # ------------------------------------------------
-            # Parse JSON.
-            # ------------------------------------------------
+IMPORTANT RETRY:
+Return NO MORE THAN 6 suggestions.
+Keep "analysis" under 250 characters.
+The entire response must be a compact JSON object.
+"""
 
-            data = self._extract_json(
-                content
-            )
+                try:
+                    data = await _request_json(
+                        retry_prompt,
+                        max_tokens=2048,
+                    )
+                except ValueError as retry_error:
+                    raise ValueError(
+                        "Claude could not return valid structured JSON "
+                        "for this internal-linking analysis. "
+                        f"First attempt: {first_error}. "
+                        f"Retry: {retry_error}"
+                    ) from retry_error
 
             # ------------------------------------------------
             # Validate/normalize suggestions.
