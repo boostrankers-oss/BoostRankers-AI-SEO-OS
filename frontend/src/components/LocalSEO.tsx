@@ -7,7 +7,7 @@ import { useClaude } from "@/components/ClaudeProvider";
 import { toast } from "sonner";
 import {
   AlertCircle, ArrowUpRight, CheckCircle2, ChevronDown, ChevronUp,
-  Clock, ExternalLink, Globe2, Loader2, MapPin, Search, ShieldCheck,
+  Clock, ExternalLink, Globe2, Loader2, MapPin, Search,
   Sparkles, Star, Target, XCircle, Zap,
 } from "lucide-react";
 
