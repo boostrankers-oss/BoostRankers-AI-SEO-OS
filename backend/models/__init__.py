@@ -10,6 +10,7 @@ from .client import Client
 from .audit import Audit
 from .report import Report  # <-- add this line
 from .competitor import Competitor
+from .content_plan import ContentPlan
 
 __all__ = [
     "Base",
@@ -24,4 +25,5 @@ __all__ = [
     "Client",
     "Audit",
     "Report",  # <-- add this
+    "ContentPlan",
 ]

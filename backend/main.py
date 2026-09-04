@@ -21,6 +21,7 @@ load_dotenv(ENV_FILE)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database.database import engine
+from models.content_plan import ContentPlan
 
 
 from routers import (
@@ -37,8 +38,10 @@ from routers import (
 
 from api.v1.auth import router as auth_router
 from routers.ai import router as ai_router
+from routers.content_plans import router as content_plans_router
 from routers.ai_settings import router as ai_settings_router
 from routers.google_integration import router as google_integration
+from content_automation import router as content_automation_router
 
 # ============================================================
 # Validate required environment
@@ -162,6 +165,12 @@ app.include_router(
 )
 
 app.include_router(
+    content_plans_router,
+    prefix="/api",
+    tags=["Content Plans"],
+)
+
+app.include_router(
     ai_settings_router,
     prefix="/api",
     tags=["AI Settings"],
@@ -178,6 +187,17 @@ app.include_router(
     prefix="/api",
     tags=["Google Integration"],
 )
+
+app.include_router(
+    content_automation_router,
+    tags=["Content Automation"],
+)
+
+@app.on_event("startup")
+def ensure_content_plan_table():
+    # Creates only the new table if it does not exist.
+    ContentPlan.__table__.create(bind=engine, checkfirst=True)
+
 
 # ============================================================
 # Health Check
