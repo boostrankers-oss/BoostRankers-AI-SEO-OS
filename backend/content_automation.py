@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from io import BytesIO
 from typing import Any
+import re
+
+from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urlparse
 
 import httpx
@@ -75,6 +79,147 @@ def _site(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/') }".rstrip("/")
 
 
+def _slugify(value: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
+    return value[:80] or "boost-rankers-featured-image"
+
+
+def _font(size: int, bold: bool = False):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _build_featured_image(title: str, keyword: str) -> bytes:
+    """Create a deterministic, non-empty 1600x900 branded PNG without an image API."""
+    width, height = 1600, 900
+    image = Image.new("RGB", (width, height), (12, 20, 38))
+    pixels = image.load()
+    seed = sum(ord(ch) for ch in f"{title}|{keyword}") % 360
+    for y in range(height):
+        for x in range(width):
+            t = (x + y) / (width + height)
+            pixels[x, y] = (
+                int(10 + 18 * t),
+                int(20 + 24 * t),
+                int(38 + 38 * t),
+            )
+
+    draw = ImageDraw.Draw(image, "RGBA")
+    # Branded geometric accents.
+    draw.rounded_rectangle((90, 80, 1510, 820), radius=42, outline=(251, 210, 11, 180), width=4)
+    draw.ellipse((1120, -140, 1740, 480), fill=(251, 210, 11, 42))
+    draw.ellipse((-180, 600, 500, 1280), fill=(16, 185, 129, 30))
+    draw.rounded_rectangle((120, 130, 1480, 770), radius=32, fill=(0, 0, 0, 35))
+
+    title_font = _font(68, bold=True)
+    keyword_font = _font(30, bold=False)
+    brand_font = _font(26, bold=True)
+
+    def wrap(text: str, font, max_chars: int = 34):
+        words = text.split()
+        lines, current = [], ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if len(candidate) > max_chars and current:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        return lines[:5]
+
+    lines = wrap(title, title_font)
+    y = 260
+    for line in lines:
+        draw.text((150, y), line, font=title_font, fill=(255, 255, 255, 255))
+        y += 82
+
+    draw.text((150, 680), f"Primary keyword: {keyword[:110]}", font=keyword_font, fill=(210, 220, 235, 255))
+    draw.text((150, 735), "BOOST RANKERS · AI SEO OS", font=brand_font, fill=(251, 210, 11, 255))
+
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+async def _upload_featured_image(client: httpx.AsyncClient, site: str, auth: tuple[str, str], title: str, keyword: str) -> dict[str, Any]:
+    image_bytes = _build_featured_image(title, keyword)
+    filename = f"{_slugify(title)}.png"
+    response = await client.post(
+        f"{site}/wp-json/wp/v2/media",
+        content=image_bytes,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "image/png",
+        },
+        auth=auth,
+    )
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("message", response.text)
+        except Exception:
+            detail = response.text
+        raise HTTPException(status_code=502, detail=f"WordPress rejected the featured image upload (HTTP {response.status_code}): {detail}")
+    media = response.json()
+    media_id = media.get("id")
+    if not media_id:
+        raise HTTPException(status_code=502, detail="WordPress accepted the image but returned no media ID.")
+
+    # Set accessible alt text using the article title.
+    alt_response = await client.post(
+        f"{site}/wp-json/wp/v2/media/{int(media_id)}",
+        json={"alt_text": title[:500]},
+        auth=auth,
+    )
+    if alt_response.status_code >= 400:
+        # The featured image itself is valid; do not fail publication only because
+        # a secondary alt-text update was rejected.
+        pass
+
+    return {
+        "id": int(media_id),
+        "url": str(media.get("source_url") or media.get("guid", {}).get("rendered") or ""),
+    }
+
+
+async def _apply_seo_metadata(client: httpx.AsyncClient, site: str, auth: tuple[str, str], post_id: int, meta_title: str, meta_description: str, focus_keyphrase: str) -> dict[str, Any]:
+    status_response = await client.get(f"{site}/wp-json/boost-rankers/v1/seo-meta/status", auth=auth)
+    if status_response.status_code == 404:
+        raise HTTPException(
+            status_code=424,
+            detail="WordPress SEO Bridge is not installed. Install the Boost Rankers SEO Bridge plugin on the WordPress site before publishing so SEO title, meta description, and focus keyphrase are saved automatically.",
+        )
+    if status_response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Could not verify the WordPress SEO Bridge (HTTP {status_response.status_code}).")
+
+    response = await client.post(
+        f"{site}/wp-json/boost-rankers/v1/seo-meta/{post_id}",
+        json={
+            "seo_title": meta_title[:500],
+            "meta_description": meta_description[:1000],
+            "focus_keyphrase": focus_keyphrase[:500],
+        },
+        auth=auth,
+    )
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("message", response.text)
+        except Exception:
+            detail = response.text
+        raise HTTPException(status_code=502, detail=f"WordPress SEO metadata could not be saved (HTTP {response.status_code}): {detail}")
+    result = response.json()
+    return {"applied": bool(result.get("success", True)), "response": result}
+
+
 @router.on_event("startup")
 def _ensure_table() -> None:
     ContentArticle.__table__.create(bind=engine, checkfirst=True)
@@ -146,18 +291,32 @@ async def publish_article_wordpress(
     if data.scheduled_at is not None:
         scheduled = data.scheduled_at
         if scheduled.tzinfo is None:
-            # Backward-compatible handling for older clients. New clients send
-            # an explicit browser/site offset so the selected clock time is
-            # not silently interpreted as UTC.
             scheduled = scheduled.replace(tzinfo=timezone.utc)
         payload["date"] = scheduled.isoformat()
         payload["date_gmt"] = scheduled.astimezone(timezone.utc).isoformat()
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=15.0), follow_redirects=True) as client:
             me = await client.get(f"{site}/wp-json/wp/v2/users/me", params={"context": "edit"}, auth=auth)
             if me.status_code >= 400:
                 raise HTTPException(status_code=401, detail=f"WordPress authentication failed (HTTP {me.status_code}). Use a WordPress Application Password.")
+
+            # Fail before creating a post if the required SEO bridge is absent.
+            bridge = await client.get(f"{site}/wp-json/boost-rankers/v1/seo-meta/status", auth=auth)
+            if bridge.status_code == 404:
+                raise HTTPException(status_code=424, detail="Install and activate the Boost Rankers SEO Bridge plugin on WordPress. It is required to save SEO title, meta description, and focus keyphrase automatically.")
+            if bridge.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"WordPress SEO Bridge check failed (HTTP {bridge.status_code}).")
+            try:
+                bridge_data = bridge.json()
+            except Exception:
+                bridge_data = {}
+            if not bridge_data.get("yoast_active"):
+                raise HTTPException(status_code=424, detail="Yoast SEO is not active on the connected WordPress site. Activate Yoast SEO so Boost Rankers can save the SEO title, meta description, and focus keyphrase.")
+
+            featured = await _upload_featured_image(client, site, auth, article.title, article.keyword)
+            payload["featured_media"] = featured["id"]
+
             response = await client.post(f"{site}/wp-json/wp/v2/posts", json=payload, auth=auth)
             if response.status_code >= 400:
                 try:
@@ -166,6 +325,16 @@ async def publish_article_wordpress(
                     detail = response.text
                 raise HTTPException(status_code=502, detail=f"WordPress rejected the post (HTTP {response.status_code}): {detail}")
             result = response.json()
+
+            seo = await _apply_seo_metadata(
+                client,
+                site,
+                auth,
+                int(result["id"]),
+                article.meta_title or article.title,
+                article.meta_description or article.title,
+                article.keyword,
+            )
     except HTTPException:
         raise
     except Exception as exc:
@@ -187,6 +356,11 @@ async def publish_article_wordpress(
         "success": True,
         "message": "WordPress content scheduled successfully." if data.status == "future" else "WordPress content published successfully." if data.status == "publish" else "WordPress draft created successfully.",
         "article": _serialize(article),
+        "wordpress": {
+            "featured_media_id": featured["id"],
+            "featured_image_url": featured["url"],
+            "seo_metadata_applied": seo["applied"],
+        },
     }
 
 
