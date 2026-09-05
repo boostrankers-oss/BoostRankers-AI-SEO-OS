@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useClaude } from "@/components/ClaudeProvider";
 import { api } from "@/lib/api";
+import { generateAIInternalLinks } from "@/lib/wordpressInternalLinks";
 
 export interface ContentWriterIdea {
   title: string;
@@ -62,7 +63,7 @@ export function ContentWriter({ open, onClose, idea, planId, dayNumber, schedule
   const [publishMode, setPublishMode] = useState<"draft" | "future" | "publish">("future");
   const [publishDate, setPublishDate] = useState(scheduledDate);
   const [publishTime, setPublishTime] = useState("10:00");
-  const [publishInfo, setPublishInfo] = useState<{ featuredImageUrl?: string; seoMetadataApplied?: boolean } | null>(null);
+  const [publishInfo, setPublishInfo] = useState<{ featuredImageUrl?: string; seoMetadataApplied?: boolean; internalLinksApplied?: Array<{ target_url: string; anchor_text: string }> } | null>(null);
 
   const readyMessage = useMemo(() => {
     if (status === "billing_required") return "Anthropic billing is required.";
@@ -125,17 +126,39 @@ Requirements:
     setPublishing(true); setError(null); setPublishInfo(null);
     try {
       const scheduledAt = publishMode === "future" ? toLocalIso(publishDate, publishTime) : null;
-      const result = await api.post(`/api/content-automation/articles/${article.id}/publish/wordpress`, {
+      const credentials = {
         wordpress_site: site.trim(),
         wordpress_username: username.trim(),
         wordpress_application_password: appPassword.trim(),
+      };
+
+      // Discover the site's real published pages/posts, then let Claude choose
+      // only semantically useful targets and exact anchor phrases from the article.
+      setError(null);
+      const candidateResponse = await api.post(`/api/content-automation/articles/${article.id}/internal-link-candidates`, credentials) as { candidates?: any[] };
+      const candidates = candidateResponse.candidates ?? [];
+      let internalLinks: Array<{ target_url: string; anchor_text: string; reason?: string }> = [];
+      if (candidates.length > 0) {
+        internalLinks = await generateAIInternalLinks(
+          generateContent,
+          article.article_html,
+          article.title,
+          article.keyword,
+          candidates,
+        );
+      }
+
+      const result = await api.post(`/api/content-automation/articles/${article.id}/publish/wordpress`, {
+        ...credentials,
         status: publishMode,
         scheduled_at: scheduledAt,
+        internal_links: internalLinks,
       });
       setArticle((result as any).article);
       setPublishInfo({
         featuredImageUrl: (result as any).wordpress?.featured_image_url,
         seoMetadataApplied: (result as any).wordpress?.seo_metadata_applied,
+        internalLinksApplied: (result as any).wordpress?.internal_links_applied ?? [],
       });
       onSaved?.((result as any).article);
     } catch (err: any) {
@@ -191,9 +214,9 @@ Requirements:
               {publishMode === "future" && <><div className="mb-2 rounded-md bg-slate-50 p-2 text-[11px] text-slate-500 dark:bg-slate-900/50">Schedule time uses your browser's local timezone ({Intl.DateTimeFormat().resolvedOptions().timeZone || "local time"}).</div><div className="grid grid-cols-2 gap-2"><div className="space-y-2"><Label>Date</Label><Input type="date" value={publishDate} onChange={e => setPublishDate(e.target.value)} /></div><div className="space-y-2"><Label>Time</Label><Input type="time" value={publishTime} onChange={e => setPublishTime(e.target.value)} /></div></div></>}
               <Button onClick={publish} disabled={!article || publishing} className="w-full bg-indigo-600 text-white hover:bg-indigo-700"><Send className="size-4" />{publishing ? "Sending to WordPress..." : publishMode === "future" ? "Schedule on WordPress" : publishMode === "publish" ? "Publish Now" : "Create WordPress Draft"}</Button>
               <div className="rounded-md border bg-slate-50 p-3 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-900/50 dark:text-slate-300">
-                <strong>Automatic publishing package:</strong> featured image, SEO title, meta description and focus keyphrase are applied to WordPress.
+                <strong>Automatic publishing package:</strong> featured image, SEO title, meta description, focus keyphrase and AI-selected internal links are applied to WordPress.
               </div>
-              {article?.status && <div className="rounded-md bg-emerald-50 p-3 text-xs text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400">Status: <strong>{article.status}</strong>{publishInfo?.seoMetadataApplied ? " · Yoast SEO saved" : null}{publishInfo?.featuredImageUrl ? <> · Featured image uploaded</> : null}{article.wordpress_url ? <> · <a className="underline" href={article.wordpress_url} target="_blank" rel="noreferrer">Open post</a></> : null}</div>}
+              {article?.status && <div className="rounded-md bg-emerald-50 p-3 text-xs text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400">Status: <strong>{article.status}</strong>{publishInfo?.seoMetadataApplied ? " · Yoast SEO saved" : null}{publishInfo?.featuredImageUrl ? <> · Featured image uploaded</> : null}{publishInfo?.internalLinksApplied?.length ? <> · {publishInfo.internalLinksApplied.length} internal links added</> : null}{article.wordpress_url ? <> · <a className="underline" href={article.wordpress_url} target="_blank" rel="noreferrer">Open post</a></> : null}</div>}
             </div>
           </div>
           {error && <div className="mt-4 flex items-start gap-2 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700 dark:border-rose-900/50 dark:bg-rose-900/10 dark:text-rose-400"><AlertCircle className="mt-0.5 size-4 shrink-0" />{error}</div>}

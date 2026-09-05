@@ -6,16 +6,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useClaude } from "@/components/ClaudeProvider";
 import { api } from "@/lib/api";
+import { generateAIInternalLinks } from "@/lib/wordpressInternalLinks";
 
 interface Idea { title: string; keyword: string; intent?: string; contentType?: string; outline: string[]; }
-interface Props {
-  open: boolean;
-  onClose: () => void;
-  ideas: Idea[];
-  planId: string | null;
-  startDate: string;
-  onArticleUpdated?: (dayNumber: number, article: any) => void;
-}
+interface Props { open: boolean; onClose: () => void; ideas: Idea[]; planId: string | null; startDate: string; }
 
 function parseResponse(raw: string): any {
   const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
@@ -25,7 +19,6 @@ function parseResponse(raw: string): any {
     throw new Error("Claude returned invalid article JSON.");
   }
 }
-
 function toLocalIso(date: string, time: string): string {
   const value = new Date(`${date}T${time}:00`);
   const offsetMinutes = -value.getTimezoneOffset();
@@ -41,7 +34,7 @@ function addDays(date: string, days: number) {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
 }
 
-export function ContentAutoScheduler({ open, onClose, ideas, planId, startDate, onArticleUpdated }: Props) {
+export function ContentAutoScheduler({ open, onClose, ideas, planId, startDate }: Props) {
   const { isReady, generateContent } = useClaude();
   const [site, setSite] = useState("");
   const [username, setUsername] = useState("");
@@ -60,6 +53,7 @@ export function ContentAutoScheduler({ open, onClose, ideas, planId, startDate, 
     if (!site.trim() || !username.trim() || !password.trim()) { setError("WordPress site, username and Application Password are required."); return; }
     setRunning(true); setProgress(0); setError(null); setMessage("Starting 90-day publishing queue...");
     let completed = 0;
+    let internalLinkCandidates: any[] | null = null;
     for (let i = 0; i < ideas.length; i += 1) {
       const idea = ideas[i];
       try {
@@ -72,13 +66,34 @@ export function ContentAutoScheduler({ open, onClose, ideas, planId, startDate, 
           article_html: String(article.article_html), meta_title: String(article.meta_title || idea.title),
           meta_description: String(article.meta_description || ""), slug: String(article.slug || "")
         }) as any;
+        if (internalLinkCandidates === null) {
+          setMessage("Analyzing WordPress pages and posts for internal links...");
+          const candidateResponse = await api.post(`/api/content-automation/articles/${saved.article.id}/internal-link-candidates`, {
+            wordpress_site: site.trim(),
+            wordpress_username: username.trim(),
+            wordpress_application_password: password.trim(),
+          }) as { candidates?: any[] };
+          internalLinkCandidates = candidateResponse.candidates ?? [];
+        }
+
+        let internalLinks: Array<{ target_url: string; anchor_text: string; reason?: string }> = [];
+        if (internalLinkCandidates.length > 0) {
+          internalLinks = await generateAIInternalLinks(
+            generateContent,
+            String(article.article_html),
+            idea.title,
+            idea.keyword,
+            internalLinkCandidates,
+          );
+        }
+
         const scheduledDate = addDays(startDate, i);
-        setMessage(`Scheduling Day ${i + 1}/90 on WordPress...`);
-        const scheduled = await api.post(`/api/content-automation/articles/${saved.article.id}/publish/wordpress`, {
+        setMessage(`Scheduling Day ${i + 1}/90 on WordPress with ${internalLinks.length} AI internal links...`);
+        await api.post(`/api/content-automation/articles/${saved.article.id}/publish/wordpress`, {
           wordpress_site: site.trim(), wordpress_username: username.trim(), wordpress_application_password: password.trim(),
-          status: "future", scheduled_at: toLocalIso(scheduledDate, time)
-        }) as any;
-        onArticleUpdated?.(i + 1, scheduled?.article || { ...saved.article, status: "scheduled", scheduled_at: toLocalIso(scheduledDate, time) });
+          status: "future", scheduled_at: toLocalIso(scheduledDate, time),
+          internal_links: internalLinks,
+        });
         completed += 1; setProgress(completed);
       } catch (err: any) {
         // Continue the queue so one failed article does not cancel the remaining 90 days.
@@ -99,7 +114,7 @@ export function ContentAutoScheduler({ open, onClose, ideas, planId, startDate, 
           <div className="space-y-2"><Label>Application Password</Label><Input type="password" value={password} onChange={e=>setPassword(e.target.value)} /></div>
           <div className="space-y-2"><Label>Daily Publishing Time</Label><Input type="time" value={time} onChange={e=>setTime(e.target.value)} /></div>
         </div>
-        <div className="rounded-lg border bg-slate-50 p-4 text-sm dark:border-slate-800 dark:bg-slate-900/50"><strong>90 scheduled posts</strong><div className="mt-1 text-slate-500">Day 1: {startDate} at {time} · Day 90: {addDays(startDate,89)} at {time}</div><div className="mt-1 text-xs text-slate-500">The selected time uses your browser's local timezone ({Intl.DateTimeFormat().resolvedOptions().timeZone || "local time"}) and is sent to WordPress with an explicit timezone offset.</div></div>
+        <div className="rounded-lg border bg-slate-50 p-4 text-sm dark:border-slate-800 dark:bg-slate-900/50"><strong>90 scheduled posts</strong><div className="mt-1 text-slate-500">Day 1: {startDate} at {time} · Day 90: {addDays(startDate,89)} at {time}</div><div className="mt-1 text-xs text-slate-500">Articles are generated one at a time and sent to WordPress as native future posts.</div></div>
         {running && <div className="space-y-2"><div className="flex justify-between text-xs"><span>{message}</span><span>{progress}/90</span></div><div className="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"><div className="h-full bg-emerald-600 transition-all" style={{width:`${(progress/90)*100}%`}} /></div></div>}
         {error && <div className="flex gap-2 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700 dark:border-rose-900/50 dark:bg-rose-900/10 dark:text-rose-400"><AlertCircle className="size-4 shrink-0" />{error}</div>}
         {!running && message && <div className="rounded-md bg-emerald-50 p-3 text-sm text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400">{message}</div>}

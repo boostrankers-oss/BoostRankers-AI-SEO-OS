@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any
 import re
+import re
 
 from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urlparse
@@ -13,6 +14,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, select
 from sqlalchemy.orm import Mapped, mapped_column
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover
+    BeautifulSoup = None  # type: ignore[assignment]
 
 from api.deps.current_user import get_current_user
 from database.database import engine
@@ -55,6 +61,17 @@ class ArticleCreate(BaseModel):
     slug: str | None = Field(default=None, max_length=500)
 
 
+class WordPressCredentialsRequest(BaseModel):
+    wordpress_site: HttpUrl
+    wordpress_username: str = Field(min_length=1, max_length=255)
+    wordpress_application_password: str = Field(min_length=1, max_length=255)
+
+
+class InternalLinkInput(BaseModel):
+    target_url: HttpUrl
+    anchor_text: str = Field(min_length=2, max_length=160)
+
+
 class WordPressPublishRequest(BaseModel):
     wordpress_site: HttpUrl
     wordpress_username: str = Field(min_length=1, max_length=255)
@@ -64,6 +81,7 @@ class WordPressPublishRequest(BaseModel):
     category_ids: list[int] = Field(default_factory=list)
     tag_ids: list[int] = Field(default_factory=list)
     author_id: int | None = None
+    internal_links: list[InternalLinkInput] = Field(default_factory=list, max_length=12)
 
 
 def _scope(user: User):
@@ -257,6 +275,92 @@ def get_article(article_id: str, db=Depends(get_db), current_user: User = Depend
     return {"success": True, "article": _serialize(article)}
 
 
+async def _wordpress_content_candidates(
+    client: httpx.AsyncClient, site: str, auth: tuple[str, str], current_post_id: int | None = None
+) -> list[dict[str, Any]]:
+    """Fetch published WordPress pages and posts that are eligible internal-link targets."""
+    candidates: list[dict[str, Any]] = []
+    for content_type in ("pages", "posts"):
+        try:
+            response = await client.get(
+                f"{site}/wp-json/wp/v2/{content_type}",
+                params={
+                    "status": "publish",
+                    "per_page": 100,
+                    "page": 1,
+                    "orderby": "modified",
+                    "order": "desc",
+                    "_fields": "id,link,title,slug,type,modified",
+                },
+                auth=auth,
+            )
+        except Exception:
+            continue
+        if response.status_code >= 400:
+            continue
+        try:
+            rows = response.json()
+        except Exception:
+            continue
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item_id = row.get("id")
+            if current_post_id is not None and str(item_id) == str(current_post_id):
+                continue
+            link = str(row.get("link") or "").strip()
+            title = str((row.get("title") or {}).get("rendered") or row.get("title") or "").strip()
+            if not link or not title:
+                continue
+            candidates.append({
+                "id": item_id,
+                "type": "page" if content_type == "pages" else "post",
+                "title": title,
+                "url": link,
+                "slug": str(row.get("slug") or ""),
+            })
+
+    # De-duplicate by canonical URL while preserving the freshest API ordering.
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for item in candidates:
+        key = item["url"].rstrip("/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique[:180]
+
+
+@router.post("/articles/{article_id}/internal-link-candidates")
+async def internal_link_candidates(
+    article_id: str,
+    data: WordPressCredentialsRequest,
+    db=Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    article = db.scalar(select(ContentArticle).where(ContentArticle.id == article_id, _scope(current_user)))
+    if not article:
+        raise HTTPException(status_code=404, detail="Content article not found.")
+
+    site = _site(str(data.wordpress_site))
+    auth = (data.wordpress_username.strip(), data.wordpress_application_password.strip())
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True) as client:
+            me = await client.get(f"{site}/wp-json/wp/v2/users/me", params={"context": "edit"}, auth=auth)
+            if me.status_code >= 400:
+                raise HTTPException(status_code=401, detail="WordPress authentication failed. Use a WordPress Application Password.")
+            candidates = await _wordpress_content_candidates(client, site, auth, article.wordpress_post_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not load WordPress pages and posts: {exc}") from exc
+
+    return {"success": True, "count": len(candidates), "candidates": candidates}
+
+
 @router.post("/articles/{article_id}/publish/wordpress")
 async def publish_article_wordpress(
     article_id: str,
@@ -273,9 +377,68 @@ async def publish_article_wordpress(
     if data.status == "future" and data.scheduled_at is None:
         raise HTTPException(status_code=400, detail="scheduled_at is required for a scheduled WordPress post.")
 
+    # Internal-link targets are selected by Claude in the frontend from the
+    # authenticated WordPress candidate list. The backend validates every URL
+    # against the connected site before inserting links.
+    final_content = article.article_html
+    applied_internal_links: list[dict[str, str]] = []
+    if data.internal_links:
+        parsed_site = urlparse(site)
+        allowed_host = parsed_site.netloc.lower()
+        allowed_scheme = parsed_site.scheme.lower()
+        valid_links: list[dict[str, str]] = []
+        for item in data.internal_links:
+            target = str(item.target_url).strip()
+            parsed_target = urlparse(target)
+            if parsed_target.scheme.lower() != allowed_scheme or parsed_target.netloc.lower() != allowed_host:
+                continue
+            if target.rstrip("/") == site.rstrip("/"):
+                continue
+            anchor = " ".join(item.anchor_text.split())[:160]
+            if len(anchor) >= 2:
+                valid_links.append({"url": target, "anchor": anchor})
+
+        if valid_links:
+            if BeautifulSoup is None:
+                raise HTTPException(status_code=500, detail="Internal-link publishing requires beautifulsoup4. Install the backend dependency and restart the server.")
+            soup = BeautifulSoup(final_content, "html.parser")
+            existing_urls = {str(a.get("href") or "").rstrip("/").lower() for a in soup.find_all("a", href=True)}
+
+            for link in valid_links[:8]:
+                target_key = link["url"].rstrip("/").lower()
+                if target_key in existing_urls:
+                    continue
+                pattern = re.compile(re.escape(link["anchor"]), re.IGNORECASE)
+                inserted = False
+                for node in list(soup.find_all(string=True)):
+                    parent = node.parent
+                    if parent is None or parent.name in {"a", "code", "pre", "script", "style", "h1", "h2", "h3", "h4", "h5", "h6"}:
+                        continue
+                    if parent.find_parent(["a", "code", "pre", "script", "style", "h1", "h2", "h3", "h4", "h5", "h6"]):
+                        continue
+                    match = pattern.search(str(node))
+                    if not match:
+                        continue
+                    before = str(node)[:match.start()]
+                    matched = match.group(0)
+                    after = str(node)[match.end():]
+                    anchor_tag = soup.new_tag("a", href=link["url"])
+                    anchor_tag.string = matched
+                    from bs4 import NavigableString
+                    fragment = [NavigableString(before), anchor_tag, NavigableString(after)]
+                    node.replace_with(*fragment)
+                    existing_urls.add(target_key)
+                    applied_internal_links.append({"target_url": link["url"], "anchor_text": matched})
+                    inserted = True
+                    break
+                if len(applied_internal_links) >= 8:
+                    break
+
+            final_content = str(soup)
+
     payload: dict[str, Any] = {
         "title": article.title,
-        "content": article.article_html,
+        "content": final_content,
         "status": data.status,
     }
     if article.slug:
@@ -340,6 +503,7 @@ async def publish_article_wordpress(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not connect to WordPress: {exc}") from exc
 
+    article.article_html = final_content
     article.status = "published" if data.status == "publish" else "scheduled" if data.status == "future" else "draft"
     article.wordpress_site = site
     article.wordpress_post_id = result.get("id")
@@ -360,6 +524,7 @@ async def publish_article_wordpress(
             "featured_media_id": featured["id"],
             "featured_image_url": featured["url"],
             "seo_metadata_applied": seo["applied"],
+            "internal_links_applied": applied_internal_links,
         },
     }
 
