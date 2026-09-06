@@ -65,6 +65,10 @@ interface RankKeyword {
   ranking_url: string | null;
   last_checked_at: string | null;
   status: string;
+  last_error?: string | null;
+  measurement_property?: string;
+  measurement_message?: string;
+  date_range?: { start: string; end: string };
 }
 
 interface Overview {
@@ -121,6 +125,7 @@ export function RankTracker() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryPoint[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [measurementMessage, setMeasurementMessage] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -210,6 +215,9 @@ export function RankTracker() {
             setKeywords((current) =>
               current.map((item) => item.id === checked.id ? checked : item),
             );
+            if (checked.measurement_message) {
+              toast.info(checked.measurement_message);
+            }
             await loadHistory(created.id);
           }
 
@@ -249,6 +257,9 @@ export function RankTracker() {
           const map = new Map(result.items.map((item) => [item.id, item]));
           return current.map((item) => map.get(item.id) || item);
         });
+        const first = result.items[0];
+        if (first?.measurement_message) setMeasurementMessage(first.measurement_message);
+        if (ids.length === 1) await loadHistory(ids[0]);
       }
       if (result.errors?.length) {
         toast.warning(`${result.updated} updated; ${result.errors.length} could not be checked.`);
@@ -281,10 +292,36 @@ export function RankTracker() {
     }
   };
 
-  const chartData = history.map((point) => ({
-    date: new Date(point.checked_at).toLocaleDateString(undefined, { month: "short", day: "numeric" }),
-    position: point.position,
-  }));
+  const chartData = history.map((point, index) => {
+    const checkedAt = new Date(point.checked_at);
+    return {
+      // Include time (and seconds) so multiple snapshots taken on the same day
+      // remain distinct on the X axis instead of collapsing into one "Sep 6" label.
+      date: checkedAt.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+      }),
+      position: point.position,
+      snapshot: index + 1,
+      checkedAt: point.checked_at,
+    };
+  });
+
+  const chartPositions = chartData
+    .map((point) => point.position)
+    .filter((position): position is number => typeof position === "number" && Number.isFinite(position));
+  const chartMin = chartPositions.length ? Math.min(...chartPositions) : 1;
+  const chartMax = chartPositions.length ? Math.max(...chartPositions) : 1;
+  // Keep a small amount of breathing room around a flat series (e.g. 21, 21, 21, 21)
+  // so the line and snapshot points are clearly visible.
+  const chartPadding = Math.max(1, Math.ceil((chartMax - chartMin) * 0.2));
+  const chartDomain: [number, number] = [
+    Math.max(1, chartMin - chartPadding),
+    chartMax + chartPadding,
+  ];
 
   if (loading) {
     return <div className="p-8 flex items-center gap-2 text-slate-500"><Loader2 className="size-4 animate-spin" /> Loading Rank Tracker...</div>;
@@ -325,7 +362,14 @@ export function RankTracker() {
           </CardContent>
         </Card>
       ) : (
-        <div className="flex items-center gap-2 text-xs text-slate-500"><CheckCircle2 className="size-4 text-emerald-600" /> Measuring from <span className="font-medium text-slate-700 dark:text-slate-300">{property}</span> · GSC average position</div>
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 text-xs text-slate-500"><CheckCircle2 className="size-4 text-emerald-600" /> Measuring from <span className="font-medium text-slate-700 dark:text-slate-300">{property}</span> · GSC average position</div>
+          {measurementMessage && (
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-400">
+              {measurementMessage}
+            </div>
+          )}
+        </div>
       )}
 
       <div className="grid grid-cols-2 xl:grid-cols-7 gap-3">
@@ -378,7 +422,16 @@ export function RankTracker() {
                         <td className="px-4 py-4 text-slate-500">{positionLabel(item.previous_position)}</td>
                         <td className={`px-4 py-4 font-medium ${movementClass(item.change)}`}>{item.change == null ? "—" : <span className="inline-flex items-center gap-1">{item.change > 0 ? <ArrowUp className="size-3.5" /> : item.change < 0 ? <ArrowDown className="size-3.5" /> : null}{Math.abs(item.change).toFixed(1)}</span>}</td>
                         <td className="px-4 py-4 text-xs text-slate-500">{item.last_checked_at ? new Date(item.last_checked_at).toLocaleDateString() : "Never"}</td>
-                        <td className="px-3 py-4"><Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); void handleDelete(item.id); }}><Trash2 className="size-4 text-slate-400 hover:text-rose-500" /></Button></td>
+                        <td className="px-3 py-4">
+                          <div className="flex items-center gap-1">
+                            <Button variant="ghost" size="sm" title="Check this keyword now" onClick={(e) => { e.stopPropagation(); void handleRefresh([item.id]); }} disabled={refreshing}>
+                              <RefreshCw className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} />
+                            </Button>
+                            <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); void handleDelete(item.id); }}>
+                              <Trash2 className="size-4 text-slate-400 hover:text-rose-500" />
+                            </Button>
+                          </div>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -391,15 +444,59 @@ export function RankTracker() {
         <Card className="shadow-sm">
           <CardHeader><CardTitle className="flex items-center gap-2"><BarChart3 className="size-5 text-emerald-600" /> Position History</CardTitle><CardDescription>{selectedId ? keywords.find((item) => item.id === selectedId)?.keyword : "Select a keyword"}</CardDescription></CardHeader>
           <CardContent>
-            {!selectedId ? <div className="py-16 text-center text-slate-500"><ChevronRight className="size-6 mx-auto mb-2" />Select a keyword to view history.</div> : historyLoading ? <div className="py-16 flex justify-center"><Loader2 className="size-5 animate-spin" /></div> : chartData.length === 0 ? <div className="py-16 text-center text-slate-500">No ranking snapshots yet. Run Check Rankings.</div> : (
-              <div className="h-[300px] w-full">
-                <ResponsiveContainer width="100%" height="100%"><LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                  <XAxis dataKey="date" tick={{ fontSize: 11 }} minTickGap={24} />
-                  <YAxis reversed domain={["dataMin - 1", "dataMax + 1"]} tick={{ fontSize: 11 }} />
-                  <Tooltip formatter={(value) => [value == null ? "Not ranking" : Number(value).toFixed(1), "Position"]} />
-                  <Line type="monotone" dataKey="position" connectNulls={false} dot={false} strokeWidth={2} />
-                </LineChart></ResponsiveContainer>
+            {!selectedId ? <div className="py-16 text-center text-slate-500"><ChevronRight className="size-6 mx-auto mb-2" />Select a keyword to view history.</div> : historyLoading ? <div className="py-16 flex justify-center"><Loader2 className="size-5 animate-spin" /></div> : chartData.length === 0 ? (
+                <div className="py-16 text-center text-slate-500">
+                  {keywords.find((item) => item.id === selectedId)?.last_error ||
+                    "No ranking position was returned by Google Search Console for this keyword in the selected period."}
+                </div>
+              ) : (
+              <div className="h-[320px] w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={chartData} margin={{ top: 12, right: 12, left: 4, bottom: 38 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                    <XAxis
+                      dataKey="date"
+                      tick={{ fontSize: 10 }}
+                      interval={0}
+                      angle={-28}
+                      textAnchor="end"
+                      height={58}
+                      tickMargin={8}
+                    />
+                    <YAxis
+                      reversed
+                      domain={chartDomain}
+                      allowDecimals
+                      tick={{ fontSize: 11 }}
+                      width={34}
+                      tickFormatter={(value) => Number(value).toFixed(0)}
+                    />
+                    <Tooltip
+                      labelFormatter={(_, payload) => {
+                        const checkedAt = payload?.[0]?.payload?.checkedAt;
+                        return checkedAt
+                          ? new Date(checkedAt).toLocaleString(undefined, {
+                              dateStyle: "medium",
+                              timeStyle: "medium",
+                            })
+                          : "Snapshot";
+                      }}
+                      formatter={(value) => [
+                        value == null ? "Not ranking" : Number(value).toFixed(1),
+                        "Position",
+                      ]}
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="position"
+                      connectNulls={false}
+                      strokeWidth={3}
+                      dot={{ r: 4, strokeWidth: 2 }}
+                      activeDot={{ r: 6 }}
+                      isAnimationActive={false}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
               </div>
             )}
             {selectedId && history.length > 0 && <div className="mt-4 pt-4 border-t dark:border-slate-800 text-xs text-slate-500 flex items-center gap-2"><Clock3 className="size-3.5" /> {history.length} stored snapshot{history.length === 1 ? "" : "s"}</div>}
