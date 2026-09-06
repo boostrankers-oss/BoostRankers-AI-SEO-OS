@@ -30,13 +30,128 @@ function cleanHtml(value: string): string {
   return value.replace(/^```(?:html)?\s*/i, "").replace(/\s*```$/i, "").trim();
 }
 
+function sanitizeJsonControlCharacters(value: string): string {
+  // Claude can occasionally return literal newline/tab characters inside a
+  // JSON string (most often inside article_html). JSON requires these control
+  // characters to be escaped. Repair only characters inside quoted strings;
+  // do not alter normal JSON whitespace outside strings.
+  let result = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i];
+
+    if (inString) {
+      if (escaped) {
+        result += char;
+        escaped = false;
+        continue;
+      }
+
+      if (char === "\\") {
+        result += char;
+        escaped = true;
+        continue;
+      }
+
+      if (char === '"') {
+        result += char;
+        inString = false;
+        continue;
+      }
+
+      const code = char.charCodeAt(0);
+      if (code < 0x20) {
+        switch (char) {
+          case "\n":
+            result += "\\n";
+            break;
+          case "\r":
+            result += "\\r";
+            break;
+          case "\t":
+            result += "\\t";
+            break;
+          case "\b":
+            result += "\\b";
+            break;
+          case "\f":
+            result += "\\f";
+            break;
+          default:
+            result += `\\u${code.toString(16).padStart(4, "0")}`;
+        }
+      } else {
+        result += char;
+      }
+      continue;
+    }
+
+    if (char === '"') inString = true;
+    result += char;
+  }
+
+  return result;
+}
+
+function extractJsonObject(value: string): string {
+  const start = value.indexOf("{");
+  if (start < 0) throw new Error("Claude returned no JSON object.");
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < value.length; i += 1) {
+    const char = value[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return value.slice(start, i + 1);
+    }
+  }
+
+  throw new Error("Claude returned incomplete JSON.");
+}
+
 function parseJson(value: string): any {
-  const cleaned = value.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-  try { return JSON.parse(cleaned); } catch {
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
-    if (start >= 0 && end > start) return JSON.parse(cleaned.slice(start, end + 1));
-    throw new Error("Claude returned an invalid article response.");
+  const cleaned = value
+    .replace(/^\s*```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .trim();
+
+  // Fast path: valid JSON exactly as returned by Claude.
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Continue with the production repair path below.
+  }
+
+  const candidate = extractJsonObject(cleaned);
+
+  // Repair literal control characters inside JSON strings. This directly
+  // addresses errors such as: Bad control character in string literal.
+  try {
+    return JSON.parse(sanitizeJsonControlCharacters(candidate));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown JSON error.";
+    throw new Error(`Claude returned an invalid article response: ${message}`);
   }
 }
 
