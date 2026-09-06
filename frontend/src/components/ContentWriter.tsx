@@ -107,8 +107,28 @@ function parseTaggedArticle(value: string): any | null {
     return match?.[1]?.trim() ?? "";
   };
 
-  const articleMatch = cleaned.match(/ARTICLE_HTML_BEGIN\s*\n?([\\s\\S]*?)\n?ARTICLE_HTML_END/i);
-  if (!articleMatch) return null;
+  const articleMatch = cleaned.match(/ARTICLE_HTML_BEGIN\s*\n?([\s\S]*?)\n?ARTICLE_HTML_END/i);
+  if (!articleMatch) {
+    // Tolerate harmless formatting around the protocol markers.
+    const begin = cleaned.search(/ARTICLE_HTML_BEGIN/i);
+    const end = cleaned.search(/ARTICLE_HTML_END/i);
+    if (begin >= 0 && end > begin) {
+      const afterBegin = cleaned.slice(begin + "ARTICLE_HTML_BEGIN".length);
+      const relativeEnd = afterBegin.search(/ARTICLE_HTML_END/i);
+      if (relativeEnd >= 0) {
+        const articleHtml = afterBegin.slice(0, relativeEnd).trim();
+        if (articleHtml) {
+          return {
+            meta_title: get("META_TITLE"),
+            meta_description: get("META_DESCRIPTION"),
+            slug: get("SLUG"),
+            article_html: articleHtml,
+          };
+        }
+      }
+    }
+    return null;
+  }
 
   const articleHtml = articleMatch[1].trim();
   if (!articleHtml) return null;
@@ -149,6 +169,9 @@ function parseJsonArticle(value: string): any | null {
 }
 
 function parseArticleResponse(value: string): any {
+  if (!value || !String(value).trim()) {
+    throw new Error("Claude returned an empty article response.");
+  }
   // Preferred protocol: plain-text delimiters. This avoids JSON escaping
   // entirely for large multiline WordPress HTML documents.
   const tagged = parseTaggedArticle(value);
