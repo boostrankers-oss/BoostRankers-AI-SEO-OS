@@ -31,10 +31,6 @@ function cleanHtml(value: string): string {
 }
 
 function sanitizeJsonControlCharacters(value: string): string {
-  // Claude can occasionally return literal newline/tab characters inside a
-  // JSON string (most often inside article_html). JSON requires these control
-  // characters to be escaped. Repair only characters inside quoted strings;
-  // do not alter normal JSON whitespace outside strings.
   let result = "";
   let inString = false;
   let escaped = false;
@@ -48,40 +44,24 @@ function sanitizeJsonControlCharacters(value: string): string {
         escaped = false;
         continue;
       }
-
       if (char === "\\") {
         result += char;
         escaped = true;
         continue;
       }
-
       if (char === '"') {
         result += char;
         inString = false;
         continue;
       }
-
       const code = char.charCodeAt(0);
       if (code < 0x20) {
-        switch (char) {
-          case "\n":
-            result += "\\n";
-            break;
-          case "\r":
-            result += "\\r";
-            break;
-          case "\t":
-            result += "\\t";
-            break;
-          case "\b":
-            result += "\\b";
-            break;
-          case "\f":
-            result += "\\f";
-            break;
-          default:
-            result += `\\u${code.toString(16).padStart(4, "0")}`;
-        }
+        if (char === "\n") result += "\\n";
+        else if (char === "\r") result += "\\r";
+        else if (char === "\t") result += "\\t";
+        else if (char === "\b") result += "\\b";
+        else if (char === "\f") result += "\\f";
+        else result += `\\u${code.toString(16).padStart(4, "0")}`;
       } else {
         result += char;
       }
@@ -91,7 +71,6 @@ function sanitizeJsonControlCharacters(value: string): string {
     if (char === '"') inString = true;
     result += char;
   }
-
   return result;
 }
 
@@ -105,54 +84,83 @@ function extractJsonObject(value: string): string {
 
   for (let i = start; i < value.length; i += 1) {
     const char = value[i];
-
     if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
       continue;
     }
-
-    if (char === '"') {
-      inString = true;
-    } else if (char === "{") {
-      depth += 1;
-    } else if (char === "}") {
+    if (char === '"') inString = true;
+    else if (char === "{") depth += 1;
+    else if (char === "}") {
       depth -= 1;
       if (depth === 0) return value.slice(start, i + 1);
     }
   }
-
   throw new Error("Claude returned incomplete JSON.");
 }
 
-function parseJson(value: string): any {
+function parseTaggedArticle(value: string): any | null {
+  const cleaned = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const get = (name: string): string => {
+    const match = cleaned.match(new RegExp(`^${name}\\s*:\\s*(.*?)\\s*$`, "im"));
+    return match?.[1]?.trim() ?? "";
+  };
+
+  const articleMatch = cleaned.match(/ARTICLE_HTML_BEGIN\s*\n?([\\s\\S]*?)\n?ARTICLE_HTML_END/i);
+  if (!articleMatch) return null;
+
+  const articleHtml = articleMatch[1].trim();
+  if (!articleHtml) return null;
+
+  return {
+    meta_title: get("META_TITLE"),
+    meta_description: get("META_DESCRIPTION"),
+    slug: get("SLUG"),
+    article_html: articleHtml,
+  };
+}
+
+function parseJsonArticle(value: string): any | null {
   const cleaned = value
     .replace(/^\s*```(?:json)?\s*/i, "")
     .replace(/\s*```\s*$/i, "")
     .trim();
 
-  // Fast path: valid JSON exactly as returned by Claude.
+  const attempts = [cleaned];
   try {
-    return JSON.parse(cleaned);
+    attempts.push(extractJsonObject(cleaned));
   } catch {
-    // Continue with the production repair path below.
+    // Continue to the repair attempt below.
   }
 
-  const candidate = extractJsonObject(cleaned);
-
-  // Repair literal control characters inside JSON strings. This directly
-  // addresses errors such as: Bad control character in string literal.
-  try {
-    return JSON.parse(sanitizeJsonControlCharacters(candidate));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown JSON error.";
-    throw new Error(`Claude returned an invalid article response: ${message}`);
+  for (const candidate of attempts) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      try {
+        return JSON.parse(sanitizeJsonControlCharacters(candidate));
+      } catch {
+        // Try the next representation.
+      }
+    }
   }
+  return null;
+}
+
+function parseArticleResponse(value: string): any {
+  // Preferred protocol: plain-text delimiters. This avoids JSON escaping
+  // entirely for large multiline WordPress HTML documents.
+  const tagged = parseTaggedArticle(value);
+  if (tagged) return tagged;
+
+  // Backward-compatible JSON support for older Claude responses.
+  const json = parseJsonArticle(value);
+  if (json) return json;
+
+  throw new Error(
+    "Claude returned an invalid article response. The response was neither the required tagged format nor valid JSON."
+  );
 }
 
 
@@ -208,13 +216,30 @@ Requirements:
 - Use semantic H2/H3 headings, short paragraphs, bullets where useful, and a concise FAQ when appropriate.
 - Do not invent statistics, search volume, rankings, customer results, credentials, citations, or claims that cannot be supported by the topic.
 - Do not add fake sources or fake links.
-- Return JSON only with: meta_title, meta_description, slug, article_html.
+- Do NOT return JSON. JSON escaping is intentionally not used for article HTML.
+- Return ONLY this exact tagged format, with no commentary and no code fences:
+META_TITLE: a concise SEO title
+META_DESCRIPTION: a useful meta description
+SLUG: a clean URL slug
+ARTICLE_HTML_BEGIN
+<article HTML here>
+ARTICLE_HTML_END
 - article_html must contain semantic HTML suitable for WordPress post content, without html/head/body wrappers.
-- Do not use markdown or code fences.
+- Never put ARTICLE_HTML_END inside the article itself.
+- Do not use markdown outside the HTML.
 - Aim for approximately 1200-1800 words unless the topic genuinely requires less.
 `;
-      const raw = await generateContent(prompt);
-      const parsed = parseJson(raw);
+      const recoveryPrompt = `${prompt}
+
+CRITICAL RECOVERY RULE: Output the tagged format exactly. Do not output JSON, markdown fences, explanations, or introductory text.`;
+      let raw = await generateContent(prompt);
+      let parsed = parseArticleResponse(raw);
+
+      if (!parsed.article_html || String(parsed.article_html).length < 500) {
+        raw = await generateContent(recoveryPrompt);
+        parsed = parseArticleResponse(raw);
+      }
+
       if (!parsed.article_html || String(parsed.article_html).length < 500) throw new Error("Claude did not return enough article content.");
       const payload = {
         plan_id: planId,
