@@ -233,14 +233,31 @@ ARTICLE_HTML_END
 
 CRITICAL RECOVERY RULE: Output the tagged format exactly. Do not output JSON, markdown fences, explanations, or introductory text.`;
       let raw = await generateContent(prompt);
-      let parsed = parseArticleResponse(raw);
+      let parsed: any | null = null;
+      let firstParseError: unknown = null;
 
-      if (!parsed.article_html || String(parsed.article_html).length < 500) {
-        raw = await generateContent(recoveryPrompt);
+      try {
         parsed = parseArticleResponse(raw);
+      } catch (parseError) {
+        firstParseError = parseError;
       }
 
-      if (!parsed.article_html || String(parsed.article_html).length < 500) throw new Error("Claude did not return enough article content.");
+      // If Claude ignored the output protocol or the response was truncated,
+      // make one recovery request instead of surfacing the parser error immediately.
+      if (!parsed?.article_html || String(parsed.article_html).length < 500) {
+        raw = await generateContent(recoveryPrompt);
+        try {
+          parsed = parseArticleResponse(raw);
+        } catch (recoveryError) {
+          const firstMessage = firstParseError instanceof Error ? firstParseError.message : "";
+          const recoveryMessage = recoveryError instanceof Error ? recoveryError.message : "";
+          throw new Error(recoveryMessage || firstMessage || "Claude did not return a readable article.");
+        }
+      }
+
+      if (!parsed?.article_html || String(parsed.article_html).length < 500) {
+        throw new Error("Claude did not return enough article content after the recovery attempt.");
+      }
       const payload = {
         plan_id: planId,
         day_number: dayNumber,
