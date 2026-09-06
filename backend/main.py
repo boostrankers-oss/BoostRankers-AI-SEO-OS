@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database.database import engine
 from models.content_plan import ContentPlan
+from rank_tracking import router as rank_tracking_router
 
 
 from routers import (
@@ -191,6 +192,10 @@ app.include_router(
 app.include_router(
     content_automation_router,
     tags=["Content Automation"],
+)
+app.include_router(
+    rank_tracking_router,
+    tags=["Rank Tracking"],
 )
 
 @app.on_event("startup")

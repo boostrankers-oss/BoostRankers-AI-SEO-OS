@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type * as React from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -53,6 +54,16 @@ interface ContentArticleStatus {
   wordpress_url: string | null;
   published_at: string | null;
 }
+
+// Compatibility layer for older ContentAutoScheduler builds.
+// It keeps the existing status callback available without changing the
+// scheduler's other props or behavior.
+type ContentAutoSchedulerProps = React.ComponentProps<typeof ContentAutoScheduler> & {
+  onArticleUpdated?: (dayNumber: number, article: ContentArticleStatus) => void;
+};
+
+const ContentAutoSchedulerCompat =
+  ContentAutoScheduler as React.ComponentType<ContentAutoSchedulerProps>;
 
 function formatDateKey(date: Date): string {
   const year = date.getFullYear();
@@ -775,13 +786,13 @@ ${retry ? "IMPORTANT: Your previous response failed validation. Return the exact
         <Card className="border-slate-200 dark:border-slate-800 shadow-sm"><CardContent className="p-12 text-center"><Calendar className="size-10 text-slate-300 dark:text-slate-700 mx-auto mb-3" /><p className="text-slate-500 dark:text-slate-400">No 90-day content plan yet. Generate one to get started.</p></CardContent></Card>
       )}
 
-      <ContentAutoScheduler
+      <ContentAutoSchedulerCompat
         open={autoSchedulerOpen}
         onClose={() => setAutoSchedulerOpen(false)}
         ideas={ideas}
         planId={currentPlanId}
         startDate={startDate}
-        onArticleUpdated={(dayNumber, article) => {
+        onArticleUpdated={(dayNumber: number, article: ContentArticleStatus) => {
           setIdeas((current) => current.map((item, index) =>
             index === dayNumber - 1 ? { ...item, status: article?.status || item.status } : item
           ));

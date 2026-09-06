@@ -51,6 +51,7 @@ export function Sidebar({ view, setView, dark, setDark, onLogout, role }: Sideba
     { id: "eeat", label: "EEAT", icon: Award },
     { id: "aisearch", label: "AI Search", icon: Bot },
     { id: "google", label: "Google Integration", icon: BarChart3 },
+	{ id: "ranktracker", label: "Rank Tracker", icon: Link2,},
   ] as const;
 
   const bottomItems = [

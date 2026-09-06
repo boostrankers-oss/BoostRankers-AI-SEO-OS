@@ -33,6 +33,7 @@ export function CommandPalette({ open, onOpenChange, setView }: CommandPalettePr
     { id: "eeat", label: "EEAT Optimization", icon: Award },
     { id: "aisearch", label: "AI Search Optimization", icon: Bot },
     { id: "google", label: "Google Integration", icon: BarChart3 },
+	{ id: "ranktracker", label: "Rank Tracker", icon: Link2 },
     { id: "settings", label: "Open Settings", icon: Settings },
     { id: "notifications", label: "View Notifications", icon: Bell },
     { id: "profile", label: "View Profile", icon: User },

@@ -23,6 +23,7 @@ import { AuthProvider, useAuth } from "@/components/AuthProvider";
 import { ClaudeProvider } from "@/components/ClaudeProvider";
 import { AuditProvider } from "@/context/AuditContext";
 import AdminDashboard from "@/components/AdminDashboard";
+import { RankTracker } from "./components/RankTracker";
 
 export type ViewKey =
   | "dashboard"
@@ -41,6 +42,7 @@ export type ViewKey =
   | "eeat"
   | "aisearch"
   | "google"
+  | "ranktracker"
   | "settings"
   | "admin";
 
@@ -95,6 +97,8 @@ function MainApp() {
         return <Settings />;
       case "admin":
         return <AdminDashboard />;
+      case "ranktracker":
+        return <RankTracker />;
       default:
         return <div className="p-8">Page not found</div>;
     }
