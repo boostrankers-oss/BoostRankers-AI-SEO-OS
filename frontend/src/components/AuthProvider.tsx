@@ -196,7 +196,7 @@ export function AuthProvider({
        * not /signup.
        */
       const response = await api.post<AuthResponse>(
-        "/api/auth/register",
+        "/api/auth/signup",
         payload,
         {
           auth: false,

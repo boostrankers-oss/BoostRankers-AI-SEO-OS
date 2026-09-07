@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import { AuthScreen } from "@/components/AuthScreen";
 import { Sidebar } from "@/components/Sidebar";
@@ -23,8 +23,6 @@ import { AuthProvider, useAuth } from "@/components/AuthProvider";
 import { ClaudeProvider } from "@/components/ClaudeProvider";
 import { AuditProvider } from "@/context/AuditContext";
 import AdminDashboard from "@/components/AdminDashboard";
-import { RankTracker } from "./components/RankTracker";
-import { KeywordConflicts } from "./components/KeywordConflicts";
 
 export type ViewKey =
   | "dashboard"
@@ -43,91 +41,60 @@ export type ViewKey =
   | "eeat"
   | "aisearch"
   | "google"
-  | "ranktracker"
-  | "keywordconflicts"
   | "settings"
   | "admin";
+
+
+  // existing code continues here...
 
 function MainApp() {
   const { user, logout } = useAuth();
   const [dark, setDark] = useState(false);
   const [activeView, setActiveView] = useState<ViewKey>("dashboard");
 
-  /*
-   * Keep the existing Super Admin behavior:
-   * Super Admin opens the Admin panel by default.
-   *
-   * This is implemented with useEffect instead of changing state
-   * directly during render.
-   */
-  useEffect(() => {
-    if (user && user.role === "super_admin" && activeView === "dashboard") {
-      setActiveView("admin");
-    }
-  }, [user, activeView]);
+  // Super Admin sees the admin panel by default
+  if (user && user.role === "super_admin" && activeView === "dashboard") {
+    setActiveView("admin");
+  }
 
   const renderContent = () => {
     switch (activeView) {
       case "dashboard":
         return <Dashboard onRunAudit={() => setActiveView("audit")} />;
-
       case "clients":
         return <Clients />;
-
       case "audit":
         return <AuditEngine />;
-
       case "reports":
         return <Reports />;
-
       case "content":
         return <ContentPlanner />;
-
       case "keywords":
         return <KeywordResearch />;
-
       case "clusters":
         return <KeywordClusters />;
-
       case "blog":
         return <BlogOptimizer />;
-
       case "competitors":
         return <Competitors />;
-
       case "linking":
         return <InternalLinking />;
-
       case "backlinks":
         return <Backlinks />;
-
       case "local":
         return <LocalSEO />;
-
       case "schema":
         return <SchemaGenerator />;
-
       case "eeat":
         return <EEAT />;
-
       case "aisearch":
         return <AISearch />;
-
       case "google":
         return <GoogleIntegration />;
-
-      case "ranktracker":
-        return <RankTracker />;
-
-      case "keywordconflicts":
-        return <KeywordConflicts />;
-
       case "settings":
         return <Settings />;
-
       case "admin":
         return <AdminDashboard />;
-
       default:
         return <div className="p-8">Page not found</div>;
     }
@@ -147,7 +114,6 @@ function MainApp() {
         onLogout={logout}
         role={user.role}
       />
-
       <main className="flex-1 overflow-y-auto bg-slate-50 dark:bg-slate-950">
         {renderContent()}
       </main>

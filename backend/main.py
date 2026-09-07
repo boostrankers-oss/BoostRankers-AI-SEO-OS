@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database.database import engine
 from models.content_plan import ContentPlan
 from rank_tracking import router as rank_tracking_router
+from keyword_conflicts import router as keyword_conflicts_router
 
 
 from routers import (
@@ -196,6 +197,10 @@ app.include_router(
 app.include_router(
     rank_tracking_router,
     tags=["Rank Tracking"],
+)
+app.include_router(
+    keyword_conflicts_router,
+    tags=["Keyword Conflicts"],
 )
 
 @app.on_event("startup")

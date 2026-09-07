@@ -1,27 +1,30 @@
 import { cn } from "@/lib/utils";
 import { UserRole } from "@/components/AuthProvider";
-import { 
-  LayoutDashboard, 
-  Users, 
-  FileSearch, 
-  FileText, 
-  CalendarRange, 
-  Search, 
-  Network, 
-  PenLine, 
-  Target, 
-  Link2, 
-  MapPin, 
-  Code2, 
-  Award, 
-  Bot, 
-  BarChart3, 
-  Settings as SettingsIcon, 
+
+import {
+  LayoutDashboard,
+  Users,
+  FileSearch,
+  FileText,
+  CalendarRange,
+  Search,
+  Network,
+  PenLine,
+  Target,
+  Link2,
+  MapPin,
+  Code2,
+  Award,
+  Bot,
+  BarChart3,
+  Settings as SettingsIcon,
   LogOut,
   ShieldCheck,
+  ShieldAlert,
   Moon,
   Sun,
 } from "lucide-react";
+
 import type { ViewKey } from "@/App";
 
 interface SidebarProps {
@@ -33,7 +36,14 @@ interface SidebarProps {
   role: UserRole;
 }
 
-export function Sidebar({ view, setView, dark, setDark, onLogout, role }: SidebarProps) {
+export function Sidebar({
+  view,
+  setView,
+  dark,
+  setDark,
+  onLogout,
+  role,
+}: SidebarProps) {
   const navItems = [
     { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
     { id: "clients", label: "Clients", icon: Users },
@@ -51,7 +61,18 @@ export function Sidebar({ view, setView, dark, setDark, onLogout, role }: Sideba
     { id: "eeat", label: "EEAT", icon: Award },
     { id: "aisearch", label: "AI Search", icon: Bot },
     { id: "google", label: "Google Integration", icon: BarChart3 },
-	{ id: "ranktracker", label: "Rank Tracker", icon: Link2,},
+    { id: "ranktracker", label: "Rank Tracker", icon: Link2 },
+
+    /*
+     * Keyword Conflicts & Cannibalization
+     * Uses isolated navigation ID and does not modify
+     * any existing navigation item.
+     */
+    {
+      id: "keywordconflicts",
+      label: "Keyword Conflicts",
+      icon: ShieldAlert,
+    },
   ] as const;
 
   const bottomItems = [
@@ -60,32 +81,46 @@ export function Sidebar({ view, setView, dark, setDark, onLogout, role }: Sideba
 
   return (
     <aside className="w-64 h-screen bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col">
+      {/* Brand */}
       <div className="p-6 border-b border-slate-200 dark:border-slate-800">
         <div className="flex items-center gap-2">
           <div className="size-8 rounded-lg bg-emerald-600 flex items-center justify-center">
             <ShieldCheck className="size-5 text-white" />
           </div>
+
           <div>
-            <h1 className="font-serif text-lg font-bold leading-none">Boost Rankers</h1>
-            <p className="text-xs text-slate-500 mt-1">AI SEO OS</p>
+            <h1 className="font-serif text-lg font-bold leading-none">
+              Boost Rankers
+            </h1>
+
+            <p className="text-xs text-slate-500 mt-1">
+              AI SEO OS
+            </p>
           </div>
         </div>
       </div>
 
+      {/* User Role */}
       <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800">
         <div className="flex items-center gap-2">
-          <span className={cn(
-            "px-2 py-0.5 rounded-md text-xs font-medium",
-            role === "super_admin" ? "bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-400" :
-            role === "agency_admin" ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400" :
-            role === "manager" || role === "seo_specialist" ? "bg-indigo-50 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-400" :
-            "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400"
-          )}>
+          <span
+            className={cn(
+              "px-2 py-0.5 rounded-md text-xs font-medium",
+              role === "super_admin"
+                ? "bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-400"
+                : role === "agency_admin"
+                ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
+                : role === "manager" || role === "seo_specialist"
+                ? "bg-indigo-50 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-400"
+                : "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400"
+            )}
+          >
             {role}
           </span>
         </div>
       </div>
 
+      {/* Main Navigation */}
       <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-1">
         {navItems.map((item) => (
           <button
@@ -104,14 +139,23 @@ export function Sidebar({ view, setView, dark, setDark, onLogout, role }: Sideba
         ))}
       </nav>
 
+      {/* Bottom Navigation */}
       <div className="p-3 border-t border-slate-200 dark:border-slate-800 space-y-1">
+        {/* Theme Toggle */}
         <button
           onClick={() => setDark(!dark)}
           className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors text-slate-600 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
         >
-          {dark ? <Moon className="size-4" /> : <Sun className="size-4" />}
+          {dark ? (
+            <Moon className="size-4" />
+          ) : (
+            <Sun className="size-4" />
+          )}
+
           {dark ? "Dark Mode" : "Light Mode"}
         </button>
+
+        {/* Settings */}
         {bottomItems.map((item) => (
           <button
             key={item.id}
@@ -127,6 +171,8 @@ export function Sidebar({ view, setView, dark, setDark, onLogout, role }: Sideba
             {item.label}
           </button>
         ))}
+
+        {/* Logout */}
         <button
           onClick={onLogout}
           className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors text-slate-600 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
