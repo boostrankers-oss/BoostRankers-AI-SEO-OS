@@ -1218,7 +1218,42 @@ async def _run_crawl(
     payload: CrawlRequest,
 ) -> None:
     db = SessionLocal()
+    advisory_lock_acquired = False
+    lock_key = f"boost_rankers:page_post_indexing:{company_id}:{client_id}"
     try:
+        # Only one Page & Post crawl may mutate a client's indexing rows at a time.
+        # Manual crawls and the unattended automation can otherwise overlap and
+        # acquire PostgreSQL relation/index locks in different orders, causing
+        # deadlocks during the ON CONFLICT upserts and run-progress UPDATEs.
+        lock_row = db.execute(
+            text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0)) AS acquired"),
+            {"lock_key": lock_key},
+        ).scalar()
+        advisory_lock_acquired = bool(lock_row)
+        if not advisory_lock_acquired:
+            db.execute(
+                text(
+                    "UPDATE page_post_indexing_runs "
+                    "SET status='skipped', completed_at=:now, "
+                    "progress_message=:message, google_message=:google_message "
+                    "WHERE id=:id AND company_id=:company_id"
+                ),
+                {
+                    "id": run_id,
+                    "company_id": company_id,
+                    "now": _now(),
+                    "message": "Crawl skipped because another Page & Post crawl is already running for this client.",
+                    "google_message": "Retry after the active crawl completes.",
+                },
+            )
+            db.commit()
+            logger.info(
+                "Skipped overlapping Page/Post crawl %s for client %s; another crawl holds the advisory lock.",
+                run_id,
+                client_id,
+            )
+            return
+
         db.execute(
             text(
                 "UPDATE page_post_indexing_runs "
@@ -1508,6 +1543,15 @@ async def _run_crawl(
         except Exception:
             db.rollback()
     finally:
+        if advisory_lock_acquired:
+            try:
+                db.execute(
+                    text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                    {"lock_key": lock_key},
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
         db.close()
 
 
