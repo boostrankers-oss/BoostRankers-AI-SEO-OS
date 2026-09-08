@@ -203,6 +203,237 @@ def _extract_sitemap_locs(xml: str, limit: int = 5000) -> list[str]:
     ]
 
 
+def _host_key(value: str) -> str:
+    parsed = urlparse(str(value).strip())
+    host = (parsed.hostname or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _property_matches_site(property_value: str, site: str) -> bool:
+    """
+    Prevent submitting a client's sitemap to a different Search Console property.
+
+    Supports URL-prefix properties and sc-domain properties. Protocol and a leading
+    www. are ignored for hostname comparison, which is appropriate for ownership
+    matching here.
+    """
+    prop = str(property_value or "").strip()
+    site_host = _host_key(site)
+    if not prop or not site_host:
+        return False
+
+    if prop.lower().startswith("sc-domain:"):
+        return _host_key("https://" + prop.split(":", 1)[1]) == site_host
+
+    try:
+        parsed = urlparse(prop)
+    except Exception:
+        return False
+
+    return bool(parsed.hostname) and _host_key(prop) == site_host
+
+
+async def _probe_sitemap_candidate(
+    site: str,
+    candidate: str,
+    http: httpx.AsyncClient,
+    *,
+    robots_declared: bool,
+) -> dict[str, Any]:
+    """
+    Verify that a sitemap candidate is real before sending it to Google.
+
+    We deliberately do not treat a merely existing URL as a valid sitemap:
+    the response must be successful and contain sitemap <loc> entries.
+    """
+    candidate = str(candidate).strip()
+    if not candidate or not _same_domain(site, candidate):
+        return {
+            "url": candidate,
+            "valid": False,
+            "reason": "Sitemap must belong to the client's website.",
+        }
+
+    try:
+        response = await http.get(candidate)
+    except httpx.HTTPError as exc:
+        return {
+            "url": candidate,
+            "valid": False,
+            "reason": f"Sitemap request failed: {str(exc)[:300]}",
+        }
+
+    if response.status_code >= 400:
+        return {
+            "url": candidate,
+            "valid": False,
+            "status_code": response.status_code,
+            "reason": f"Sitemap returned HTTP {response.status_code}.",
+        }
+
+    xml = response.text or ""
+    locs = _extract_sitemap_locs(xml, 5000)
+    if not locs:
+        return {
+            "url": candidate,
+            "valid": False,
+            "status_code": response.status_code,
+            "reason": "Sitemap returned no <loc> entries.",
+        }
+
+    lowered = xml.lower()
+    if "<sitemapindex" in lowered:
+        kind = "sitemap_index"
+    elif "<urlset" in lowered:
+        kind = "urlset"
+    else:
+        kind = "xml"
+
+    # A robots.txt declaration is the strongest signal of the site's intended
+    # sitemap. Valid URL sets are also preferred over empty/non-sitemap XML.
+    score = 100 if robots_declared else 0
+    score += 40 if kind == "sitemap_index" else 30 if kind == "urlset" else 10
+    score += min(len(locs), 1000) / 1000
+
+    return {
+        "url": candidate,
+        "valid": True,
+        "status_code": response.status_code,
+        "kind": kind,
+        "loc_count": len(locs),
+        "robots_declared": robots_declared,
+        "score": score,
+    }
+
+
+async def _discover_submission_sitemap(
+    site: str,
+    explicit_sitemap_url: str | None = None,
+) -> dict[str, Any]:
+    """
+    Select the actual sitemap for this client instead of blindly submitting
+    /wp-sitemap.xml.
+
+    Priority:
+      1. An explicitly supplied sitemap, after validation.
+      2. A valid sitemap declared by robots.txt.
+      3. A valid WordPress/standard sitemap fallback.
+
+    Empty, inaccessible, cross-domain, or non-sitemap candidates are rejected.
+    """
+    site = _clean_site(site)
+
+    timeout = httpx.Timeout(20.0, connect=8.0, read=15.0, write=10.0, pool=8.0)
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/xml,text/xml,text/plain,*/*",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        headers=headers,
+    ) as http:
+        if explicit_sitemap_url:
+            explicit = str(explicit_sitemap_url).strip()
+            if not _same_domain(site, explicit):
+                return {
+                    "status": "error",
+                    "message": "The supplied sitemap must belong to the selected client website.",
+                    "sitemap_url": explicit,
+                }
+
+            result = await _probe_sitemap_candidate(
+                site,
+                explicit,
+                http,
+                robots_declared=False,
+            )
+            if not result.get("valid"):
+                return {
+                    "status": "error",
+                    "message": result.get("reason") or "The supplied sitemap could not be validated.",
+                    "sitemap_url": explicit,
+                }
+
+            return {
+                "status": "ok",
+                "sitemap_url": explicit,
+                "source": "explicit",
+                "kind": result.get("kind"),
+                "loc_count": result.get("loc_count"),
+            }
+
+        robots_declared: list[str] = []
+        try:
+            robots_response = await http.get(f"{site}/robots.txt")
+            if robots_response.status_code < 400:
+                for line in robots_response.text.splitlines():
+                    if line.lower().startswith("sitemap:"):
+                        candidate = line.split(":", 1)[1].strip()
+                        if candidate.startswith(("http://", "https://")):
+                            robots_declared.append(candidate)
+        except httpx.HTTPError:
+            robots_declared = []
+
+        fallback_candidates = [
+            f"{site}/wp-sitemap.xml",
+            f"{site}/sitemap_index.xml",
+            f"{site}/sitemap.xml",
+        ]
+
+        candidates: list[tuple[str, bool]] = []
+        seen: set[str] = set()
+        for candidate in robots_declared + fallback_candidates:
+            candidate = candidate.strip()
+            key = candidate.lower()
+            if not candidate or key in seen:
+                continue
+            seen.add(key)
+            candidates.append((candidate, candidate in robots_declared))
+
+        results: list[dict[str, Any]] = []
+        for candidate, declared in candidates[:10]:
+            result = await _probe_sitemap_candidate(
+                site,
+                candidate,
+                http,
+                robots_declared=declared,
+            )
+            if result.get("valid"):
+                results.append(result)
+
+        if not results:
+            attempted = ", ".join(candidate for candidate, _ in candidates[:10])
+            return {
+                "status": "not_found",
+                "message": (
+                    "No valid sitemap was found for this website. "
+                    f"Checked: {attempted or 'no sitemap candidates'}."
+                ),
+            }
+
+        # robots.txt is authoritative when it points to a valid sitemap.
+        # Otherwise select the strongest verified sitemap candidate.
+        results.sort(
+            key=lambda item: (
+                1 if item.get("robots_declared") else 0,
+                item.get("score", 0),
+                item.get("loc_count", 0),
+            ),
+            reverse=True,
+        )
+        selected = results[0]
+
+        return {
+            "status": "ok",
+            "sitemap_url": selected["url"],
+            "source": "robots.txt" if selected.get("robots_declared") else "verified_fallback",
+            "kind": selected.get("kind"),
+            "loc_count": selected.get("loc_count"),
+        }
+
+
 def _parse_index_status(payload: dict[str, Any]) -> dict[str, Any]:
     result = payload.get("inspectionResult") or {}
     index = result.get("indexStatusResult") or {}
@@ -701,7 +932,11 @@ async def _google_submit_sitemap(
 ) -> dict[str, Any]:
     connection = get_connection(db, company_id, "search_console")
     if connection is None:
-        return {"submitted": False, "status": "not_connected", "message": "Google Search Console is not connected."}
+        return {
+            "submitted": False,
+            "status": "not_connected",
+            "message": "Google Search Console is not connected.",
+        }
 
     property_value = None
     for attr in (
@@ -715,7 +950,26 @@ async def _google_submit_sitemap(
             break
 
     if not property_value:
-        return {"submitted": False, "status": "not_configured", "message": "No Search Console property is selected."}
+        return {
+            "submitted": False,
+            "status": "not_configured",
+            "message": "No Search Console property is selected.",
+        }
+
+    # Never submit a client's sitemap against another client's GSC property.
+    site = _clean_site(sitemap_url)
+    if not _property_matches_site(property_value, site):
+        return {
+            "submitted": False,
+            "status": "property_mismatch",
+            "message": (
+                "The selected Google Search Console property does not match "
+                "the client's website. Select the correct Search Console property "
+                "before submitting its sitemap."
+            ),
+            "property": property_value,
+            "sitemap_url": sitemap_url,
+        }
 
     token = await get_access_token(connection, db)
     endpoint = GOOGLE_SITEMAP_ENDPOINT.format(
@@ -723,24 +977,53 @@ async def _google_submit_sitemap(
         feed=quote(sitemap_url, safe=""),
     )
 
-    async with httpx.AsyncClient(timeout=45.0) as http:
-        response = await http.put(
-            endpoint,
-            headers={"Authorization": f"Bearer {token}"},
-        )
+    timeout = httpx.Timeout(20.0, connect=8.0, read=15.0, write=10.0, pool=8.0)
+    async with httpx.AsyncClient(timeout=timeout) as http:
+        try:
+            response = await http.put(
+                endpoint,
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+        except httpx.TimeoutException:
+            return {
+                "submitted": False,
+                "status": "timeout",
+                "message": "Google sitemap submission timed out. Please retry.",
+            }
+        except httpx.RequestError:
+            return {
+                "submitted": False,
+                "status": "error",
+                "message": "Google Search Console could not be reached. Please retry.",
+            }
 
         if response.status_code == 401:
             token = await get_access_token(connection, db)
-            response = await http.put(
-                endpoint,
-                headers={"Authorization": f"Bearer {token}"},
-            )
+            try:
+                response = await http.put(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                )
+            except httpx.TimeoutException:
+                return {
+                    "submitted": False,
+                    "status": "timeout",
+                    "message": "Google sitemap submission timed out after token refresh. Please retry.",
+                }
+            except httpx.RequestError:
+                return {
+                    "submitted": False,
+                    "status": "error",
+                    "message": "Google Search Console could not be reached after token refresh.",
+                }
 
     if response.status_code == 403:
         return {
             "submitted": False,
             "status": "unavailable",
             "message": "The connected Google OAuth authorization does not permit sitemap submission.",
+            "property": property_value,
+            "sitemap_url": sitemap_url,
         }
 
     if response.status_code >= 400:
@@ -748,12 +1031,18 @@ async def _google_submit_sitemap(
             detail = response.json().get("error", {}).get("message") or "Google sitemap submission failed."
         except Exception:
             detail = f"Google sitemap submission returned HTTP {response.status_code}."
-        return {"submitted": False, "status": "error", "message": detail}
+        return {
+            "submitted": False,
+            "status": "error",
+            "message": detail,
+            "property": property_value,
+            "sitemap_url": sitemap_url,
+        }
 
     return {
         "submitted": True,
         "status": "submitted",
-        "message": "Sitemap submitted to Google Search Console.",
+        "message": "Verified sitemap submitted to Google Search Console.",
         "sitemap_url": sitemap_url,
         "property": property_value,
     }
@@ -977,23 +1266,34 @@ async def _run_crawl(
             db.commit()
 
         sitemap_url = None
-        sitemap_result = {"submitted": False, "status": "not_requested", "message": "Sitemap submission not requested."}
+        sitemap_result = {
+            "submitted": False,
+            "status": "not_requested",
+            "message": "Sitemap submission not requested.",
+        }
         if payload.submit_sitemap:
             try:
-                _, sitemap_url = await _discover_from_sitemap(site, 1)
-                # The helper returns the first sitemap fetched, which is useful only as a
-                # hint. Prefer WordPress's canonical sitemap when available.
-                for candidate in (
-                    f"{site}/wp-sitemap.xml",
-                    f"{site}/sitemap_index.xml",
-                    f"{site}/sitemap.xml",
-                ):
-                    sitemap_url = candidate
-                    sitemap_result = await _google_submit_sitemap(db, company_id, candidate)
-                    if sitemap_result.get("submitted"):
-                        break
+                discovery = await _discover_submission_sitemap(site)
+                sitemap_url = discovery.get("sitemap_url")
+                if discovery.get("status") == "ok" and sitemap_url:
+                    sitemap_result = await _google_submit_sitemap(
+                        db,
+                        company_id,
+                        sitemap_url,
+                    )
+                else:
+                    sitemap_result = {
+                        "submitted": False,
+                        "status": discovery.get("status", "error"),
+                        "message": discovery.get("message", "No valid sitemap was found."),
+                    }
             except Exception as exc:
-                sitemap_result = {"submitted": False, "status": "error", "message": str(exc)[:1000]}
+                logger.exception("Sitemap discovery/submission failed for %s", site)
+                sitemap_result = {
+                    "submitted": False,
+                    "status": "error",
+                    "message": str(exc)[:1000],
+                }
 
         final_status = "completed"
         db.execute(
@@ -1342,9 +1642,34 @@ async def submit_sitemap(
     company_id = _company_id(current_user)
     client = _client_for_company(db, payload.client_id, company_id)
     site = _clean_site(str(client.website or ""))
-    sitemap = str(payload.sitemap_url or f"{site}/wp-sitemap.xml")
 
-    result = await _google_submit_sitemap(db, company_id, sitemap)
+    # If the user supplies a sitemap, validate that exact URL. Otherwise discover
+    # the site's verified sitemap from robots.txt and standard WordPress candidates.
+    discovery = await _discover_submission_sitemap(
+        site,
+        str(payload.sitemap_url) if payload.sitemap_url else None,
+    )
+
+    if discovery.get("status") != "ok" or not discovery.get("sitemap_url"):
+        raise HTTPException(
+            status_code=400,
+            detail=discovery.get("message") or "No valid sitemap was found for this website.",
+        )
+
+    result = await _google_submit_sitemap(
+        db,
+        company_id,
+        str(discovery["sitemap_url"]),
+    )
+    if not result.get("submitted"):
+        result["discovery_source"] = discovery.get("source")
+        result["sitemap_kind"] = discovery.get("kind")
+        result["discovered_entries"] = discovery.get("loc_count")
+    else:
+        result["discovery_source"] = discovery.get("source")
+        result["sitemap_kind"] = discovery.get("kind")
+        result["discovered_entries"] = discovery.get("loc_count")
+
     if not result.get("submitted") and result.get("status") == "not_connected":
         raise HTTPException(status_code=400, detail=result["message"])
     return result
