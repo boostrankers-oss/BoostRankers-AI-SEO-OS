@@ -51,7 +51,7 @@ export type ViewKey =
   | "admin";
 
 function MainApp() {
-  const { user, logout } = useAuth();
+  const { user, logout, loading } = useAuth();
   const [dark, setDark] = useState(false);
   const [activeView, setActiveView] = useState<ViewKey>("dashboard");
 
@@ -137,6 +137,16 @@ function MainApp() {
         return <div className="p-8">Page not found</div>;
     }
   };
+  
+  if (loading) {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950">
+      <div className="text-sm text-slate-500 dark:text-slate-400">
+        Restoring session...
+      </div>
+    </div>
+  );
+}
 
   if (!user) {
     return <AuthScreen />;

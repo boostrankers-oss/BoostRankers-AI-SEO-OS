@@ -106,16 +106,19 @@ export function AuthProvider({
             JSON.stringify(currentUser)
           );
         }
-      } catch (error) {
-        console.warn(
-          "Session restoration failed. Clearing local session.",
-          error
-        );
+      } catch (error: any) {
+        const status = error?.status;
 
-        clearSession();
+        console.warn("Session restoration request failed:", error);
 
-        if (mounted) {
-          setUser(null);
+        // Keep the locally restored session during temporary network/server
+        // failures. The API client clears it only when the refresh token is
+        // genuinely rejected/expired.
+        if (status === 401 || status === 403) {
+          clearSession();
+          if (mounted) {
+            setUser(null);
+          }
         }
       } finally {
         if (mounted) {
@@ -196,7 +199,7 @@ export function AuthProvider({
        * not /signup.
        */
       const response = await api.post<AuthResponse>(
-        "/api/auth/signup",
+        "/api/auth/register",
         payload,
         {
           auth: false,

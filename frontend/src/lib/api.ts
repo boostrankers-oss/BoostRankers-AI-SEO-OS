@@ -36,6 +36,7 @@ interface RefreshResponse {
 class ApiClient {
   private readonly baseUrl: string;
   private refreshPromise: Promise<boolean> | null = null;
+  private refreshRejected = false;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
@@ -123,6 +124,8 @@ class ApiClient {
       return this.refreshPromise;
     }
 
+    this.refreshRejected = false;
+
     this.refreshPromise = (async () => {
       try {
         const response = await fetch(`${this.baseUrl}/api/auth/refresh`, {
@@ -136,6 +139,9 @@ class ApiClient {
         });
 
         if (!response.ok) {
+          if (response.status === 400 || response.status === 401 || response.status === 403) {
+            this.refreshRejected = true;
+          }
           return false;
         }
 
@@ -143,6 +149,7 @@ class ApiClient {
         return this.saveTokens(data);
       } catch (error) {
         console.error("Token refresh failed:", error);
+        this.refreshRejected = false;
         return false;
       } finally {
         this.refreshPromise = null;
@@ -151,7 +158,7 @@ class ApiClient {
 
     const refreshed = await this.refreshPromise;
 
-    if (!refreshed) {
+    if (!refreshed && this.refreshRejected) {
       this.clearAuthStorage();
     }
 
