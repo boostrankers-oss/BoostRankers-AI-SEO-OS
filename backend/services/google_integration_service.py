@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import hashlib
@@ -46,7 +46,7 @@ PROVIDER_CONFIG: dict[str, dict[str, Any]] = {
         "scopes": [
             "openid",
             "email",
-            "https://www.googleapis.com/auth/webmasters.readonly",
+            "https://www.googleapis.com/auth/webmasters",
         ],
     },
     "analytics": {
@@ -589,3 +589,4 @@ async def revoke_connection(db: Session, connection: GoogleIntegration) -> None:
 
     db.delete(connection)
     db.commit()
+

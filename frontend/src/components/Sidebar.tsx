@@ -21,6 +21,7 @@ import {
   LogOut,
   ShieldCheck,
   ShieldAlert,
+  FileSearch as PagePostIndexingIcon,
   Moon,
   Sun,
 } from "lucide-react";
@@ -72,6 +73,11 @@ export function Sidebar({
       id: "keywordconflicts",
       label: "Keyword Conflicts",
       icon: ShieldAlert,
+    },
+    {
+      id: "pagepostindexing",
+      label: "Page & Post Indexing",
+      icon: PagePostIndexingIcon,
     },
   ] as const;
 

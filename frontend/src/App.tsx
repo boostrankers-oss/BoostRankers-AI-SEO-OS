@@ -25,6 +25,7 @@ import { AuditProvider } from "@/context/AuditContext";
 import AdminDashboard from "@/components/AdminDashboard";
 import { RankTracker } from "./components/RankTracker";
 import { KeywordConflicts } from "./components/KeywordConflicts";
+import { PagePostIndexing } from "./components/PagePostIndexing";
 
 export type ViewKey =
   | "dashboard"
@@ -45,6 +46,7 @@ export type ViewKey =
   | "google"
   | "ranktracker"
   | "keywordconflicts"
+  | "pagepostindexing"
   | "settings"
   | "admin";
 
@@ -121,6 +123,9 @@ function MainApp() {
 
       case "keywordconflicts":
         return <KeywordConflicts />;
+
+      case "pagepostindexing":
+        return <PagePostIndexing />;
 
       case "settings":
         return <Settings />;

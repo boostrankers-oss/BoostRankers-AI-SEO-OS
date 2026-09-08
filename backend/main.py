@@ -24,6 +24,11 @@ from database.database import engine
 from models.content_plan import ContentPlan
 from rank_tracking import router as rank_tracking_router
 from keyword_conflicts import router as keyword_conflicts_router
+from page_post_indexing import (
+    router as page_post_indexing_router,
+    ensure_page_post_indexing_tables,
+    page_post_indexing_automation_loop,
+)
 
 
 from routers import (
@@ -202,11 +207,18 @@ app.include_router(
     keyword_conflicts_router,
     tags=["Keyword Conflicts"],
 )
+app.include_router(
+    page_post_indexing_router,
+    tags=["Page & Post Indexing"],
+)
 
 @app.on_event("startup")
 def ensure_content_plan_table():
-    # Creates only the new table if it does not exist.
+    # Creates only the new tables if they do not exist.
     ContentPlan.__table__.create(bind=engine, checkfirst=True)
+    ensure_page_post_indexing_tables()
+    import asyncio
+    app.state.page_post_indexing_task = asyncio.create_task(page_post_indexing_automation_loop())
 
 
 # ============================================================
