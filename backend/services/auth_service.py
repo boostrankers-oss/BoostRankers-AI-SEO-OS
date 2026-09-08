@@ -6,6 +6,7 @@ from typing import Optional
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from models.company import Company
@@ -63,10 +64,48 @@ class AuthService:
     # Private Helpers
     # ==========================================================
 
+    @staticmethod
+    def _normalize_email(email: str) -> str:
+        """
+        Canonicalize login/registration email input.
+
+        Registration already stores emails in lowercase. Stripping surrounding
+        whitespace and case-folding here makes login deterministic for values
+        coming from browser autofill, copy/paste, or mixed-case input.
+        """
+        return email.strip().casefold()
+
     def _find_user_by_email(self, email: str) -> Optional[User]:
+        normalized_email = self._normalize_email(email)
         return self.db.scalar(
-            select(User).where(User.email == email.lower())
+            select(User).where(User.email == normalized_email)
         )
+
+    def _find_user_for_login(self, email: str) -> Optional[User]:
+        """
+        Login-specific lookup with a single safe retry for a transient
+        PostgreSQL/SQLAlchemy connection failure.
+
+        The row lock also serializes concurrent attempts for the same user so
+        failed_login_attempts cannot be updated from stale concurrent copies.
+        """
+        normalized_email = self._normalize_email(email)
+
+        statement = (
+            select(User)
+            .where(User.email == normalized_email)
+            .with_for_update()
+        )
+
+        try:
+            return self.db.scalar(statement)
+        except OperationalError:
+            # A pooled PostgreSQL connection can occasionally be dropped by
+            # the server/network. Roll back the failed transaction and retry
+            # once on a fresh connection instead of turning a transient
+            # database event into an apparent authentication failure.
+            self.db.rollback()
+            return self.db.scalar(statement)
 
     def _find_company_by_name(
         self,
@@ -300,7 +339,7 @@ class AuthService:
 
                 last_name=data.last_name,
 
-                email=data.email.lower(),
+                email=self._normalize_email(data.email),
 
                 hashed_password=hash_password(
                     data.password
@@ -402,7 +441,7 @@ class AuthService:
             # Find User
             # -------------------------------------------------
 
-            user = self._find_user_by_email(
+            user = self._find_user_for_login(
                 data.email
             )
 
@@ -432,10 +471,21 @@ class AuthService:
             # Verify Password
             # -------------------------------------------------
 
-            if not verify_password(
-                data.password,
-                user.hashed_password,
-            ):
+            try:
+                password_valid = verify_password(
+                    data.password,
+                    user.hashed_password,
+                )
+            except (ValueError, TypeError) as exc:
+                # A broken/unsupported stored hash is an authentication-system
+                # problem, not an invalid user password. Do not increment the
+                # user's failed-login counter for this condition.
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Authentication service could not verify the account password.",
+                ) from exc
+
+            if not password_valid:
                 self._failed_login(user)
 
                 self._commit()
