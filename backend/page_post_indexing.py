@@ -925,6 +925,79 @@ async def _google_inspect(
         }
 
 
+async def _google_get_sitemap(
+    http: httpx.AsyncClient,
+    connection: Any,
+    db: Session,
+    property_value: str,
+    sitemap_url: str,
+    token: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """
+    Read the sitemap resource back from Search Console after submission.
+
+    Google documents the PUT submission endpoint as returning an empty body.
+    A follow-up GET is therefore the reliable way to distinguish:
+      - Google accepted the submission and registered the sitemap;
+      - Google accepted the request but the sitemap resource is not visible yet;
+      - Google rejected the request.
+    """
+    endpoint = GOOGLE_SITEMAP_ENDPOINT.format(
+        site=quote(property_value, safe=""),
+        feed=quote(sitemap_url, safe=""),
+    )
+
+    last_response: httpx.Response | None = None
+    for attempt in range(3):
+        try:
+            response = await http.get(
+                endpoint,
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+        except httpx.TimeoutException:
+            if attempt == 2:
+                return None, "timeout"
+            await asyncio.sleep(1.0)
+            continue
+        except httpx.RequestError:
+            if attempt == 2:
+                return None, "request_error"
+            await asyncio.sleep(1.0)
+            continue
+
+        last_response = response
+
+        if response.status_code == 401:
+            token = await get_access_token(connection, db)
+            if attempt < 2:
+                continue
+            return None, "unauthorized"
+
+        if response.status_code == 200:
+            try:
+                return response.json(), "ok"
+            except ValueError:
+                return None, "invalid_response"
+
+        # Search Console can be eventually consistent immediately after PUT.
+        # A short retry avoids falsely reporting that registration failed.
+        if response.status_code in {404, 409, 429, 500, 502, 503, 504} and attempt < 2:
+            await asyncio.sleep(1.0 + attempt)
+            continue
+
+        break
+
+    if last_response is not None:
+        if last_response.status_code == 403:
+            return None, "forbidden"
+        if last_response.status_code == 404:
+            return None, "not_visible_yet"
+        if last_response.status_code >= 400:
+            return None, f"http_{last_response.status_code}"
+
+    return None, "request_error"
+
+
 async def _google_submit_sitemap(
     db: Session,
     company_id: str,
@@ -1017,36 +1090,125 @@ async def _google_submit_sitemap(
                     "message": "Google Search Console could not be reached after token refresh.",
                 }
 
-    if response.status_code == 403:
-        return {
-            "submitted": False,
-            "status": "unavailable",
-            "message": "The connected Google OAuth authorization does not permit sitemap submission.",
-            "property": property_value,
-            "sitemap_url": sitemap_url,
-        }
+        if response.status_code == 403:
+            return {
+                "submitted": False,
+                "status": "unavailable",
+                "message": "The connected Google OAuth authorization does not permit sitemap submission.",
+                "property": property_value,
+                "sitemap_url": sitemap_url,
+            }
 
-    if response.status_code >= 400:
-        try:
-            detail = response.json().get("error", {}).get("message") or "Google sitemap submission failed."
-        except Exception:
-            detail = f"Google sitemap submission returned HTTP {response.status_code}."
-        return {
-            "submitted": False,
-            "status": "error",
-            "message": detail,
-            "property": property_value,
-            "sitemap_url": sitemap_url,
-        }
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("error", {}).get("message") or "Google sitemap submission failed."
+            except Exception:
+                detail = f"Google sitemap submission returned HTTP {response.status_code}."
+            return {
+                "submitted": False,
+                "status": "error",
+                "message": detail,
+                "property": property_value,
+                "sitemap_url": sitemap_url,
+            }
 
-    return {
+        # The PUT endpoint intentionally returns an empty body. Verify the
+        # sitemap through Google's GET resource before claiming registration.
+        resource, verify_status = await _google_get_sitemap(
+            http,
+            connection,
+            db,
+            property_value,
+            sitemap_url,
+            token,
+        )
+
+    base = {
         "submitted": True,
-        "status": "submitted",
-        "message": "Verified sitemap submitted to Google Search Console.",
         "sitemap_url": sitemap_url,
         "property": property_value,
     }
 
+    if resource:
+        contents = resource.get("contents") or []
+        submitted_urls = sum(
+            int(item.get("submitted") or 0)
+            for item in contents
+            if isinstance(item, dict)
+        )
+        errors = int(resource.get("errors") or 0)
+        warnings = int(resource.get("warnings") or 0)
+        pending = bool(resource.get("isPending"))
+
+        if errors:
+            message = (
+                "Google registered the sitemap, but Search Console reports "
+                f"{errors} sitemap error(s). Open the sitemap details in Search Console."
+            )
+            status_value = "registered_with_errors"
+        elif pending:
+            message = (
+                "Google registered the sitemap and is still processing it. "
+                "Search Console's discovered-page counts can update asynchronously."
+            )
+            status_value = "registered_pending"
+        else:
+            message = (
+                "Google registered the sitemap successfully. Search Console "
+                "may take additional time to update Last read and discovered-page counts."
+            )
+            status_value = "registered"
+
+        return {
+            **base,
+            "status": status_value,
+            "message": message,
+            "gsc_path": resource.get("path"),
+            "gsc_last_submitted": resource.get("lastSubmitted"),
+            "gsc_last_downloaded": resource.get("lastDownloaded"),
+            "gsc_is_pending": pending,
+            "gsc_is_sitemaps_index": bool(resource.get("isSitemapsIndex")),
+            "gsc_type": resource.get("type"),
+            "gsc_errors": errors,
+            "gsc_warnings": warnings,
+            "gsc_submitted_urls": submitted_urls,
+            "gsc_contents": contents,
+        }
+
+    # PUT succeeded but Google's read-after-write view is not visible yet.
+    # This is still a successful submission; do not fabricate a crawl/index result.
+    if verify_status == "not_visible_yet":
+        return {
+            **base,
+            "status": "submitted_pending_verification",
+            "message": (
+                "Google accepted the sitemap submission. Search Console has not "
+                "returned the sitemap resource yet; its report is eventually consistent. "
+                "Refresh later to see Last read and discovered-page counts."
+            ),
+            "gsc_verification": "pending",
+        }
+
+    if verify_status == "timeout":
+        return {
+            **base,
+            "status": "submitted_verification_timeout",
+            "message": (
+                "Google accepted the sitemap submission, but the follow-up Search Console "
+                "verification timed out. The sitemap may still appear after Google processes it."
+            ),
+            "gsc_verification": "timeout",
+        }
+
+    return {
+        **base,
+        "status": "submitted",
+        "message": (
+            "Google accepted the sitemap submission. The Search Console report updates "
+            "asynchronously; submission does not mean the URLs are indexed."
+        ),
+        "gsc_verification": verify_status,
+    }
 
 async def _run_crawl(
     run_id: str,
