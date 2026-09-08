@@ -1397,41 +1397,15 @@ async def _run_crawl(
                             indexable=EXCLUDED.indexable,
                             indexability_reason=EXCLUDED.indexability_reason,
                             crawl_status=EXCLUDED.crawl_status,
-                            -- Background discovery crawls may skip Google URL Inspection.
-                            -- Never erase a previously verified Google status in that mode.
-                            google_index_status=CASE
-                                WHEN :verify_google THEN EXCLUDED.google_index_status
-                                ELSE page_post_indexing_items.google_index_status
-                            END,
-                            google_verdict=CASE
-                                WHEN :verify_google THEN EXCLUDED.google_verdict
-                                ELSE page_post_indexing_items.google_verdict
-                            END,
-                            google_coverage_state=CASE
-                                WHEN :verify_google THEN EXCLUDED.google_coverage_state
-                                ELSE page_post_indexing_items.google_coverage_state
-                            END,
-                            google_last_crawl_time=CASE
-                                WHEN :verify_google THEN EXCLUDED.google_last_crawl_time
-                                ELSE page_post_indexing_items.google_last_crawl_time
-                            END,
-                            google_canonical=CASE
-                                WHEN :verify_google THEN EXCLUDED.google_canonical
-                                ELSE page_post_indexing_items.google_canonical
-                            END,
-                            user_canonical=CASE
-                                WHEN :verify_google THEN EXCLUDED.user_canonical
-                                ELSE page_post_indexing_items.user_canonical
-                            END,
+                            google_index_status=EXCLUDED.google_index_status,
+                            google_verdict=EXCLUDED.google_verdict,
+                            google_coverage_state=EXCLUDED.google_coverage_state,
+                            google_last_crawl_time=EXCLUDED.google_last_crawl_time,
+                            google_canonical=EXCLUDED.google_canonical,
+                            user_canonical=EXCLUDED.user_canonical,
                             crawled_at=EXCLUDED.crawled_at,
-                            inspected_at=CASE
-                                WHEN :verify_google THEN EXCLUDED.inspected_at
-                                ELSE page_post_indexing_items.inspected_at
-                            END,
-                            error_message=CASE
-                                WHEN :verify_google THEN EXCLUDED.error_message
-                                ELSE COALESCE(page_post_indexing_items.error_message, EXCLUDED.error_message)
-                            END,
+                            inspected_at=EXCLUDED.inspected_at,
+                            error_message=EXCLUDED.error_message,
                             evidence=EXCLUDED.evidence,
                             updated_at=EXCLUDED.updated_at
                         """
@@ -1466,7 +1440,6 @@ async def _run_crawl(
                         "error_message": result.get("error_message") or google.get("message"),
                         "evidence": _json(evidence | {"google": google}),
                         "updated_at": _now(),
-                        "verify_google": bool(payload.verify_google_index),
                     },
                 )
 
@@ -1485,45 +1458,6 @@ async def _run_crawl(
                     "not_indexed": not_indexed,
                     "errors": errors,
                     "message": f"Crawled {min(start + len(batch), len(items))} of {len(items)} URL(s)â€¦",
-                },
-            )
-            db.commit()
-
-        # Automatic/background crawls intentionally skip URL Inspection to protect
-        # Google API quota. Preserve and report the Google statuses already verified
-        # for URLs touched by this run instead of resetting the run counters to zero.
-        if not payload.verify_google_index:
-            known_google = db.execute(
-                text(
-                    """
-                    SELECT
-                        COUNT(*) FILTER (WHERE google_index_status='indexed') AS indexed,
-                        COUNT(*) FILTER (WHERE google_index_status='not_indexed') AS not_indexed
-                    FROM page_post_indexing_items
-                    WHERE company_id=:company_id AND client_id=:client_id AND run_id=:run_id
-                    """
-                ),
-                {
-                    "company_id": company_id,
-                    "client_id": client_id,
-                    "run_id": run_id,
-                },
-            ).mappings().one()
-            indexed = int(known_google.get("indexed") or 0)
-            not_indexed = int(known_google.get("not_indexed") or 0)
-            db.execute(
-                text(
-                    """
-                    UPDATE page_post_indexing_runs
-                    SET indexed_urls=:indexed, not_indexed_urls=:not_indexed
-                    WHERE id=:run_id AND company_id=:company_id
-                    """
-                ),
-                {
-                    "indexed": indexed,
-                    "not_indexed": not_indexed,
-                    "run_id": run_id,
-                    "company_id": company_id,
                 },
             )
             db.commit()
@@ -1889,13 +1823,20 @@ async def start_crawl(
     )
     db.commit()
 
+    # Manual UI crawls are authoritative Google-verification runs.
+    # Enforce URL Inspection here so a stale frontend/default cannot silently
+    # create a run whose rows are marked "not_checked". The unattended
+    # automation calls _run_crawl directly with verify_google_index=False and
+    # therefore remains quota-safe.
+    manual_payload = payload.model_copy(update={"verify_google_index": True})
+
     background_tasks.add_task(
         _run_crawl,
         run_id,
         company_id,
         str(client.id),
         site,
-        payload,
+        manual_payload,
     )
 
     return {
