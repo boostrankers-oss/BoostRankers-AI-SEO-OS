@@ -79,7 +79,9 @@ export function AuthProvider({
     }
   });
 
-  const [loading, setLoading] = useState(true);
+  // The user is synchronously hydrated from localStorage above.
+  // Do not block the whole application while /api/auth/me is validated.
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -152,8 +154,6 @@ export function AuthProvider({
     email: string,
     password: string
   ): Promise<void> => {
-    setLoading(true);
-
     try {
       const response = await api.post<AuthResponse>(
         "/api/auth/login",
@@ -186,8 +186,6 @@ export function AuthProvider({
     last_name: string;
     company_name?: string;
   }): Promise<void> => {
-    setLoading(true);
-
     try {
       const payload = {
         ...data,
