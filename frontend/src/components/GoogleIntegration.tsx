@@ -115,15 +115,10 @@ export function GoogleIntegration() {
         );
         setGscProperties(properties.items || []);
 
-        const stored = result.search_console.selected_property;
-        const first = stored || properties.items?.[0]?.id || "";
-        setGscProperty(first);
-
-        if (first) {
-          await api.post("/api/google/select-property/search_console", {
-            property: first,
-          });
-        }
+        // Restore only a property that the user previously selected.
+        // Never auto-select Google's first property after a new connection.
+        const stored = result.search_console.selected_property || "";
+        setGscProperty(stored);
       } else {
         setGscProperties([]);
         setGscProperty("");
@@ -136,15 +131,10 @@ export function GoogleIntegration() {
         );
         setGaProperties(properties.items || []);
 
-        const stored = result.analytics.selected_property;
-        const first = stored || properties.items?.[0]?.id || "";
-        setGaProperty(first);
-
-        if (first) {
-          await api.post("/api/google/select-property/analytics", {
-            property: first,
-          });
-        }
+        // Restore only a property that the user previously selected.
+        // Never auto-select Google's first property after a new connection.
+        const stored = result.analytics.selected_property || "";
+        setGaProperty(stored);
       } else {
         setGaProperties([]);
         setGaProperty("");
