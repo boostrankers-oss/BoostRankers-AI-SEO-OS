@@ -217,8 +217,19 @@ def ensure_content_plan_table():
     # Creates only the new tables if they do not exist.
     ContentPlan.__table__.create(bind=engine, checkfirst=True)
     ensure_page_post_indexing_tables()
-    import asyncio
-    app.state.page_post_indexing_task = asyncio.create_task(page_post_indexing_automation_loop())
+
+    # Do not start unattended crawling unless it is explicitly enabled.
+    # Manual Page & Post Indexing remains fully available.
+    if os.getenv("PAGE_POST_INDEXING_AUTO_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        import asyncio
+        app.state.page_post_indexing_task = asyncio.create_task(
+            page_post_indexing_automation_loop()
+        )
 
 
 # ============================================================

@@ -1318,15 +1318,15 @@ async def _run_crawl(
         indexed = 0
         not_indexed = 0
 
-        # Bounded concurrency protects both the target WordPress host and our DB pool.
-        semaphore = asyncio.Semaphore(8)
+        # Keep HTTP concurrency conservative for small-memory deployments.
+        semaphore = asyncio.Semaphore(4)
 
         async def crawl_bounded(item: dict[str, Any]) -> dict[str, Any]:
             async with semaphore:
                 return await _crawl_url(item)
 
-        for start in range(0, len(items), 50):
-            batch = items[start : start + 50]
+        for start in range(0, len(items), 25):
+            batch = items[start : start + 25]
             results = await asyncio.gather(*(crawl_bounded(item) for item in batch))
 
             for result in results:
@@ -1642,13 +1642,23 @@ async def run_page_post_indexing_automation_once() -> None:
     finally:
         db.close()
 
-    semaphore = asyncio.Semaphore(3)
+    # Keep unattended work strictly bounded. Do not create hundreds/thousands
+    # of coroutine objects at once on small-memory deployments.
+    concurrency = 2
+    batch_size = 10
 
-    async def bounded(target: tuple[str, str, str]) -> None:
-        async with semaphore:
-            await _run_automatic_client_cycle(*target)
+    for start in range(0, len(targets), batch_size):
+        batch = targets[start : start + batch_size]
+        semaphore = asyncio.Semaphore(concurrency)
 
-    await asyncio.gather(*(bounded(target) for target in targets), return_exceptions=True)
+        async def bounded(target: tuple[str, str, str]) -> None:
+            async with semaphore:
+                await _run_automatic_client_cycle(*target)
+
+        await asyncio.gather(
+            *(bounded(target) for target in batch),
+            return_exceptions=True,
+        )
 
 
 async def page_post_indexing_automation_loop() -> None:
@@ -1660,7 +1670,7 @@ async def page_post_indexing_automation_loop() -> None:
     """
     import os
 
-    if os.getenv("PAGE_POST_INDEXING_AUTO_ENABLED", "true").strip().lower() not in {
+    if os.getenv("PAGE_POST_INDEXING_AUTO_ENABLED", "false").strip().lower() not in {
         "1",
         "true",
         "yes",
@@ -1919,7 +1929,3 @@ def feature_status(
         "automatic_discovery": True,
         "automatic_sitemap_submission": True,
     }
-
-
-
-
