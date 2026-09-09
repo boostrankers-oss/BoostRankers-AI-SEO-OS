@@ -79,8 +79,8 @@ export function AuthProvider({
     }
   });
 
-  // The user is synchronously hydrated from localStorage above.
-  // Do not block the whole application while /api/auth/me is validated.
+  // Cached session hydration is synchronous. Do not block the auth UI
+  // while the background /api/auth/me validation is running.
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -154,6 +154,9 @@ export function AuthProvider({
     email: string,
     password: string
   ): Promise<void> => {
+    // `loading` is reserved for initial session restoration.
+    // Do not toggle it during login, otherwise App.tsx can show
+    // "Restoring session..." while the user is actively logging in.
     try {
       const response = await api.post<AuthResponse>(
         "/api/auth/login",
@@ -173,8 +176,6 @@ export function AuthProvider({
     } catch (error) {
       console.error("Login failed:", error);
       throw error;
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -186,6 +187,8 @@ export function AuthProvider({
     last_name: string;
     company_name?: string;
   }): Promise<void> => {
+    // `loading` is reserved for initial session restoration.
+    // Do not toggle it during signup for the same reason as login.
     try {
       const payload = {
         ...data,
@@ -211,8 +214,6 @@ export function AuthProvider({
     } catch (error) {
       console.error("Signup failed:", error);
       throw error;
-    } finally {
-      setLoading(false);
     }
   };
 

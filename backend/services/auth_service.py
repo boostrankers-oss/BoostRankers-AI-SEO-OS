@@ -539,6 +539,60 @@ class AuthService:
                 detail=str(exc),
             )
         
+    # ==========================================================
+    # Logout Current Device
+    # ==========================================================
+
+    def logout(
+        self,
+        refresh_token: str,
+    ) -> dict:
+        """
+        Revoke the supplied refresh token for the current device.
+
+        Logout is intentionally idempotent: a missing or already-revoked
+        refresh token is treated as a successful logout. This keeps the
+        endpoint safe for retries and browser/session cleanup.
+        """
+        try:
+            if not refresh_token or not refresh_token.strip():
+                return {
+                    "success": True,
+                    "message": "Already logged out.",
+                }
+
+            db_token = self.db.scalar(
+                select(RefreshToken).where(
+                    RefreshToken.token == refresh_token
+                )
+            )
+
+            if db_token is None:
+                return {
+                    "success": True,
+                    "message": "Already logged out.",
+                }
+
+            if not db_token.is_revoked:
+                db_token.revoke("user_logout")
+
+            self._commit()
+
+            return {
+                "success": True,
+                "message": "Logout successful.",
+            }
+
+        except HTTPException:
+            self._rollback()
+            raise
+        except Exception as exc:
+            self._rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Unable to complete logout.",
+            ) from exc
+
         # ==========================================================
         # Refresh Access Token
         # ==========================================================

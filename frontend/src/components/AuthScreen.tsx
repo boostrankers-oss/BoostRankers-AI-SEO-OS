@@ -10,7 +10,8 @@ import { useAuth, UserRole } from "@/components/AuthProvider";
 import { toast } from "sonner";
 
 export function AuthScreen() {
-  const { login, signup, loading } = useAuth();
+  const { login, signup } = useAuth();
+  const [submitting, setSubmitting] = useState(false);
   const [mode, setMode] = useState<"login" | "signup">("login");
   const [error, setError] = useState("");
 
@@ -27,48 +28,43 @@ export function AuthScreen() {
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    if (submitting) return;
+
     setError("");
+    setSubmitting(true);
+
     try {
-      await login(loginEmail, loginPassword);
+      await login(loginEmail.trim(), loginPassword);
       toast.success("Welcome back!");
     } catch (err: any) {
-      const msg = err?.data?.detail || "Invalid credentials. Please try again.";
+      const msg =
+        err?.data?.detail ||
+        err?.message ||
+        "Unable to sign in. Please check your credentials and try again.";
       setError(msg);
       toast.error("Login failed");
+    } finally {
+      setSubmitting(false);
     }
   };
 
   const handleSignup = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    if (submitting) return;
+
     setError("");
+    setSubmitting(true);
     // Validation
     if (!signupFirstName || !signupLastName || !signupEmail || !signupPassword || !signupConfirmPassword) {
       setError("Please fill in all fields.");
       return;
     }
     if (signupPassword.length < 12) {
-	  setError("Password must be at least 12 characters.");
-	  return;
-	}
-
-	const passwordByteLength = new TextEncoder().encode(signupPassword).length;
-
-	if (passwordByteLength > 72) {
-	  setError(
-		"Password is too long. Please use a password of 72 bytes or fewer."
-	  );
-	  return;
-	}
-	
-	const confirmPasswordByteLength =
-	  new TextEncoder().encode(signupConfirmPassword).length;
-
-	if (confirmPasswordByteLength > 72) {
-	  setError(
-		"Confirmation password is too long. Please use a password of 72 bytes or fewer."
-	  );
-	  return;
-	}
+      setError("Password must be at least 12 characters.");
+      return;
+    }
     if (signupPassword !== signupConfirmPassword) {
       setError("Passwords do not match.");
       return;
@@ -84,9 +80,14 @@ export function AuthScreen() {
       });
       toast.success("Account created successfully!");
     } catch (err: any) {
-      const msg = err?.data?.detail || "Signup failed. Please try again.";
+      const msg =
+        err?.data?.detail ||
+        err?.message ||
+        "Signup failed. Please try again.";
       setError(msg);
       toast.error("Signup failed");
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -179,8 +180,8 @@ export function AuthScreen() {
                       </div>
                     )}
 
-                    <Button type="submit" className="w-full bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20" disabled={loading}>
-                      {loading ? "Signing in..." : "Sign In"} <ArrowRight className="size-4" />
+                    <Button type="submit" className="w-full bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20" disabled={submitting}>
+                      {submitting ? "Signing in..." : "Sign In"} <ArrowRight className="size-4" />
                     </Button>
                   </form>
                 </CardContent>
@@ -223,14 +224,14 @@ export function AuthScreen() {
                       <Label htmlFor="signup-password">Password</Label>
                       <div className="relative">
                         <Lock className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-slate-400" />
-                        <Input type="password" maxLength={72} id="signup-password" placeholder="Min 12 characters" className="pl-9" value={signupPassword} onChange={(e) => setSignupPassword(e.target.value)} required />
+                        <Input type="password" id="signup-password" placeholder="Min 12 characters" className="pl-9" value={signupPassword} onChange={(e) => setSignupPassword(e.target.value)} required />
                       </div>
                     </div>
                     <div className="space-y-2">
                       <Label htmlFor="signup-confirm-password">Confirm Password</Label>
                       <div className="relative">
                         <Lock className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-slate-400" />
-                        <Input type="password" id="signup-confirm-password" maxLength={72} placeholder="••••••••" className="pl-9" value={signupConfirmPassword} onChange={(e) => setSignupConfirmPassword(e.target.value)} required />
+                        <Input type="password" id="signup-confirm-password" placeholder="••••••••" className="pl-9" value={signupConfirmPassword} onChange={(e) => setSignupConfirmPassword(e.target.value)} required />
                       </div>
                     </div>
                     <div className="space-y-2">
@@ -253,8 +254,8 @@ export function AuthScreen() {
                       </div>
                     )}
 
-                    <Button type="submit" className="w-full bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20" disabled={loading}>
-                      {loading ? "Creating..." : "Create Account"} <ArrowRight className="size-4" />
+                    <Button type="submit" className="w-full bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20" disabled={submitting}>
+                      {submitting ? "Creating..." : "Create Account"} <ArrowRight className="size-4" />
                     </Button>
                   </form>
                 </CardContent>
