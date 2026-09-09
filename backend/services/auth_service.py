@@ -37,6 +37,7 @@ from core.security import (
 from core.jwt import (
     create_access_token,
     create_refresh_token,
+    verify_token,
 )
 
 # Default role assigned to new users
@@ -593,198 +594,195 @@ class AuthService:
                 detail="Unable to complete logout.",
             ) from exc
 
-        # ==========================================================
-        # Refresh Access Token
-        # ==========================================================
+    def refresh(
+        self,
+        refresh_token: str,
+    ) -> dict:
+        """
+        Refresh JWT tokens using refresh token rotation.
 
-def refresh(
-    self,
-    refresh_token: str,
-) -> dict:
-    """
-    Refresh JWT tokens using refresh token rotation.
+        Flow
 
-    Flow
+        1. Verify JWT
+        2. Check DB record
+        3. Check revoked
+        4. Check expired
+        5. Load user
+        6. Create new Access Token
+        7. Rotate Refresh Token
+        8. Revoke previous Refresh Token
+        """
 
-    1. Verify JWT
-    2. Check DB record
-    3. Check revoked
-    4. Check expired
-    5. Load user
-    6. Create new Access Token
-    7. Rotate Refresh Token
-    8. Revoke previous Refresh Token
-    """
+        try:
 
-    try:
+            # ---------------------------------------------
+            # Verify JWT
+            # ---------------------------------------------
 
-        # ---------------------------------------------
-        # Verify JWT
-        # ---------------------------------------------
-
-        payload = verify_token(
-            refresh_token,
-            token_type="refresh",
-        )
-
-        user_id = payload["sub"]
-
-        session_id = payload["sid"]
-
-        # ---------------------------------------------
-        # Database Lookup
-        # ---------------------------------------------
-
-        db_token = self.db.scalar(
-            select(RefreshToken).where(
-                RefreshToken.token == refresh_token
-            )
-        )
-
-        if db_token is None:
-
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Refresh token not found.",
+            payload = verify_token(
+                refresh_token,
+                token_type="refresh",
             )
 
-        # ---------------------------------------------
-        # Revoked
-        # ---------------------------------------------
+            user_id = payload["sub"]
 
-        if db_token.is_revoked:
+            session_id = payload["sid"]
 
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Refresh token revoked.",
+            # ---------------------------------------------
+            # Database Lookup
+            # ---------------------------------------------
+
+            db_token = self.db.scalar(
+                select(RefreshToken).where(
+                    RefreshToken.token == refresh_token
+                )
             )
 
-        # ---------------------------------------------
-        # Expired
-        # ---------------------------------------------
+            if db_token is None:
 
-        if db_token.is_expired:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Refresh token not found.",
+                )
 
-            db_token.revoke("expired")
+            # ---------------------------------------------
+            # Revoked
+            # ---------------------------------------------
+
+            if db_token.is_revoked:
+
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Refresh token revoked.",
+                )
+
+            # ---------------------------------------------
+            # Expired
+            # ---------------------------------------------
+
+            if db_token.is_expired:
+
+                db_token.revoke("expired")
+
+                self._commit()
+
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Refresh token expired.",
+                )
+
+            # ---------------------------------------------
+            # User
+            # ---------------------------------------------
+
+            user = self.db.get(
+                User,
+                user_id,
+            )
+
+            if user is None:
+
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found.",
+                )
+
+            if not user.is_active:
+
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Account disabled.",
+                )
+
+            # ---------------------------------------------
+            # Rotate Token
+            # ---------------------------------------------
+
+            db_token.revoke(
+                reason="rotation"
+            )
+
+            new_access = create_access_token(
+                user_id=user.id,
+                email=user.email,
+                company_id=user.company_id,
+                role=user.role,
+                permissions=[],
+            )
+
+            new_refresh = create_refresh_token(
+                user_id=user.id,
+                session_id=session_id,
+            )
+
+            self.db.add(
+                RefreshToken(
+                    user_id=user.id,
+                    token=new_refresh,
+                    token_family=db_token.token_family,
+                    device_name=db_token.device_name,
+                    device_type=db_token.device_type,
+                    browser=db_token.browser,
+                    operating_system=db_token.operating_system,
+                    ip_address=db_token.ip_address,
+                    user_agent=db_token.user_agent,
+                    location=db_token.location,
+                    expires_at=datetime.now(UTC)
+                    + timedelta(days=30),
+                )
+            )
+
+            db_token.replaced_by_token = new_refresh
+
+            db_token.last_used_at = datetime.now(UTC)
 
             self._commit()
 
+            return {
+
+                "success": True,
+
+                "message": "Token refreshed.",
+
+                "tokens": {
+
+                    "access_token": new_access,
+
+                    "refresh_token": new_refresh,
+
+                    "expires_in": 900,
+                },
+            }
+
+        except JWTError:
+
+            self._rollback()
+
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Refresh token expired.",
+                detail="Invalid refresh token.",
             )
 
-        # ---------------------------------------------
-        # User
-        # ---------------------------------------------
+        except HTTPException:
 
-        user = self.db.get(
-            User,
-            user_id,
-        )
+            self._rollback()
 
-        if user is None:
+            raise
+
+        except Exception as exc:
+
+            self._rollback()
 
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found.",
+                status_code=500,
+                detail=str(exc),
             )
-
-        if not user.is_active:
-
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Account disabled.",
-            )
-
-        # ---------------------------------------------
-        # Rotate Token
-        # ---------------------------------------------
-
-        db_token.revoke(
-            reason="rotation"
-        )
-
-        new_access = create_access_token(
-            user_id=user.id,
-            email=user.email,
-            company_id=user.company_id,
-            role=user.role,
-            permissions=[],
-        )
-
-        new_refresh = create_refresh_token(
-            user_id=user.id,
-            session_id=session_id,
-        )
-
-        self.db.add(
-            RefreshToken(
-                user_id=user.id,
-                token=new_refresh,
-                token_family=db_token.token_family,
-                device_name=db_token.device_name,
-                device_type=db_token.device_type,
-                browser=db_token.browser,
-                operating_system=db_token.operating_system,
-                ip_address=db_token.ip_address,
-                user_agent=db_token.user_agent,
-                location=db_token.location,
-                expires_at=datetime.now(UTC)
-                + timedelta(days=30),
-            )
-        )
-
-        db_token.replaced_by_token = new_refresh
-
-        db_token.last_used_at = datetime.now(UTC)
-
-        self._commit()
-
-        return {
-
-            "success": True,
-
-            "message": "Token refreshed.",
-
-            "tokens": {
-
-                "access_token": new_access,
-
-                "refresh_token": new_refresh,
-
-                "expires_in": 900,
-            },
-        }
-
-    except JWTError:
-
-        self._rollback()
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token.",
-        )
-
-    except HTTPException:
-
-        self._rollback()
-
-        raise
-
-    except Exception as exc:
-
-        self._rollback()
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        )
         
+            # ==========================================================
+    # Logout Current Device
+    # ==========================================================
         # ==========================================================
-# Logout Current Device
-# ==========================================================
-
+        # Refresh Access Token
 def logout(
     self,
     refresh_token: str,
