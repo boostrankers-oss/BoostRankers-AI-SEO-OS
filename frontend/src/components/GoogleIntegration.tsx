@@ -109,16 +109,28 @@ export function GoogleIntegration() {
       const result = await api.get<GoogleStatusResponse>("/api/google/status");
       setStatus(result);
 
-      if (result.search_console.connected) {
-        const properties = await api.get<{ items: Property[] }>(
-          "/api/google/properties/search-console",
-        );
-        setGscProperties(properties.items || []);
+      // Load each provider independently. A temporary failure fetching one
+      // provider's property list must not make an already-connected provider
+      // appear disconnected or blank the entire Google page.
+      const errors: string[] = [];
 
-        // Restore only a property that the user previously selected.
-        // Never auto-select Google's first property after a new connection.
-        const stored = result.search_console.selected_property || "";
-        setGscProperty(stored);
+      if (result.search_console.connected) {
+        try {
+          const properties = await api.get<{ items: Property[] }>(
+            "/api/google/properties/search-console",
+          );
+          setGscProperties(properties.items || []);
+
+          // Restore only a property that the user previously selected.
+          // Never auto-select Google's first property after a new connection.
+          const stored = result.search_console.selected_property || "";
+          setGscProperty(stored);
+        } catch (err: any) {
+          errors.push(
+            err?.data?.detail ||
+              "Unable to load Search Console properties.",
+          );
+        }
       } else {
         setGscProperties([]);
         setGscProperty("");
@@ -126,22 +138,36 @@ export function GoogleIntegration() {
       }
 
       if (result.analytics.connected) {
-        const properties = await api.get<{ items: Property[] }>(
-          "/api/google/properties/analytics",
-        );
-        setGaProperties(properties.items || []);
+        try {
+          const properties = await api.get<{ items: Property[] }>(
+            "/api/google/properties/analytics",
+          );
+          setGaProperties(properties.items || []);
 
-        // Restore only a property that the user previously selected.
-        // Never auto-select Google's first property after a new connection.
-        const stored = result.analytics.selected_property || "";
-        setGaProperty(stored);
+          // Restore only a property that the user previously selected.
+          // Never auto-select Google's first property after a new connection.
+          const stored = result.analytics.selected_property || "";
+          setGaProperty(stored);
+        } catch (err: any) {
+          errors.push(
+            err?.data?.detail ||
+              "Unable to load Analytics properties.",
+          );
+        }
       } else {
         setGaProperties([]);
         setGaProperty("");
         setGaData([]);
       }
+
+      if (errors.length > 0) {
+        setError(errors.join(" "));
+      }
     } catch (err: any) {
-      const detail = err?.data?.detail || "Unable to load Google integration status.";
+      const detail =
+        err?.data?.detail ||
+        err?.message ||
+        "Unable to load Google integration status.";
       setError(detail);
     } finally {
       setLoading(false);

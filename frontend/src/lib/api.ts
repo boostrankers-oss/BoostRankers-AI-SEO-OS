@@ -37,6 +37,12 @@ class ApiClient {
   private readonly baseUrl: string;
   private refreshPromise: Promise<boolean> | null = null;
   private refreshRejected = false;
+  private readonly refreshLockKey = "boost_auth_refresh_lock";
+  private readonly refreshLockOwner =
+    typeof window !== "undefined"
+      ? `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      : "server";
+  private readonly refreshLockTtlMs = 15_000;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
@@ -112,6 +118,110 @@ class ApiClient {
     }
   }
 
+  private async waitForOtherTabRefresh(
+    originalRefreshToken: string,
+  ): Promise<boolean> {
+    const deadline = Date.now() + this.refreshLockTtlMs + 2_000;
+
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      const currentRefreshToken = this.getRefreshToken();
+
+      // Another tab may already have rotated the token successfully.
+      if (
+        currentRefreshToken &&
+        currentRefreshToken !== originalRefreshToken &&
+        this.getToken()
+      ) {
+        return true;
+      }
+
+      const lockRaw = localStorage.getItem(this.refreshLockKey);
+      if (!lockRaw) {
+        return false;
+      }
+
+      try {
+        const lock = JSON.parse(lockRaw) as {
+          owner?: string;
+          expiresAt?: number;
+        };
+
+        if (!lock.expiresAt || lock.expiresAt <= Date.now()) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  private acquireRefreshLock(): boolean {
+    const now = Date.now();
+
+    try {
+      const existingRaw = localStorage.getItem(this.refreshLockKey);
+
+      if (existingRaw) {
+        try {
+          const existing = JSON.parse(existingRaw) as {
+            owner?: string;
+            expiresAt?: number;
+          };
+
+          if (
+            existing.owner &&
+            existing.owner !== this.refreshLockOwner &&
+            typeof existing.expiresAt === "number" &&
+            existing.expiresAt > now
+          ) {
+            return false;
+          }
+        } catch {
+          // Replace malformed/stale lock.
+        }
+      }
+
+      localStorage.setItem(
+        this.refreshLockKey,
+        JSON.stringify({
+          owner: this.refreshLockOwner,
+          expiresAt: now + this.refreshLockTtlMs,
+        }),
+      );
+
+      const verifyRaw = localStorage.getItem(this.refreshLockKey);
+      if (!verifyRaw) return false;
+
+      const verify = JSON.parse(verifyRaw) as {
+        owner?: string;
+        expiresAt?: number;
+      };
+
+      return verify.owner === this.refreshLockOwner;
+    } catch {
+      // If localStorage is unavailable, preserve the existing in-tab mutex.
+      return true;
+    }
+  }
+
+  private releaseRefreshLock(): void {
+    try {
+      const raw = localStorage.getItem(this.refreshLockKey);
+      if (!raw) return;
+
+      const lock = JSON.parse(raw) as { owner?: string };
+      if (lock.owner === this.refreshLockOwner) {
+        localStorage.removeItem(this.refreshLockKey);
+      }
+    } catch {
+      // Nothing to do.
+    }
+  }
+
   private async refreshAccessToken(): Promise<boolean> {
     const refreshToken = this.getRefreshToken();
 
@@ -127,19 +237,50 @@ class ApiClient {
     this.refreshRejected = false;
 
     this.refreshPromise = (async () => {
+      let ownsLock = false;
+
       try {
+        ownsLock = this.acquireRefreshLock();
+
+        if (!ownsLock) {
+          // Another browser tab is rotating this refresh token. Wait for it
+          // and then use the newly stored access/refresh tokens.
+          const reused = await this.waitForOtherTabRefresh(refreshToken);
+          if (reused) {
+            return true;
+          }
+
+          // The other tab stopped without rotating the token. Re-read the
+          // current token before attempting the refresh ourselves.
+          const currentRefreshToken = this.getRefreshToken();
+          if (!currentRefreshToken) {
+            this.refreshRejected = true;
+            return false;
+          }
+        }
+
+        const tokenForRequest = this.getRefreshToken();
+        if (!tokenForRequest) {
+          this.refreshRejected = true;
+          return false;
+        }
+
         const response = await fetch(`${this.baseUrl}/api/auth/refresh`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            refresh_token: refreshToken,
+            refresh_token: tokenForRequest,
           }),
         });
 
         if (!response.ok) {
-          if (response.status === 400 || response.status === 401 || response.status === 403) {
+          if (
+            response.status === 400 ||
+            response.status === 401 ||
+            response.status === 403
+          ) {
             this.refreshRejected = true;
           }
           return false;
@@ -152,6 +293,9 @@ class ApiClient {
         this.refreshRejected = false;
         return false;
       } finally {
+        if (ownsLock) {
+          this.releaseRefreshLock();
+        }
         this.refreshPromise = null;
       }
     })();
@@ -186,11 +330,49 @@ class ApiClient {
       hasBody
     );
 
-    const response = await fetch(`${this.baseUrl}${endpoint}`, {
-      ...rest,
-      headers: requestHeaders,
-      body,
-    });
+    let response: Response;
+
+    try {
+      response = await fetch(`${this.baseUrl}${endpoint}`, {
+        ...rest,
+        headers: requestHeaders,
+        body,
+      });
+    } catch (error) {
+      const method = String(rest.method || "GET").toUpperCase();
+      const canRetryTransport =
+        retry &&
+        !skipRefresh &&
+        (method === "GET" || method === "HEAD" || method === "OPTIONS");
+
+      if (!canRetryTransport) {
+        throw error;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      response = await fetch(`${this.baseUrl}${endpoint}`, {
+        ...rest,
+        headers: requestHeaders,
+        body,
+      });
+    }
+
+    if (
+      response.status >= 500 &&
+      response.status <= 504 &&
+      retry &&
+      !skipRefresh &&
+      String(rest.method || "GET").toUpperCase() === "GET"
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      response = await fetch(`${this.baseUrl}${endpoint}`, {
+        ...rest,
+        headers: requestHeaders,
+        body,
+      });
+    }
 
     if (response.status === 401 && auth && retry && !skipRefresh) {
       const refreshed = await this.refreshAccessToken();
