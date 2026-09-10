@@ -442,7 +442,7 @@ def _build_featured_image(title: str, keyword: str, article_html: str = "", clie
     )
     draw.text(
         (135, 735),
-        f"{client_brand} · SEO CONTENT",
+        f"{client_brand}",
         font=brand_font,
         fill=(251, 210, 11, 255),
     )
