@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any
+import base64
+import json
+import os
 import re
 
 from PIL import Image, ImageDraw, ImageFont
@@ -126,13 +129,24 @@ def _font(size: int, bold: bool = False):
     return ImageFont.load_default()
 
 
-def _visual_theme(title: str, keyword: str, article_html: str = "") -> str:
-    """Infer a lightweight visual theme from the actual article topic.
+def _extract_article_text(article_html: str, max_chars: int = 9000) -> str:
+    """Extract bounded plain text from the article for visual-context generation."""
+    if not article_html:
+        return ""
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(article_html, "html.parser")
+            for node in soup(["script", "style", "noscript"]):
+                node.decompose()
+            return " ".join(soup.get_text(" ", strip=True).split())[:max_chars]
+        except Exception:
+            pass
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", article_html)).strip()[:max_chars]
 
-    This is intentionally deterministic and local: it does not invent stock-photo
-    URLs, call an unavailable image API, or change the publishing workflow.
-    """
-    text = f"{title} {keyword} {article_html[:12000]}".lower()
+
+def _visual_theme(title: str, keyword: str, article_html: str = "") -> str:
+    """Infer the service/industry scene from the complete article context."""
+    text = f"{title} {keyword} {_extract_article_text(article_html)}".lower()
 
     theme_rules = (
         ("medical_commercial", (
@@ -140,7 +154,6 @@ def _visual_theme(title: str, keyword: str, article_html: str = "") -> str:
             "medical cleaning versus commercial cleaning",
             "medical vs commercial cleaning",
             "medical versus commercial cleaning",
-            "medical cleaning commercial cleaning",
         )),
         ("healthcare", (
             "healthcare", "medical", "hospital", "clinic", "surgery", "patient",
@@ -154,19 +167,22 @@ def _visual_theme(title: str, keyword: str, article_html: str = "") -> str:
             "school", "student", "classroom", "education", "college", "campus",
             "childcare", "daycare",
         )),
-        ("office", (
-            "office", "commercial cleaning", "workplace", "corporate",
-            "business cleaning", "workstation", "workspace",
+        ("hotel", (
+            "hotel", "hospitality", "guest room", "accommodation", "resort",
+            "housekeeping", "hotel cleaning",
+        )),
+        ("industrial", (
+            "industrial", "warehouse", "factory", "manufacturing",
+            "industrial cleaning", "distribution centre", "distribution center",
         )),
         ("house", (
             "house cleaning", "home cleaning", "residential", "housekeeper",
             "domestic cleaning", "home cleaners", "living room", "bedroom",
+            "end of lease", "bond clean", "vacate cleaning", "move out cleaning",
         )),
-        ("hotel", (
-            "hotel", "hospitality", "guest room", "accommodation", "resort",
-        )),
-        ("industrial", (
-            "industrial", "warehouse", "factory", "manufacturing", "industrial cleaning",
+        ("office", (
+            "office", "commercial cleaning", "workplace", "corporate",
+            "business cleaning", "workstation", "workspace", "commercial property",
         )),
     )
 
@@ -174,20 +190,325 @@ def _visual_theme(title: str, keyword: str, article_html: str = "") -> str:
         if any(term in text for term in terms):
             return name
 
-    # Deterministic fallback based on the subject rather than one universal image.
-    return "business" if any(
-        term in text for term in ("service", "services", "facility", "contractor", "cleaning")
-    ) else "business"
+    return "business"
+
+
+def _industry_visual_direction(theme: str) -> str:
+    """Return a service-specific photography direction, not a reusable illustration."""
+    directions = {
+        "healthcare": (
+            "A professional commercial cleaner actively sanitising a modern clinic or "
+            "healthcare facility, wearing realistic PPE/gloves, using professional cleaning "
+            "equipment, with treatment rooms, hygienic surfaces and clinical details visible."
+        ),
+        "medical_commercial": (
+            "A sophisticated split-scene comparison: one side shows a professional cleaner "
+            "sanitising a clinical/medical environment with appropriate PPE and disinfecting "
+            "equipment; the other shows a professional cleaner maintaining a modern office. "
+            "The two environments should look clearly different and authentic."
+        ),
+        "gym": (
+            "A professional gym cleaner actively disinfecting fitness equipment such as a "
+            "treadmill, weights or exercise machines in a premium modern fitness facility. "
+            "Show realistic cleaning tools and an authentic working environment."
+        ),
+        "school": (
+            "A professional school cleaner actively cleaning a bright classroom or school "
+            "common area, with desks, educational surroundings, hygiene equipment and a "
+            "realistic professional cleaning workflow."
+        ),
+        "hotel": (
+            "A professional hospitality cleaner or housekeeper actively preparing a premium "
+            "hotel guest room or hospitality area, with realistic linens, surfaces, cleaning "
+            "cart and professional equipment."
+        ),
+        "industrial": (
+            "A professional industrial cleaner actively operating commercial cleaning "
+            "equipment inside a realistic warehouse, factory or industrial facility, with "
+            "appropriate PPE, machinery and large-scale surfaces."
+        ),
+        "house": (
+            "A professional residential cleaner actively performing the specific cleaning "
+            "service in a realistic high-quality home interior. Show authentic household "
+            "surfaces, cleaning tools and a human cleaner at work."
+        ),
+        "office": (
+            "A professional commercial cleaner actively cleaning a modern corporate office, "
+            "wiping desks or workstations with professional spray and microfiber equipment. "
+            "Show realistic office furniture, computers, glass partitions and workplace detail."
+        ),
+        "business": (
+            "A professional commercial cleaner actively delivering the service in a realistic "
+            "business facility, with visible professional cleaning equipment and a human worker "
+            "engaged in the task."
+        ),
+    }
+    return directions.get(theme, directions["business"])
+
+
+def _image_generation_config() -> tuple[str, str, str] | None:
+    """Read optional image-generation configuration without changing existing app settings."""
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    model = os.getenv("CONTENT_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"
+    quality = os.getenv("CONTENT_IMAGE_QUALITY", "high").strip().lower()
+    if quality not in {"low", "medium", "high", "auto"}:
+        quality = "high"
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    return api_key, model, quality, base_url
+
+
+def _build_ai_image_prompt(
+    title: str,
+    keyword: str,
+    article_html: str,
+    client_brand: str,
+    theme: str,
+) -> str:
+    """Create a professional editorial-photo prompt from the actual article topic."""
+    article_text = _extract_article_text(article_html, 7000)
+    direction = _industry_visual_direction(theme)
+
+    return f"""
+Create a premium editorial hero photograph for a professional business blog.
+
+ARTICLE TITLE:
+{title}
+
+PRIMARY KEYWORD:
+{keyword}
+
+CLIENT BUSINESS:
+{client_brand}
+
+INDUSTRY / SERVICE:
+{theme.replace("_", " ")}
+
+SERVICE-SPECIFIC SCENE:
+{direction}
+
+ARTICLE CONTEXT:
+{article_text[:7000]}
+
+CREATIVE DIRECTION:
+- Photorealistic commercial photography, not an illustration, cartoon, icon set, vector art,
+  flat graphic, 3D render, clipart or generic stock-photo collage.
+- Show a real human professional actively performing the relevant cleaning service.
+- The person must be naturally integrated into the environment and visibly doing the work,
+  not simply standing and smiling at the camera.
+- Use realistic professional cleaning tools, PPE where appropriate, natural human anatomy,
+  believable hands, realistic skin, fabric and equipment.
+- Make the environment clearly match the service described by the article.
+- Premium corporate editorial photography suitable for a high-end Australian business website.
+- Natural daylight plus realistic interior lighting, shallow depth of field where appropriate,
+  subtle cinematic composition, authentic textures, clean premium finish.
+- Compose the main human/service action toward the RIGHT 55% of the frame.
+- Keep the LEFT 42% visually clean, bright and uncluttered so exact article-title typography
+  can be added later by the application.
+- Do NOT put any words, letters, logos, watermarks, fake signage, business names or article
+  titles inside the generated photograph.
+- Do NOT create a generic reusable scene. The environment, tools and activity must reflect
+  the specific industry/service and article context.
+- Landscape hero composition, approximately 16:9.
+- No borders, no infographic panels, no UI elements, no template frame.
+""".strip()
+
+
+async def _generate_ai_featured_image(
+    client: httpx.AsyncClient,
+    title: str,
+    keyword: str,
+    article_html: str,
+    client_brand: str,
+) -> bytes | None:
+    """Generate a photorealistic article image when OPENAI_API_KEY is configured.
+
+    Failure is intentionally non-fatal: the existing local generator remains the safe
+    fallback so WordPress publishing and all other application features continue to work.
+    """
+    config = _image_generation_config()
+    if config is None:
+        return None
+
+    api_key, model, quality, base_url = config
+    theme = _visual_theme(title, keyword, article_html)
+    prompt = _build_ai_image_prompt(title, keyword, article_html, client_brand, theme)
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "size": "1536x1024",
+        "quality": quality,
+        "background": "opaque",
+        "output_format": "png",
+        "n": 1,
+    }
+
+    try:
+        response = await client.post(
+            f"{base_url}/images/generations",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=httpx.Timeout(120.0, connect=20.0),
+        )
+        if response.status_code >= 400:
+            return None
+
+        data = response.json()
+        item = (data.get("data") or [{}])[0]
+        encoded = item.get("b64_json")
+        if not encoded:
+            return None
+
+        image_bytes = base64.b64decode(encoded)
+        if not image_bytes:
+            return None
+
+        # Validate that the API returned a real decodable image before continuing.
+        with Image.open(BytesIO(image_bytes)) as generated:
+            generated.load()
+
+        return image_bytes
+    except Exception:
+        # Image generation is an enhancement. Never turn a temporary provider failure
+        # into a WordPress publishing failure.
+        return None
+
+
+def _compose_professional_featured_image(
+    generated_bytes: bytes,
+    title: str,
+    keyword: str,
+    client_brand: str,
+) -> bytes:
+    """Crop the generated photograph and add exact, readable title/brand typography."""
+    with Image.open(BytesIO(generated_bytes)) as source:
+        image = source.convert("RGB")
+        target_w, target_h = 1600, 900
+        target_ratio = target_w / target_h
+        source_ratio = image.width / image.height
+
+        if source_ratio > target_ratio:
+            crop_w = int(image.height * target_ratio)
+            left = max(0, (image.width - crop_w) // 2)
+            image = image.crop((left, 0, left + crop_w, image.height))
+        elif source_ratio < target_ratio:
+            crop_h = int(image.width / target_ratio)
+            top = max(0, (image.height - crop_h) // 2)
+            image = image.crop((0, top, image.width, top + crop_h))
+
+        image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+    draw = ImageDraw.Draw(image, "RGBA")
+    title_font = _font(61, bold=True)
+    brand_font = _font(31, bold=True)
+    keyword_font = _font(23, bold=False)
+    label_font = _font(20, bold=True)
+
+    # Premium dark-to-transparent editorial panel on the left.
+    panel = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    panel_draw = ImageDraw.Draw(panel, "RGBA")
+    for x in range(0, 780, 12):
+        alpha = int(205 * max(0.0, 1.0 - x / 820))
+        panel_draw.rectangle((x, 0, x + 12, 900), fill=(5, 18, 35, alpha))
+    image = Image.alpha_composite(image.convert("RGBA"), panel)
+    draw = ImageDraw.Draw(image, "RGBA")
+
+    # Thin brand accent and subtle bottom protection.
+    draw.rounded_rectangle((55, 55, 805, 845), radius=28, outline=(255, 255, 255, 80), width=2)
+    draw.rectangle((0, 810, 1600, 900), fill=(4, 18, 35, 180))
+
+    # Exact article title: generated text is never trusted to an image model.
+    def wrap(text: str, max_chars: int = 28) -> list[str]:
+        words = " ".join(text.split()).split()
+        lines: list[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if len(candidate) > max_chars and current:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        return lines[:5]
+
+    draw.rounded_rectangle((82, 105, 590, 153), radius=20, fill=(14, 107, 151, 230))
+    draw.text(
+        (105, 114),
+        "PROFESSIONAL SERVICE GUIDE",
+        font=label_font,
+        fill=(255, 255, 255, 255),
+    )
+
+    y = 205
+    for line in wrap(title):
+        draw.text(
+            (82, y),
+            line,
+            font=title_font,
+            fill=(255, 255, 255, 255),
+            stroke_width=1,
+            stroke_fill=(5, 18, 35, 210),
+        )
+        y += 72
+
+    # Client business name is always exact and visible.
+    brand = " ".join(client_brand.split())[:100] or "Client Website"
+    draw.text((82, 665), brand, font=brand_font, fill=(255, 214, 50, 255))
+    draw.text(
+        (82, 714),
+        f"Primary keyword: {keyword[:78]}",
+        font=keyword_font,
+        fill=(235, 243, 249, 235),
+    )
+    draw.rectangle((82, 770, 330, 776), fill=(255, 214, 50, 255))
+
+    output = BytesIO()
+    image.convert("RGB").save(output, format="JPEG", quality=94, optimize=True)
+    return output.getvalue()
+
+
+def _build_featured_image(
+    title: str,
+    keyword: str,
+    article_html: str = "",
+    client_brand: str = "",
+    ai_image_bytes: bytes | None = None,
+) -> bytes:
+    """Build a professional featured image while preserving a deterministic fallback."""
+    client_brand = " ".join(str(client_brand or "").split())[:120] or "Client Website"
+
+    if ai_image_bytes:
+        try:
+            return _compose_professional_featured_image(
+                ai_image_bytes, title, keyword, client_brand
+            )
+        except Exception:
+            pass
+
+    # Existing local generation remains the fallback for deployments without an
+    # OpenAI image key or when the provider is temporarily unavailable.
+    return _build_local_fallback_image(title, keyword, article_html, client_brand)
 
 
 def _draw_cleaner(draw: ImageDraw.ImageDraw, x: int, y: int, scale: float = 1.0) -> None:
-    """Draw a simple professional cleaner illustration."""
-    # Head
+    """Draw a compact deterministic fallback cleaner illustration."""
     r = int(25 * scale)
     draw.ellipse((x - r, y - r, x + r, y + r), fill=(242, 194, 155, 255))
-    # Hair/cap
-    draw.arc((x - r, y - r, x + r, y + r), 190, 350, fill=(15, 23, 42, 255), width=max(2, int(5 * scale)))
-    # Body
+    draw.arc(
+        (x - r, y - r, x + r, y + r),
+        190,
+        350,
+        fill=(15, 23, 42, 255),
+        width=max(2, int(5 * scale)),
+    )
     body_w = int(75 * scale)
     body_h = int(120 * scale)
     draw.rounded_rectangle(
@@ -195,7 +516,6 @@ def _draw_cleaner(draw: ImageDraw.ImageDraw, x: int, y: int, scale: float = 1.0)
         radius=int(18 * scale),
         fill=(30, 144, 132, 255),
     )
-    # Arms
     arm_w = max(5, int(14 * scale))
     draw.line(
         (x - body_w + 5 * scale, y + 55 * scale, x - body_w - 55 * scale, y + 115 * scale),
@@ -207,83 +527,42 @@ def _draw_cleaner(draw: ImageDraw.ImageDraw, x: int, y: int, scale: float = 1.0)
         fill=(242, 194, 155, 255),
         width=arm_w,
     )
-    # Legs
-    leg_w = max(7, int(17 * scale))
-    draw.line(
-        (x - 35 * scale, y + r + body_h, x - 45 * scale, y + r + body_h + 85 * scale),
-        fill=(31, 41, 55, 255),
-        width=leg_w,
-    )
-    draw.line(
-        (x + 35 * scale, y + r + body_h, x + 45 * scale, y + r + body_h + 85 * scale),
-        fill=(31, 41, 55, 255),
-        width=leg_w,
-    )
-    # Spray bottle in hand
-    bx = x + body_w + 48 * scale
-    by = y + 83 * scale
-    bw = int(30 * scale)
-    bh = int(48 * scale)
-    draw.rounded_rectangle(
-        (bx - bw / 2, by - bh / 2, bx + bw / 2, by + bh / 2),
-        radius=int(7 * scale),
-        fill=(235, 245, 255, 255),
-        outline=(30, 144, 132, 255),
-        width=max(2, int(3 * scale)),
-    )
-    draw.line(
-        (bx - 7 * scale, by - bh / 2, bx + 5 * scale, by - bh / 2 - 12 * scale),
-        fill=(235, 245, 255, 255),
-        width=max(3, int(6 * scale)),
-    )
 
 
 def _draw_medical_scene(draw: ImageDraw.ImageDraw) -> None:
-    # Hospital/clinic building
     draw.rounded_rectangle((900, 190, 1460, 620), radius=28, fill=(230, 242, 250, 255))
     for x in (950, 1070, 1190, 1310):
         for y in (260, 360, 460):
-            draw.rounded_rectangle((x, y, x + 70, y + 70), radius=8, fill=(175, 215, 235, 255))
+            draw.rounded_rectangle(
+                (x, y, x + 70, y + 70), radius=8, fill=(175, 215, 235, 255)
+            )
     draw.rectangle((1125, 275, 1235, 390), fill=(30, 144, 132, 255))
     draw.rectangle((1085, 307, 1275, 358), fill=(30, 144, 132, 255))
-    # Medical cross badge
-    draw.ellipse((1240, 80, 1430, 270), fill=(245, 250, 252, 255), outline=(30, 144, 132, 255), width=7)
-    draw.rectangle((1300, 115, 1370, 235), fill=(30, 144, 132, 255))
-    draw.rectangle((1275, 145, 1395, 205), fill=(30, 144, 132, 255))
     _draw_cleaner(draw, 1040, 540, 0.75)
 
 
 def _draw_split_cleaning_scene(draw: ImageDraw.ImageDraw) -> None:
-    # Two facility types: medical on the left, commercial office on the right.
     draw.rounded_rectangle((860, 180, 1110, 590), radius=22, fill=(228, 241, 248, 255))
     draw.rectangle((955, 250, 1015, 370), fill=(30, 144, 132, 255))
     draw.rectangle((925, 280, 1045, 340), fill=(30, 144, 132, 255))
     draw.rounded_rectangle((1140, 180, 1460, 590), radius=22, fill=(238, 235, 224, 255))
-    # Office windows/desks
     for x in (1180, 1300):
         draw.rectangle((x, 235, x + 95, 325), fill=(175, 215, 235, 255))
     draw.rectangle((1180, 410, 1395, 435), fill=(101, 76, 55, 255))
     draw.line((1210, 435, 1195, 525), fill=(75, 60, 48, 255), width=9)
     draw.line((1365, 435, 1380, 525), fill=(75, 60, 48, 255), width=9)
-    # Divider
     draw.line((1125, 160, 1125, 620), fill=(251, 210, 11, 220), width=6)
     _draw_cleaner(draw, 1060, 560, 0.55)
 
 
 def _draw_gym_scene(draw: ImageDraw.ImageDraw) -> None:
-    # Treadmill
     draw.line((870, 520, 1060, 520), fill=(60, 70, 82, 255), width=16)
     draw.line((1060, 520, 1110, 390), fill=(60, 70, 82, 255), width=16)
     draw.line((1110, 390, 1210, 390), fill=(60, 70, 82, 255), width=14)
-    draw.line((910, 520, 885, 580), fill=(60, 70, 82, 255), width=12)
-    draw.line((1050, 520, 1080, 580), fill=(60, 70, 82, 255), width=12)
-    # Dumbbell rack
     draw.rectangle((1220, 305, 1430, 325), fill=(75, 60, 48, 255))
     for x in range(1240, 1420, 45):
         draw.line((x, 325, x, 515), fill=(75, 60, 48, 255), width=7)
         draw.rounded_rectangle((x - 18, 420, x + 18, 445), radius=6, fill=(30, 144, 132, 255))
-        draw.rounded_rectangle((x - 28, 445, x + 28, 468), radius=6, fill=(30, 144, 132, 255))
-    # Cleaning spray and person
     _draw_cleaner(draw, 1030, 500, 0.55)
 
 
@@ -297,15 +576,12 @@ def _draw_school_scene(draw: ImageDraw.ImageDraw) -> None:
 
 
 def _draw_office_scene(draw: ImageDraw.ImageDraw) -> None:
-    # Modern office interior.
     draw.rectangle((875, 190, 1460, 590), fill=(235, 240, 244, 255))
     for x in (920, 1080, 1240):
         draw.rectangle((x, 240, x + 100, 335), fill=(165, 205, 225, 255))
     draw.rectangle((900, 440, 1400, 470), fill=(101, 76, 55, 255))
     for x in (930, 1080, 1230, 1380):
         draw.line((x, 470, x - 10, 575), fill=(70, 60, 50, 255), width=8)
-    draw.rounded_rectangle((1010, 370, 1100, 435), radius=12, fill=(60, 90, 120, 255))
-    draw.rounded_rectangle((1190, 370, 1280, 435), radius=12, fill=(60, 90, 120, 255))
     _draw_cleaner(draw, 1040, 545, 0.52)
 
 
@@ -324,16 +600,12 @@ def _draw_hotel_scene(draw: ImageDraw.ImageDraw) -> None:
     for x in (950, 1060, 1260, 1370):
         for y in (220, 340, 460):
             draw.rectangle((x, y, x + 70, y + 65), fill=(175, 215, 235, 255))
-    # Bed
     draw.rounded_rectangle((920, 490, 1080, 565), radius=12, fill=(255, 255, 255, 255))
-    draw.rectangle((920, 450, 950, 565), fill=(130, 94, 65, 255))
     _draw_cleaner(draw, 1280, 545, 0.5)
 
 
 def _draw_industrial_scene(draw: ImageDraw.ImageDraw) -> None:
     draw.rectangle((880, 260, 1450, 600), fill=(70, 82, 96, 255))
-    draw.polygon([(880, 260), (1010, 150), (1140, 260)], fill=(90, 105, 120, 255))
-    draw.polygon([(1140, 260), (1270, 150), (1400, 260)], fill=(90, 105, 120, 255))
     for x in (930, 1080, 1230, 1380):
         draw.rectangle((x, 350, x + 70, 440), fill=(175, 215, 235, 255))
     draw.ellipse((1230, 465, 1380, 615), fill=(251, 210, 11, 255))
@@ -344,23 +616,20 @@ def _draw_business_scene(draw: ImageDraw.ImageDraw) -> None:
     draw.rounded_rectangle((900, 170, 1450, 600), radius=28, fill=(235, 240, 244, 255))
     for x, h in ((930, 270), (1050, 210), (1170, 320), (1290, 240)):
         draw.rectangle((x, 600 - h, x + 90, 600), fill=(75, 95, 115, 255))
-        for y in range(630 - h, 570, 65):
-            draw.rectangle((x + 18, y, x + 70, y + 25), fill=(175, 215, 235, 255))
     _draw_cleaner(draw, 1030, 545, 0.5)
 
 
-def _build_featured_image(title: str, keyword: str, article_html: str = "", client_brand: str = "") -> bytes:
-    """Create a content-specific 1600x900 branded PNG locally.
-
-    The visual scene is selected from the article's title, keyword and a bounded
-    sample of article HTML. This replaces the old one-background template while
-    keeping image generation deterministic and dependency-free.
-    """
+def _build_local_fallback_image(
+    title: str,
+    keyword: str,
+    article_html: str = "",
+    client_brand: str = "",
+) -> bytes:
+    """Deterministic fallback used only when AI image generation is unavailable."""
     width, height = 1600, 900
     theme = _visual_theme(title, keyword, article_html)
     client_brand = " ".join(str(client_brand or "").split())[:120] or "Client Website"
 
-    # Theme-specific visual identity. Text remains readable while the scene changes.
     theme_backgrounds = {
         "healthcare": (12, 30, 43),
         "medical_commercial": (17, 29, 42),
@@ -372,19 +641,6 @@ def _build_featured_image(title: str, keyword: str, article_html: str = "", clie
         "industrial": (25, 31, 38),
         "business": (18, 28, 42),
     }
-    bg = theme_backgrounds.get(theme, theme_backgrounds["business"])
-
-    image = Image.new("RGB", (width, height), bg)
-    draw = ImageDraw.Draw(image, "RGBA")
-
-    # Soft diagonal bands instead of the old pixel-by-pixel gradient.
-    for offset in range(-900, 1700, 90):
-        draw.polygon(
-            [(offset, 900), (offset + 90, 900), (offset + 720, 0), (offset + 630, 0)],
-            fill=(255, 255, 255, 5),
-        )
-
-    # Content-specific scene panel.
     scene_drawers = {
         "healthcare": _draw_medical_scene,
         "medical_commercial": _draw_split_cleaning_scene,
@@ -396,19 +652,19 @@ def _build_featured_image(title: str, keyword: str, article_html: str = "", clie
         "industrial": _draw_industrial_scene,
         "business": _draw_business_scene,
     }
-    scene_drawers[theme](draw)
 
-    # Keep the existing Boost Rankers visual language, but make it secondary to the topic.
+    image = Image.new("RGB", (width, height), theme_backgrounds.get(theme, (18, 28, 42)))
+    draw = ImageDraw.Draw(image, "RGBA")
+    scene_drawers.get(theme, _draw_business_scene)(draw)
+
     draw.rounded_rectangle((70, 65, 1530, 835), radius=42, outline=(251, 210, 11, 175), width=4)
     draw.rounded_rectangle((90, 95, 805, 805), radius=34, fill=(5, 12, 25, 185))
-    draw.rounded_rectangle((825, 95, 1510, 805), radius=34, fill=(5, 12, 25, 90))
 
     title_font = _font(62, bold=True)
     keyword_font = _font(27, bold=False)
     brand_font = _font(25, bold=True)
-    theme_font = _font(22, bold=True)
 
-    def wrap(text: str, font, max_chars: int = 31):
+    def wrap(text: str, max_chars: int = 31):
         words = text.split()
         lines, current = [], ""
         for word in words:
@@ -422,19 +678,18 @@ def _build_featured_image(title: str, keyword: str, article_html: str = "", clie
             lines.append(current)
         return lines[:5]
 
-    lines = wrap(title, title_font)
     y = 210
-    for line in lines:
+    for line in wrap(title):
         draw.text((135, y), line, font=title_font, fill=(255, 255, 255, 255))
         y += 76
 
-    
     draw.text(
-        (135, 735),
-        f"{client_brand}",
-        font=brand_font,
-        fill=(251, 210, 11, 255),
+        (135, 625),
+        f"Primary keyword: {keyword[:90]}",
+        font=keyword_font,
+        fill=(218, 228, 240, 255),
     )
+    draw.text((135, 690), client_brand, font=brand_font, fill=(251, 210, 11, 255))
 
     output = BytesIO()
     image.save(output, format="PNG", optimize=True)
@@ -450,14 +705,19 @@ async def _upload_featured_image(
     article_html: str = "",
     client_brand: str = "",
 ) -> dict[str, Any]:
-    image_bytes = _build_featured_image(title, keyword, article_html, client_brand)
-    filename = f"{_slugify(title)}.png"
+    ai_image_bytes = await _generate_ai_featured_image(
+        client, title, keyword, article_html, client_brand
+    )
+    image_bytes = _build_featured_image(
+        title, keyword, article_html, client_brand, ai_image_bytes
+    )
+    filename = f"{_slugify(title)}.jpg" if ai_image_bytes else f"{_slugify(title)}.png"
     response = await client.post(
         f"{site}/wp-json/wp/v2/media",
         content=image_bytes,
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Type": "image/png",
+            "Content-Type": "image/jpeg" if ai_image_bytes else "image/png",
         },
         auth=auth,
     )
