@@ -332,7 +332,6 @@ async def _claude_json(
         response = await client.messages.create(
             model=_anthropic_model(),
             max_tokens=max_tokens,
-            temperature=0.2,
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -546,3 +545,4 @@ async def apply_to_wordpress(data: WordPressApplyRequest, current_user: User = D
                 "status": data.status,
             },
         }
+
