@@ -428,18 +428,7 @@ def _build_featured_image(title: str, keyword: str, article_html: str = "", clie
         draw.text((135, y), line, font=title_font, fill=(255, 255, 255, 255))
         y += 76
 
-    draw.text(
-        (135, 625),
-        f"Primary keyword: {keyword[:90]}",
-        font=keyword_font,
-        fill=(218, 228, 240, 255),
-    )
-    draw.text(
-        (135, 690),
-        f"TOPIC: {theme.upper()}",
-        font=theme_font,
-        fill=(251, 210, 11, 255),
-    )
+    
     draw.text(
         (135, 735),
         f"{client_brand}",
