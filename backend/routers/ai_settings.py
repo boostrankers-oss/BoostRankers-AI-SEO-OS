@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
@@ -51,9 +51,9 @@ def _mask_key(key: str | None) -> str | None:
     key = key.strip()
 
     if len(key) <= 10:
-        return "••••••••"
+        return "â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢"
 
-    return f"{key[:7]}••••••••{key[-4:]}"
+    return f"{key[:7]}â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢{key[-4:]}"
 
 
 def _configured_model() -> str | None:
@@ -355,11 +355,6 @@ def get_anthropic_status(
     "/anthropic",
     response_model=AnthropicStatusResponse,
 )
-
-@router.put(
-    "/anthropic",
-    response_model=AnthropicStatusResponse,
-)
 async def save_anthropic_key(
     payload: AnthropicSaveRequest,
     db: Session = Depends(get_db),
@@ -517,3 +512,5 @@ async def test_anthropic_key(
         )
 
     return _response(company)
+
+

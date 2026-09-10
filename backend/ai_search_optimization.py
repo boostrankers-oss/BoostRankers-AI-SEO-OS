@@ -14,10 +14,15 @@ import httpx
 from anthropic import AsyncAnthropic
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field, HttpUrl
 
 from api.deps.current_user import get_current_user
+from config import settings
+from database.database import get_db
+from models.company import Company
 from models.user import User
+from services.secret_service import decrypt_secret
 
 logger = logging.getLogger(__name__)
 
@@ -256,11 +261,44 @@ async def _fetch_public_page(url: str) -> str:
     return response.text[:MAX_CONTENT_CHARS * 4]
 
 
-def _anthropic_client() -> AsyncAnthropic:
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=503, detail="Claude API key is not configured. Configure ANTHROPIC_API_KEY in the backend environment.")
-    return AsyncAnthropic(api_key=api_key)
+def _resolve_anthropic_api_key(db: Session, company_id: str) -> str:
+    """Resolve the Claude key using the existing AI Settings architecture.
+
+    Priority:
+    1. The current company's encrypted Anthropic key saved in Settings → AI.
+    2. The global ANTHROPIC_API_KEY configuration fallback.
+    """
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if company is not None:
+        encrypted_key = getattr(company, "anthropic_api_key_encrypted", None)
+        if encrypted_key:
+            try:
+                api_key = str(decrypt_secret(str(encrypted_key).strip()) or "").strip()
+            except Exception as exc:
+                logger.exception("Could not decrypt the company's Anthropic API key")
+                raise HTTPException(
+                    status_code=503,
+                    detail="The stored Claude API key could not be decrypted. Open Settings → AI and save the Anthropic API key again.",
+                ) from exc
+            if api_key:
+                return api_key
+
+    global_key = getattr(settings, "ANTHROPIC_API_KEY", None) or os.getenv("ANTHROPIC_API_KEY", "")
+    global_key = str(global_key or "").strip()
+    if global_key:
+        return global_key
+
+    raise HTTPException(
+        status_code=503,
+        detail="Claude API key is not configured. Open Settings → AI and configure your Anthropic API key.",
+    )
+
+
+def _anthropic_model() -> str:
+    """Use the same configured Anthropic model setting used by other AI modules."""
+    model = getattr(settings, "ANTHROPIC_MODEL", None) or os.getenv("AI_SEARCH_OPTIMIZATION_MODEL", "")
+    model = str(model or "").strip()
+    return model or "claude-sonnet-4-6"
 
 
 def _parse_json(text: str) -> dict[str, Any]:
@@ -283,11 +321,16 @@ def _parse_json(text: str) -> dict[str, Any]:
     return parsed
 
 
-async def _claude_json(system: str, prompt: str, max_tokens: int = 7000) -> dict[str, Any]:
-    client = _anthropic_client()
+async def _claude_json(
+    system: str,
+    prompt: str,
+    api_key: str,
+    max_tokens: int = 7000,
+) -> dict[str, Any]:
+    client = AsyncAnthropic(api_key=api_key)
     try:
         response = await client.messages.create(
-            model=os.getenv("AI_SEARCH_OPTIMIZATION_MODEL", "claude-sonnet-4-20250514"),
+            model=_anthropic_model(),
             max_tokens=max_tokens,
             temperature=0.2,
             system=system,
@@ -303,8 +346,13 @@ async def _claude_json(system: str, prompt: str, max_tokens: int = 7000) -> dict
 
 
 @router.post("/analyze")
-async def analyze_post(data: AnalyzeRequest, current_user: User = Depends(get_current_user)):
-    _require_company(current_user)
+async def analyze_post(
+    data: AnalyzeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    company_id = _require_company(current_user)
+    api_key = _resolve_anthropic_api_key(db, company_id)
     url = _clean_url(str(data.url))
     html = await _fetch_public_page(url)
     measured = _extract_page(html, url, data.focus_keyword)
@@ -339,7 +387,7 @@ Return exactly:
 }}
 Scores are 0-100 and must be grounded in the evidence.
 """
-    ai = await _claude_json(system, prompt, max_tokens=5000)
+    ai = await _claude_json(system, prompt, api_key=api_key, max_tokens=5000)
     for key in ("ai_search_score", "content_quality", "answer_engine_readiness", "entity_readiness", "semantic_coverage"):
         try:
             ai[key] = max(0, min(100, int(ai.get(key, measured["measured_score"]))))
@@ -349,8 +397,13 @@ Scores are 0-100 and must be grounded in the evidence.
 
 
 @router.post("/rewrite")
-async def rewrite_post(data: RewriteRequest, current_user: User = Depends(get_current_user)):
-    _require_company(current_user)
+async def rewrite_post(
+    data: RewriteRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    company_id = _require_company(current_user)
+    api_key = _resolve_anthropic_api_key(db, company_id)
     source_text = _strip_html(data.content_html)
     if _word_count(source_text) < 100:
         raise HTTPException(status_code=400, detail="The post needs at least 100 readable words before AI rewriting.")
@@ -389,7 +442,7 @@ Rules:
 - Do not output markdown.
 - Do not invent unsupported facts.
 """
-    rewrite = await _claude_json(system, prompt, max_tokens=10000)
+    rewrite = await _claude_json(system, prompt, api_key=api_key, max_tokens=10000)
     rewrite["focus_keyword"] = data.focus_keyword
     return {"success": True, "rewrite": rewrite}
 
