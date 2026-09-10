@@ -49,6 +49,7 @@ from routers.content_plans import router as content_plans_router
 from routers.ai_settings import router as ai_settings_router
 from routers.google_integration import router as google_integration
 from content_automation import router as content_automation_router
+from ai_search_optimization import router as ai_search_optimization_router
 
 # ============================================================
 # Validate required environment
@@ -198,6 +199,11 @@ app.include_router(
 app.include_router(
     content_automation_router,
     tags=["Content Automation"],
+)
+
+app.include_router(
+    ai_search_optimization_router,
+    tags=["AI Search Optimization"],
 )
 app.include_router(
     rank_tracking_router,
