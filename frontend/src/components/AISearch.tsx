@@ -59,6 +59,9 @@ interface AIAnalysis {
   answer_engine_readiness: number;
   entity_readiness: number;
   semantic_coverage: number;
+  suggested_focus_keyword: string;
+  focus_keyword_auto_selected?: boolean;
+  focus_keyword_conflict?: boolean;
   summary: string;
   critical_issues: string[];
   high_priority_actions: string[];
@@ -79,6 +82,8 @@ interface RewriteResult {
   article_html: string;
   change_summary: string[];
   focus_keyword_usage: Record<string, boolean>;
+  internal_links_applied?: number;
+  internal_link_targets?: string[];
 }
 
 interface WPItem {
@@ -90,6 +95,7 @@ interface WPItem {
   modified: string;
   content_html: string;
   excerpt: string;
+  focus_keyword?: string;
 }
 
 function scoreClass(score: number) {
@@ -106,6 +112,10 @@ function scoreBarClass(score: number) {
 
 function getErrorMessage(error: any, fallback: string) {
   return error?.data?.detail || error?.response?.data?.detail || error?.message || fallback;
+}
+
+function normalizePhrase(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
 }
 
 export function AISearch() {
@@ -160,13 +170,27 @@ export function AISearch() {
     setAnalysis(null);
     setRewrite(null);
     try {
+      const usedFocusKeywords = wpItems
+        .filter((item) => String(item.id) !== String(selectedPostId))
+        .map((item) => item.focus_keyword?.trim() || "")
+        .filter(Boolean);
       const result = await api.post<{ success: boolean; measured: MeasuredPage; ai_analysis: AIAnalysis }>(
         "/api/ai-search-optimization/analyze",
-        { url: url.trim(), focus_keyword: focusKeyword.trim() },
+        {
+          url: url.trim(),
+          focus_keyword: focusKeyword.trim(),
+          used_focus_keywords: usedFocusKeywords,
+        },
       );
       setAnalysis({ measured: result.measured, ai_analysis: result.ai_analysis });
-      setFocusKeyword(result.measured.focus_keyword || focusKeyword.trim());
-      toast.success("Post analyzed using real page evidence.");
+      setFocusKeyword(result.measured.focus_keyword || result.ai_analysis.suggested_focus_keyword || focusKeyword.trim());
+      if (result.ai_analysis.focus_keyword_conflict) {
+        toast.warning(`That focus keyword was already used. Boost Rankers selected an unused keyword: ${result.measured.focus_keyword}`);
+      } else if (result.ai_analysis.focus_keyword_auto_selected) {
+        toast.success(`Focus keyword selected automatically: ${result.measured.focus_keyword}`);
+      } else {
+        toast.success("Post analyzed using real page evidence.");
+      }
     } catch (err: any) {
       const message = getErrorMessage(err, "Could not analyze the post.");
       setError(message);
@@ -184,6 +208,9 @@ export function AISearch() {
     setRewriting(true);
     setError("");
     try {
+      const internalLinkCandidates = wpItems
+        .filter((item) => String(item.id) !== String(selectedPostId) && item.status === "publish" && item.url && item.title)
+        .map((item) => ({ id: String(item.id), type: item.type, title: item.title, url: item.url }));
       const result = await api.post<{ success: boolean; rewrite: RewriteResult }>(
         "/api/ai-search-optimization/rewrite",
         {
@@ -194,6 +221,7 @@ export function AISearch() {
           meta_title: analysis.measured.meta_title,
           meta_description: analysis.measured.meta_description,
           analysis: analysis.ai_analysis,
+          internal_link_candidates: internalLinkCandidates,
         },
       );
       setRewrite(result.rewrite);
@@ -238,8 +266,19 @@ export function AISearch() {
     setUrl(item.url);
     setRewrite(null);
     setAnalysis(null);
-    setFocusKeyword("");
-    toast.success(`${item.type === "post" ? "Post" : "Page"} selected. Enter the focus keyword and analyze.`);
+    const otherUsed = new Set(
+      wpItems
+        .filter((entry) => String(entry.id) !== id)
+        .map((entry) => normalizePhrase(entry.focus_keyword || ""))
+        .filter(Boolean),
+    );
+    const existingKeyword = item.focus_keyword?.trim() || "";
+    setFocusKeyword(existingKeyword && !otherUsed.has(normalizePhrase(existingKeyword)) ? existingKeyword : "");
+    toast.success(
+      existingKeyword && !otherUsed.has(normalizePhrase(existingKeyword))
+        ? `${item.type === "post" ? "Post" : "Page"} selected. Existing unique focus keyword loaded automatically.`
+        : `${item.type === "post" ? "Post" : "Page"} selected. The focus keyword will be selected automatically from the title/content if needed.`,
+    );
   };
 
   const applyToWordPress = async () => {
@@ -321,7 +360,8 @@ export function AISearch() {
               </div>
               <div className="space-y-2 md:col-span-2">
                 <Label htmlFor="ai-focus">Focus keyword</Label>
-                <Input id="ai-focus" value={focusKeyword} onChange={(e) => setFocusKeyword(e.target.value)} placeholder="e.g. commercial cleaning Perth" />
+                <Input id="ai-focus" value={focusKeyword} onChange={(e) => setFocusKeyword(e.target.value)} placeholder="Leave blank for automatic unused keyword selection" />
+                <p className="text-xs text-slate-500">If the keyword is already used by another loaded WordPress post/page, Boost Rankers automatically selects an unused title-derived keyword.</p>
               </div>
             </div>
             <div className="flex flex-wrap gap-3">
@@ -424,10 +464,11 @@ export function AISearch() {
             </div>
           </CardHeader>
           <CardContent className="space-y-5">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
               <MetaField label="Title" value={showOriginal ? analysis?.measured.title || "" : rewrite.title} />
               <MetaField label="Meta title" value={showOriginal ? analysis?.measured.meta_title || "" : rewrite.meta_title} />
               <MetaField label="Focus keyword" value={rewrite.focus_keyword} />
+              <MetaField label="Internal links" value={String(rewrite.internal_links_applied ?? 0)} />
             </div>
             <div><p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Meta description</p><div className="rounded-lg border border-slate-200 dark:border-slate-800 p-3 text-sm">{showOriginal ? analysis?.measured.meta_description : rewrite.meta_description}</div></div>
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 p-5 max-h-[520px] overflow-auto">
