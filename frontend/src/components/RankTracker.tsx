@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArrowDown,
@@ -86,6 +86,10 @@ interface HistoryPoint {
   checked_at: string;
   position: number | null;
   ranking_url: string | null;
+  measurement_start_date?: string | null;
+  measurement_end_date?: string | null;
+  comparison_start_date?: string | null;
+  comparison_end_date?: string | null;
 }
 
 const emptyForm = {
@@ -100,13 +104,20 @@ const emptyForm = {
 };
 
 function positionLabel(position: number | null): string {
-  if (position == null) return "—";
+  if (position == null) return "â€”";
   return position.toFixed(1);
 }
 
 function movementClass(change: number | null): string {
   if (change == null || change === 0) return "text-slate-500";
   return change > 0 ? "text-emerald-600" : "text-rose-600";
+}
+
+function movementLabel(change: number | null): string {
+  if (change == null) return "No comparison";
+  if (change > 0) return "Improved";
+  if (change < 0) return "Declined";
+  return "Unchanged";
 }
 
 export function RankTracker() {
@@ -197,7 +208,7 @@ export function RankTracker() {
       setKeywords((current) => [created, ...current]);
       setForm(emptyForm);
       setShowAdd(false);
-      toast.success("Keyword added to Rank Tracker. Checking Google Search Console now…");
+      toast.success("Keyword added to Rank Tracker. Checking Google Search Console nowâ€¦");
 
       // A newly tracked keyword has no snapshot until it is checked.
       // Run the first measurement immediately so the table does not remain
@@ -363,7 +374,7 @@ export function RankTracker() {
         </Card>
       ) : (
         <div className="space-y-2">
-          <div className="flex items-center gap-2 text-xs text-slate-500"><CheckCircle2 className="size-4 text-emerald-600" /> Measuring from <span className="font-medium text-slate-700 dark:text-slate-300">{property}</span> · GSC average position</div>
+          <div className="flex items-center gap-2 text-xs text-slate-500"><CheckCircle2 className="size-4 text-emerald-600" /> Measuring from <span className="font-medium text-slate-700 dark:text-slate-300">{property}</span> Â· GSC average position</div>
           {measurementMessage && (
             <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-400">
               {measurementMessage}
@@ -380,7 +391,7 @@ export function RankTracker() {
           ["Top 20", overview?.top_20 ?? 0],
           ["Improved", overview?.improved ?? 0],
           ["Declined", overview?.declined ?? 0],
-          ["Avg. Position", overview?.average_position ?? "—"],
+          ["Avg. Position", overview?.average_position ?? "â€”"],
         ].map(([label, value]) => (
           <Card key={String(label)} className="shadow-sm">
             <CardContent className="p-4">
@@ -401,7 +412,7 @@ export function RankTracker() {
 
       <div className="grid xl:grid-cols-[1fr_420px] gap-6">
         <Card className="shadow-sm overflow-hidden">
-          <CardHeader><CardTitle>Tracked Keywords</CardTitle><CardDescription>Current position, previous snapshot, movement and ranking URL.</CardDescription></CardHeader>
+          <CardHeader><CardTitle>Tracked Keywords</CardTitle><CardDescription>Current 90-day GSC average position compared with the preceding 90-day period.</CardDescription></CardHeader>
           <CardContent className="p-0">
             {filtered.length === 0 ? (
               <div className="p-10 text-center text-slate-500">No tracked keywords match your filters.</div>
@@ -417,10 +428,12 @@ export function RankTracker() {
                     {filtered.map((item) => (
                       <tr key={item.id} className="hover:bg-slate-50 dark:hover:bg-slate-900/50 cursor-pointer" onClick={() => void loadHistory(item.id)}>
                         <td className="px-5 py-4"><div className="font-medium">{item.keyword}</div><div className="text-xs text-slate-500 truncate max-w-[320px]">{item.target_url || "No target URL specified"}</div></td>
-                        <td className="px-4 py-4 text-slate-500">{item.client_name || "—"}</td>
+                        <td className="px-4 py-4 text-slate-500">{item.client_name || "â€”"}</td>
                         <td className="px-4 py-4 font-semibold">{positionLabel(item.current_position)}</td>
                         <td className="px-4 py-4 text-slate-500">{positionLabel(item.previous_position)}</td>
-                        <td className={`px-4 py-4 font-medium ${movementClass(item.change)}`}>{item.change == null ? "—" : <span className="inline-flex items-center gap-1">{item.change > 0 ? <ArrowUp className="size-3.5" /> : item.change < 0 ? <ArrowDown className="size-3.5" /> : null}{Math.abs(item.change).toFixed(1)}</span>}</td>
+                        <td className={`px-4 py-4 font-medium ${movementClass(item.change)}`}>
+                          {item.change == null ? "â€”" : <span className="inline-flex flex-col gap-0.5"><span className="inline-flex items-center gap-1">{item.change > 0 ? <ArrowUp className="size-3.5" /> : item.change < 0 ? <ArrowDown className="size-3.5" /> : null}{Math.abs(item.change).toFixed(1)}</span><span className="text-[10px] font-normal">{movementLabel(item.change)}</span></span>}
+                        </td>
                         <td className="px-4 py-4 text-xs text-slate-500">{item.last_checked_at ? new Date(item.last_checked_at).toLocaleDateString() : "Never"}</td>
                         <td className="px-3 py-4">
                           <div className="flex items-center gap-1">
@@ -525,3 +538,7 @@ export function RankTracker() {
     </div>
   );
 }
+
+
+
+

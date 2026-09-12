@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 import re
@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, String, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, String, func, text
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from database.database import engine
@@ -54,6 +54,11 @@ class RankTrackingSnapshot(ORMBaseModel):
     clicks: Mapped[float] = mapped_column(Float, nullable=False, default=0)
     impressions: Mapped[float] = mapped_column(Float, nullable=False, default=0)
     ctr: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    measurement_start_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    measurement_end_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    comparison_start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    comparison_end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    comparison_position: Mapped[float | None] = mapped_column(Float, nullable=True)
     source: Mapped[str] = mapped_column(String(50), nullable=False, default="google_search_console")
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="ok")
     error_message: Mapped[str | None] = mapped_column(String(1000), nullable=True)
@@ -105,17 +110,16 @@ def _company_id(current_user: User) -> str:
 
 
 def _serialize_keyword(db: Session, row: RankTrackingKeyword) -> dict[str, Any]:
-    snapshots = (
+    latest = (
         db.query(RankTrackingSnapshot)
-        .filter(RankTrackingSnapshot.keyword_id == row.id)
+        .filter(RankTrackingSnapshot.keyword_id == row.id, RankTrackingSnapshot.status == "ok")
         .order_by(RankTrackingSnapshot.checked_at.desc())
-        .limit(2)
-        .all()
+        .first()
     )
-    latest = snapshots[0] if snapshots else None
-    previous = snapshots[1] if len(snapshots) > 1 else None
     position = latest.position if latest else None
-    previous_position = previous.position if previous else None
+    # Only use an explicitly measured preceding GSC period. Legacy snapshots
+    # have no period metadata, so movement remains null until the next refresh.
+    previous_position = latest.comparison_position if latest else None
     change = round(previous_position - position, 2) if position is not None and previous_position is not None else None
     client = db.get(Client, row.client_id) if row.client_id else None
     return {
@@ -153,10 +157,17 @@ def _get_keyword(db: Session, company_id: str, keyword_id: str) -> RankTrackingK
     return row
 
 
+def _period_windows(days: int = 90) -> tuple[date, date, date, date]:
+    """Return non-overlapping current and previous GSC comparison periods."""
+    current_end = date.today() - timedelta(days=3)
+    current_start = current_end - timedelta(days=days - 1)
+    previous_end = current_start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=days - 1)
+    return current_start, current_end, previous_start, previous_end
+
+
 def _date_window(days: int = 90) -> tuple[str, str]:
-    # GSC data can lag by a few days. Exclude the most recent 3 days.
-    end = date.today() - timedelta(days=3)
-    start = end - timedelta(days=days - 1)
+    start, end, _, _ = _period_windows(days)
     return start.isoformat(), end.isoformat()
 
 
@@ -346,27 +357,63 @@ async def _refresh_keyword(db: Session, row: RankTrackingKeyword, company_id: st
         raise HTTPException(status_code=400, detail="Google Search Console is not connected. Connect it in Google Integration first.")
 
     site_url, available_sites = await _resolve_gsc_property(connection, db)
-    start_date, end_date = _date_window(90)
+    current_start, current_end, previous_start, previous_end = _period_windows(90)
+    current_start_text, current_end_text = current_start.isoformat(), current_end.isoformat()
+    previous_start_text, previous_end_text = previous_start.isoformat(), previous_end.isoformat()
     try:
-        data = await _query_gsc_keyword(
+        current_data = await _query_gsc_keyword(
             connection, db, site_url=site_url, keyword=row.keyword,
-            start_date=start_date, end_date=end_date, country=row.country,
+            start_date=current_start_text, end_date=current_end_text, country=row.country,
             device=row.device, target_url=row.target_url,
         )
-        snapshot = RankTrackingSnapshot(
-            keyword_id=row.id, checked_at=datetime.now(UTC), position=data["position"],
-            ranking_url=data["ranking_url"], clicks=data["clicks"], impressions=data["impressions"],
-            ctr=data["ctr"], source="google_search_console", status="ok",
-            error_message=None if data["position"] is not None else data["message"],
+        previous_data = await _query_gsc_keyword(
+            connection, db, site_url=site_url, keyword=row.keyword,
+            start_date=previous_start_text, end_date=previous_end_text, country=row.country,
+            device=row.device, target_url=row.target_url,
         )
-        db.add(snapshot)
+        snapshot = (
+            db.query(RankTrackingSnapshot)
+            .filter(
+                RankTrackingSnapshot.keyword_id == row.id,
+                RankTrackingSnapshot.measurement_start_date == current_start,
+                RankTrackingSnapshot.measurement_end_date == current_end,
+            )
+            .order_by(RankTrackingSnapshot.checked_at.desc())
+            .first()
+        )
+        if snapshot is None:
+            snapshot = RankTrackingSnapshot(
+                keyword_id=row.id,
+                measurement_start_date=current_start,
+                measurement_end_date=current_end,
+                comparison_start_date=previous_start,
+                comparison_end_date=previous_end,
+            )
+            db.add(snapshot)
+        snapshot.checked_at = datetime.now(UTC)
+        snapshot.position = current_data["position"]
+        snapshot.ranking_url = current_data["ranking_url"]
+        snapshot.clicks = current_data["clicks"]
+        snapshot.impressions = current_data["impressions"]
+        snapshot.ctr = current_data["ctr"]
+        snapshot.comparison_position = previous_data["position"]
+        snapshot.source = "google_search_console"
+        snapshot.status = "ok"
+        if current_data["position"] is None:
+            snapshot.error_message = current_data["message"]
+        elif previous_data["position"] is None:
+            snapshot.error_message = f"Current period matched data, but comparison period has no Search Console position: {previous_data['message']}"
+        else:
+            snapshot.error_message = None
         db.commit()
         db.refresh(snapshot)
         result = _serialize_keyword(db, row)
         result["measurement_property"] = site_url
         result["available_properties"] = available_sites
-        result["date_range"] = {"start": start_date, "end": end_date}
-        result["measurement_message"] = data["message"]
+        result["date_range"] = {"start": current_start_text, "end": current_end_text}
+        result["comparison_date_range"] = {"start": previous_start_text, "end": previous_end_text}
+        result["measurement_message"] = current_data["message"]
+        result["comparison_message"] = previous_data["message"]
         return result
     except HTTPException:
         db.rollback()
@@ -516,13 +563,18 @@ async def refresh_one_keyword(keyword_id: str, db: Session = Depends(get_db), cu
 
 @router.get("/keywords/{keyword_id}/history")
 def keyword_history(keyword_id: str, limit: int = Query(90, ge=1, le=365), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> dict[str, Any]:
-    company_id = _company_id(current_user); row = _get_keyword(db, company_id, keyword_id)
+    company_id = _company_id(current_user)
+    row = _get_keyword(db, company_id, keyword_id)
     snapshots = db.query(RankTrackingSnapshot).filter(RankTrackingSnapshot.keyword_id == row.id).order_by(RankTrackingSnapshot.checked_at.desc()).limit(limit).all()
     snapshots.reverse()
     return {"keyword": _serialize_keyword(db, row), "history": [{
         "id": item.id, "checked_at": item.checked_at.isoformat(), "position": item.position,
         "ranking_url": item.ranking_url, "clicks": item.clicks, "impressions": item.impressions,
         "ctr": item.ctr, "source": item.source, "status": item.status, "error_message": item.error_message,
+        "measurement_start_date": item.measurement_start_date.isoformat() if item.measurement_start_date else None,
+        "measurement_end_date": item.measurement_end_date.isoformat() if item.measurement_end_date else None,
+        "comparison_start_date": item.comparison_start_date.isoformat() if item.comparison_start_date else None,
+        "comparison_end_date": item.comparison_end_date.isoformat() if item.comparison_end_date else None,
     } for item in snapshots]}
 
 
@@ -530,3 +582,22 @@ def keyword_history(keyword_id: str, limit: int = Query(90, ge=1, le=365), db: S
 def ensure_rank_tracking_tables() -> None:
     RankTrackingKeyword.__table__.create(bind=engine, checkfirst=True)
     RankTrackingSnapshot.__table__.create(bind=engine, checkfirst=True)
+    # Existing installations need idempotent column creation because CREATE TABLE
+    # IF NOT EXISTS does not evolve an already-existing table.
+    with engine.begin() as connection:
+        for statement in (
+            "ALTER TABLE rank_tracking_snapshots ADD COLUMN IF NOT EXISTS measurement_start_date DATE",
+            "ALTER TABLE rank_tracking_snapshots ADD COLUMN IF NOT EXISTS measurement_end_date DATE",
+            "ALTER TABLE rank_tracking_snapshots ADD COLUMN IF NOT EXISTS comparison_start_date DATE",
+            "ALTER TABLE rank_tracking_snapshots ADD COLUMN IF NOT EXISTS comparison_end_date DATE",
+            "ALTER TABLE rank_tracking_snapshots ADD COLUMN IF NOT EXISTS comparison_position DOUBLE PRECISION",
+            "CREATE INDEX IF NOT EXISTS ix_rank_tracking_snapshots_keyword_measurement_period ON rank_tracking_snapshots (keyword_id, measurement_start_date, measurement_end_date)",
+        ):
+            connection.execute(text(statement))
+
+
+
+
+
+
+
