@@ -280,6 +280,62 @@ def _insert_contextual_links(html: str, source_url: str, candidates: list[dict[s
 
 def _extract_page(html: str, url: str, focus_keyword: str) -> dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
+
+    # Extract JSON-LD BEFORE removing script tags.
+    # This prevents valid schema from being deleted before the analyzer reads it.
+    schema_types: list[str] = []
+    json_ld_detected = False
+    faq_schema_question_count = 0
+
+    for script in soup.find_all(
+        "script",
+        attrs={"type": re.compile(r"application/ld\+json", re.I)},
+    ):
+        json_ld_detected = True
+        raw = script.string or script.get_text()
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            item = stack.pop()
+            if not isinstance(item, dict):
+                continue
+
+            typ = item.get("@type")
+            normalized_types = (
+                {str(value) for value in typ if value}
+                if isinstance(typ, list)
+                else {str(typ)} if typ else set()
+            )
+            schema_types.extend(normalized_types)
+
+            if "FAQPage" in normalized_types:
+                main_entity = item.get("mainEntity")
+                if isinstance(main_entity, list):
+                    faq_schema_question_count += sum(
+                        1
+                        for question in main_entity
+                        if isinstance(question, dict)
+                        and (
+                            str(question.get("@type") or "").lower() == "question"
+                            or bool(question.get("name"))
+                        )
+                    )
+                elif isinstance(main_entity, dict):
+                    if (
+                        str(main_entity.get("@type") or "").lower() == "question"
+                        or bool(main_entity.get("name"))
+                    ):
+                        faq_schema_question_count += 1
+
+            graph = item.get("@graph")
+            if isinstance(graph, list):
+                stack.extend(graph)
+
+    # Remove executable/presentation-only elements AFTER schema extraction.
     for tag in soup(["script", "style", "noscript", "template", "svg"]):
         tag.decompose()
 
@@ -304,26 +360,6 @@ def _extract_page(html: str, url: str, focus_keyword: str) -> dict[str, Any]:
     word_count = _word_count(text)
     first_200 = " ".join(text.split()[:200])
 
-    schema_types: list[str] = []
-    for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
-        raw = script.string or script.get_text()
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-        stack = data if isinstance(data, list) else [data]
-        while stack:
-            item = stack.pop()
-            if not isinstance(item, dict):
-                continue
-            typ = item.get("@type")
-            if isinstance(typ, list):
-                schema_types.extend(str(x) for x in typ)
-            elif typ:
-                schema_types.append(str(typ))
-            graph = item.get("@graph")
-            if isinstance(graph, list):
-                stack.extend(graph)
 
     host = urlparse(url).netloc.lower().lstrip("www.")
     internal_links = 0
@@ -387,6 +423,9 @@ def _extract_page(html: str, url: str, focus_keyword: str) -> dict[str, Any]:
         "headings": headings[:80],
         "word_count": word_count,
         "schema_types": sorted(set(schema_types)),
+        "json_ld_detected": json_ld_detected,
+        "faq_schema_present": "FAQPage" in set(schema_types),
+        "faq_schema_question_count": faq_schema_question_count,
         "internal_links": internal_links,
         "external_links": external_links,
         "focus_keyword": kw,
