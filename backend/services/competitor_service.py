@@ -601,6 +601,122 @@ class CompetitorService:
         }
 
     # =========================================================
+    # Crawl-based competitive gap analysis
+    # =========================================================
+
+    @staticmethod
+    def _ordered_tokens(value: str) -> list[str]:
+        stop_words = {
+            "about", "after", "again", "also", "and", "are", "best",
+            "between", "from", "have", "into", "more", "most", "near",
+            "only", "our", "over", "that", "the", "their", "this", "with",
+            "your", "you", "for", "how", "what", "when", "where", "why",
+            "will", "can", "per", "than", "was", "were", "who", "which",
+            "service", "services", "company", "companies", "home", "website",
+        }
+        words = re.findall(r"[a-zA-Z][a-zA-Z-]{2,}", str(value or "").lower())
+        return [word.strip("-") for word in words if word not in stop_words]
+
+    @classmethod
+    def _tokens(cls, value: str) -> set[str]:
+        return set(cls._ordered_tokens(value))
+
+    @classmethod
+    def _heading_phrases(cls, page: dict[str, Any]) -> set[str]:
+        headings: list[str] = []
+        headings.append(str(page.get("title") or ""))
+        headings.extend(str(value) for value in (page.get("h1") or [])[:3])
+        headings.extend(str(value) for value in (page.get("h2") or [])[:8])
+        phrases: set[str] = set()
+        for heading in headings:
+            words = cls._ordered_tokens(heading)
+            if not words:
+                continue
+            # Keep short, interpretable topic phrases rather than raw word clouds.
+            if len(words) <= 5:
+                phrases.add(" ".join(words))
+            for size in (2, 3):
+                for index in range(max(0, len(words) - size + 1)):
+                    phrase = " ".join(words[index:index + size])
+                    if phrase:
+                        phrases.add(phrase)
+        return phrases
+
+    @classmethod
+    def _build_crawl_comparison(
+        cls,
+        competitor_data: dict[str, Any],
+        target_data: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Compare publicly crawlable page/topic evidence only.
+
+        This is intentionally not presented as a ranking-keyword gap. A measured
+        competitor keyword gap still requires a real SEO data provider.
+        """
+        if not target_data:
+            return {
+                "status": "target_not_crawled",
+                "target_pages_crawled": 0,
+                "competitor_pages_crawled": int(competitor_data.get("pages_crawled") or 0),
+                "page_gaps": [],
+                "topic_gaps": [],
+                "target_topics": [],
+                "competitor_topics": [],
+            }
+
+        target_pages = target_data.get("pages") or []
+        competitor_pages = competitor_data.get("pages") or []
+        target_phrases: set[str] = set()
+        competitor_phrase_map: dict[str, set[str]] = {}
+        for page in target_pages:
+            target_phrases.update(cls._heading_phrases(page))
+        for page in competitor_pages:
+            competitor_phrase_map[str(page.get("url") or "")] = cls._heading_phrases(page)
+
+        target_tokens: set[str] = set()
+        for phrase in target_phrases:
+            target_tokens.update(phrase.split())
+
+        page_gaps: list[dict[str, Any]] = []
+        for page in competitor_pages:
+            url = str(page.get("url") or "")
+            title = str(page.get("title") or "")
+            h1 = str((page.get("h1") or [""])[0] or "")
+            phrases = competitor_phrase_map.get(url, set())
+            meaningful = {phrase for phrase in phrases if len(phrase.split()) >= 2}
+            uncovered = sorted(
+                [phrase for phrase in meaningful if phrase not in target_phrases],
+                key=lambda item: (-len(item.split()), item),
+            )[:6]
+            page_tokens = cls._tokens(f"{title} {h1}")
+            token_overlap = len(page_tokens & target_tokens)
+            coverage = token_overlap / max(1, len(page_tokens))
+            if uncovered and coverage < 0.65:
+                page_gaps.append({
+                    "competitor_url": url,
+                    "competitor_title": title or h1 or "Untitled page",
+                    "suggested_topics": uncovered,
+                    "reason": "Competitor page headings contain topics not represented in the target site's crawled headings.",
+                })
+
+        page_gaps = page_gaps[:20]
+
+        competitor_topics = sorted(
+            {phrase for phrases in competitor_phrase_map.values() for phrase in phrases if len(phrase.split()) >= 2}
+        )
+        topic_gaps = [phrase for phrase in competitor_topics if phrase not in target_phrases][:40]
+
+        return {
+            "status": "crawl_comparison",
+            "target_pages_crawled": len(target_pages),
+            "competitor_pages_crawled": len(competitor_pages),
+            "page_gaps": page_gaps,
+            "topic_gaps": topic_gaps,
+            "target_topics": sorted(target_phrases)[:80],
+            "competitor_topics": competitor_topics[:80],
+        }
+
+    # =========================================================
     # Robust JSON parser
     # =========================================================
 
@@ -741,13 +857,34 @@ class CompetitorService:
                         "long_tail_opportunities": string_array,
                         "intent_clusters": string_array,
                         "gap_status": {"type": "string"},
+                        "crawl_based_gaps": string_array,
                     },
                     "required": [
                         "target_terms",
                         "long_tail_opportunities",
                         "intent_clusters",
                         "gap_status",
+                        "crawl_based_gaps",
                     ],
+                },
+                "page_gap_opportunities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "competitor_url": {"type": "string"},
+                            "competitor_title": {"type": "string"},
+                            "suggested_topics": string_array,
+                            "reason": {"type": "string"},
+                        },
+                        "required": [
+                            "competitor_url",
+                            "competitor_title",
+                            "suggested_topics",
+                            "reason",
+                        ],
+                    },
                 },
                 "technical_strategy": {
                     "type": "array",
@@ -841,11 +978,14 @@ COMPETITOR
 TARGET WEBSITE
 {target_text}
 
-DIRECT WEBSITE EVIDENCE
-{json.dumps(
-    website_data,
-    ensure_ascii=False,
-)}
+COMPETITOR WEBSITE EVIDENCE
+{json.dumps(website_data.get("competitor") or {}, ensure_ascii=False)}
+
+TARGET WEBSITE EVIDENCE
+{json.dumps(website_data.get("target") or {}, ensure_ascii=False)}
+
+CRAWL-BASED COMPARISON
+{json.dumps(website_data.get("comparison") or {}, ensure_ascii=False)}
 
 Produce a professional competitive SEO strategy.
 
@@ -858,10 +998,14 @@ IMPORTANT DATA POLICY:
   provider supplied that data.
 - Use only the supplied website evidence for factual observations.
 - Clearly distinguish direct evidence from strategic inference.
-- The target website was supplied for strategic positioning, not as
-  evidence that you crawled it.
+- The target website evidence is a public crawl performed by this service;
+  do not imply access to private analytics or Search Console data.
+- Treat crawl-based topic/page gaps as content opportunities, not measured
+  ranking-keyword gaps.
 - Do not claim that a page, metric, backlink, ranking or technical
   condition was verified unless it exists in the supplied evidence.
+- Do not invent traffic, rankings, backlinks, Domain Authority, search volume,
+  keyword positions, or a provider-derived keyword-gap count.
 
 OUTPUT QUALITY:
 - Keep the executive summary concise but useful.
@@ -1111,26 +1255,52 @@ Return the requested structured object only.
             )
 
         # -----------------------------------------------------
-        # Crawl competitor
-        # -----------------------------------------------------
+        # Crawl competitor and target when supplied.
+        # Both are public website evidence only; no private SEO data is assumed.
+        competitor_website_data = await self._crawl_website(
+            competitor_domain
+        )
+        target_website_data = (
+            await self._crawl_website(normalized_target)
+            if normalized_target
+            else None
+        )
+        comparison = self._build_crawl_comparison(
+            competitor_website_data,
+            target_website_data,
+        )
+        website_data = {
+            "competitor": competitor_website_data,
+            "target": target_website_data,
+            "comparison": comparison,
+        }
 
-        website_data = (
-            await self._crawl_website(
-                competitor_domain
-            )
+        # Generate the AI strategy from both public crawls.
+        strategy = await self._generate_strategy(
+            company=company,
+            competitor_domain=competitor_domain,
+            target_domain=normalized_target,
+            website_data=website_data,
         )
 
-        # -----------------------------------------------------
-        # Generate strategy
-        # -----------------------------------------------------
-
-        strategy = (
-            await self._generate_strategy(
-                company=company,
-                competitor_domain=competitor_domain,
-                target_domain=normalized_target,
-                website_data=website_data,
-            )
+        # Keep deterministic crawl comparison visible even if AI output is conservative.
+        strategy.setdefault(
+            "page_gap_opportunities",
+            comparison.get("page_gaps", []),
+        )
+        keyword_strategy = strategy.setdefault(
+            "keyword_strategy",
+            {
+                "target_terms": [],
+                "long_tail_opportunities": [],
+                "intent_clusters": [],
+                "gap_status": "crawl_based_only",
+                "crawl_based_gaps": [],
+            },
+        )
+        keyword_strategy.setdefault(
+            "crawl_based_gaps",
+            comparison.get("topic_gaps", [])[:20],
         )
 
         # -----------------------------------------------------
@@ -1158,7 +1328,9 @@ Return the requested structured object only.
                 "domain_authority": None,
                 "keyword_gap": None,
             },
-            "website_evidence": website_data,
+            "website_evidence": competitor_website_data,
+            "target_website_evidence": target_website_data,
+            "crawl_comparison": comparison,
             "strategy": strategy,
         }
 

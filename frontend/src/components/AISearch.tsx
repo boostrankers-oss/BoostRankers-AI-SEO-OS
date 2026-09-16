@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+﻿import { useMemo, useState } from "react";
 import {
   AlertCircle,
   ArrowRight,
@@ -68,7 +68,7 @@ interface AIAnalysis {
   quick_wins: string[];
   rewrite_recommended: boolean;
   rewrite_reason: string;
-  suggested_focus_keyword: string;
+
   suggested_title: string;
   suggested_meta_title: string;
   suggested_meta_description: string;
@@ -533,3 +533,4 @@ function IssueList({ title, items, tone }: { title: string; items: string[]; ton
 function MetaField({ label, value }: { label: string; value: string }) {
   return <div><p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">{label}</p><div className="min-h-10 rounded-lg border border-slate-200 dark:border-slate-800 p-2.5 text-sm bg-white/50 dark:bg-slate-950/40">{value || "—"}</div></div>;
 }
+

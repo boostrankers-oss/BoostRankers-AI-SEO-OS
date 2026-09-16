@@ -117,17 +117,36 @@ interface WebsiteEvidence {
   metrics?: WebsiteMetrics;
 }
 
+interface PageGapOpportunity {
+  competitor_url?: string;
+  competitor_title?: string;
+  suggested_topics?: string[];
+  reason?: string;
+}
+
+interface CrawlComparison {
+  status?: string;
+  target_pages_crawled?: number;
+  competitor_pages_crawled?: number;
+  page_gaps?: PageGapOpportunity[];
+  topic_gaps?: string[];
+  target_topics?: string[];
+  competitor_topics?: string[];
+}
+
 interface Strategy {
   executive_summary?: string;
   competitive_position?: string;
   strengths?: string[];
   weaknesses?: string[];
   content_gaps?: ContentGap[];
+  page_gap_opportunities?: PageGapOpportunity[];
   keyword_strategy?: {
     target_terms?: string[];
     long_tail_opportunities?: string[];
     intent_clusters?: string[];
     gap_status?: string;
+    crawl_based_gaps?: string[];
   };
   technical_strategy?: TechnicalOpportunity[];
   local_seo_strategy?: string[];
@@ -156,6 +175,8 @@ interface CompetitorDetails {
     keyword_gap?: string | number | null;
   };
   website_evidence?: WebsiteEvidence;
+  target_website_evidence?: WebsiteEvidence;
+  crawl_comparison?: CrawlComparison;
   strategy?: Strategy;
 }
 
@@ -700,6 +721,11 @@ export function Competitors() {
                 details.verified_metrics ||
                 {};
 
+              const hasTarget = Boolean(
+                targetDomain.trim() ||
+                details.target?.domain
+              );
+
               return (
                 <Card
                   key={
@@ -834,15 +860,13 @@ export function Competitors() {
                         icon={
                           Target
                         }
-                        label="Keyword Gap"
+                        label="Keyword / Topic Gap"
                         value={
-                          targetDomain.trim()
-                            ? unavailableMetric(
-                                verified.keyword_gap ??
-                                competitor.gap,
-                                "Requires SEO data"
-                              )
-                            : "Requires target domain"
+                          details.crawl_comparison?.topic_gaps?.length
+                            ? String(details.crawl_comparison.topic_gaps.length)
+                            : hasTarget
+                              ? "No crawl gap found"
+                              : "Requires target domain"
                         }
                         color="text-rose-600"
                       />
@@ -1020,6 +1044,60 @@ export function Competitors() {
 
                         </div>
 
+
+                        {/* Crawl-based keyword/topic and page gap analysis */}
+                        {hasTarget && (
+                          <StrategySection
+                            icon={Target}
+                            title="Keyword & Page Gap Opportunities"
+                          >
+                            <div className="rounded-lg border border-indigo-200 dark:border-indigo-900/50 bg-indigo-50/60 dark:bg-indigo-500/5 p-4 mb-4">
+                              <p className="text-sm text-slate-700 dark:text-slate-300 leading-6">
+                                This comparison uses public page headings and structure from both crawled websites. It identifies content/topic opportunities. A measured ranking-keyword gap still requires a connected SEO data provider.
+                              </p>
+                            </div>
+
+                            {((details.crawl_comparison?.topic_gaps?.length || 0) > 0 || (strategy.keyword_strategy?.crawl_based_gaps?.length || 0) > 0) && (
+                              <div className="rounded-lg bg-slate-50 dark:bg-slate-900 p-4 mb-4">
+                                <p className="font-medium text-sm mb-3">Topics found on the competitor but not represented in the target crawl</p>
+                                <div className="flex flex-wrap gap-2">
+                                  {(strategy.keyword_strategy?.crawl_based_gaps?.length ? strategy.keyword_strategy.crawl_based_gaps : details.crawl_comparison?.topic_gaps || []).slice(0, 30).map((item, index) => (
+                                    <Badge key={`${item}-${index}`} variant="outline">{item}</Badge>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            {((strategy.page_gap_opportunities?.length || 0) > 0 || (details.crawl_comparison?.page_gaps?.length || 0) > 0) && (
+                              <div className="space-y-3">
+                                <p className="font-medium text-sm">Competitor pages worth reviewing</p>
+                                {(strategy.page_gap_opportunities?.length ? strategy.page_gap_opportunities : details.crawl_comparison?.page_gaps || []).slice(0, 20).map((item, index) => (
+                                  <div key={`${item.competitor_url}-${index}`} className="rounded-lg border border-slate-200 dark:border-slate-800 p-4">
+                                    <div className="flex items-start justify-between gap-3">
+                                      <div className="min-w-0">
+                                        <p className="font-medium text-sm">{item.competitor_title || "Competitor page"}</p>
+                                        <p className="text-xs text-slate-500 mt-1 break-all">{item.competitor_url}</p>
+                                      </div>
+                                      <Badge variant="outline">Gap</Badge>
+                                    </div>
+                                    {item.suggested_topics?.length ? (
+                                      <div className="flex flex-wrap gap-2 mt-3">
+                                        {item.suggested_topics.slice(0, 6).map((topic, topicIndex) => (
+                                          <Badge key={`${topic}-${topicIndex}`} variant="secondary">{topic}</Badge>
+                                        ))}
+                                      </div>
+                                    ) : null}
+                                    {item.reason && <p className="text-xs text-slate-500 mt-3">{item.reason}</p>}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            {!(details.crawl_comparison?.topic_gaps?.length || details.crawl_comparison?.page_gaps?.length || strategy.keyword_strategy?.crawl_based_gaps?.length || strategy.page_gap_opportunities?.length) && (
+                              <p className="text-sm text-slate-500">No crawl-based content/topic gap was detected in the sampled pages.</p>
+                            )}
+                          </StrategySection>
+                        )}
 
                         {/* Content gaps */}
 
