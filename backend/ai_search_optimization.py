@@ -709,6 +709,46 @@ Scores are 0-100 and must be grounded in the evidence.
     return {"success": True, "measured": measured, "ai_analysis": ai}
 
 
+def _select_single_internal_link_candidate(
+    source_url: str,
+    title: str,
+    content: str,
+    focus_keyword: str,
+    candidates: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Select at most one verified, non-self WordPress target for the rewritten article."""
+    source_key = _canonical_url(source_url)
+    source_terms = set(re.findall(r"[a-z0-9]+", _normalize_phrase(f"{title} {focus_keyword}")))
+    scored: list[tuple[int, dict[str, str]]] = []
+    for candidate in candidates:
+        url = str(candidate.get("url") or "").strip()
+        target_title = str(candidate.get("title") or "").strip()
+        if not url or not target_title:
+            continue
+        if _canonical_url(url, source_url) == source_key:
+            continue
+        target_terms = set(re.findall(r"[a-z0-9]+", _normalize_phrase(target_title)))
+        overlap = len(source_terms & target_terms)
+        score = overlap * 10
+        if str(candidate.get("type") or "").lower() == "page":
+            score += 3
+        if _normalize_phrase(focus_keyword) and _normalize_phrase(focus_keyword) in _normalize_phrase(target_title):
+            score += 8
+        scored.append((
+            score,
+            {
+                "id": str(candidate.get("id") or ""),
+                "type": str(candidate.get("type") or ""),
+                "title": target_title,
+                "url": url,
+            },
+        ))
+    if not scored:
+        return []
+    scored.sort(key=lambda item: (-item[0], item[1]["type"] != "page", len(item[1]["title"])))
+    return [scored[0][1]]
+
+
 @router.post("/rewrite")
 async def rewrite_post(
     data: RewriteRequest,
@@ -718,15 +758,30 @@ async def rewrite_post(
     company_id = _require_company(current_user)
     api_key = _resolve_anthropic_api_key(db, company_id)
     source_text = _strip_html(data.content_html)
-    if _word_count(source_text) < 100:
+    source_word_count = _word_count(source_text)
+    if source_word_count < 100:
         raise HTTPException(status_code=400, detail="The post needs at least 100 readable words before AI rewriting.")
-    system = """You are a senior SEO content editor specializing in AI search and answer-engine optimization. Rewrite the supplied article without inventing business facts, statistics, credentials, locations, prices, awards, reviews, or guarantees. Preserve supported facts. Improve clarity, topical completeness, passage-level answers, entity clarity, headings, internal coherence, and natural focus-keyword usage. Do not keyword-stuff. Return only valid JSON."""
+
+    chosen_keyword, keyword_conflict = _choose_focus_keyword(
+        data.title,
+        source_text,
+        data.focus_keyword,
+        [str(x).strip() for x in data.used_focus_keywords if str(x).strip()],
+    )
+    target_candidates = _select_single_internal_link_candidate(
+        str(data.url), data.title, source_text, chosen_keyword, data.internal_link_candidates
+    )
+
+    system = """You are a senior SEO content editor specializing in helpful content and AI search / answer-engine optimization. Rewrite the supplied article without inventing business facts, statistics, credentials, locations, prices, awards, reviews, or guarantees. Preserve supported facts and the article's real subject. Improve clarity, topical completeness, passage-level answers, entity clarity, headings, internal coherence, and natural focus-keyword usage. Do not keyword-stuff. The rewritten article must remain about the same existing blog topic, not become a new page or a different service. Return only valid JSON."""
+
     prompt = f"""
 Original URL: {data.url}
 Current title: {data.title}
-Focus keyword: {data.focus_keyword}
+Focus keyword selected for this rewrite: {chosen_keyword}
+Focus keyword conflict detected: {keyword_conflict}
 Current meta title: {data.meta_title}
 Current meta description: {data.meta_description}
+Source word count: {source_word_count}
 
 Existing analysis:
 {json.dumps(data.analysis, indent=2)}
@@ -734,13 +789,13 @@ Existing analysis:
 Original article:
 {source_text[:28000]}
 
-Verified internal-link candidates from the connected WordPress site:
-{json.dumps(data.internal_link_candidates[:100], ensure_ascii=False, indent=2)}
+Exactly one verified internal-link target may be used:
+{json.dumps(target_candidates, ensure_ascii=False, indent=2)}
 
 Return ONLY:
 {{
   "title": "",
-  "focus_keyword": "{data.focus_keyword}",
+  "focus_keyword": "{chosen_keyword}",
   "meta_title": "",
   "meta_description": "",
   "article_html": "",
@@ -750,32 +805,70 @@ Return ONLY:
 }}
 
 Rules:
-- Keep the focus keyword exactly as supplied: {data.focus_keyword}
-- Use it naturally in the title/H1, opening section, one relevant subheading where natural, and body.
-- Never force it into every heading or sentence.
-- Replace the current title with a high-engagement, specific, benefit-led title that accurately matches the article intent. Do not use clickbait.
-- Meta title should be concise, compelling, accurate, and contain the exact focus keyword naturally.
+- Use exactly this focus keyword: {chosen_keyword}. Do not switch to a different keyword.
+- This focus keyword must not duplicate any keyword in the supplied used-focus-keyword list.
+- Use the focus keyword naturally in the title/H1, opening section, one relevant subheading where natural, and body. Never force it into every heading or sentence.
+- Preserve the existing blog's search intent, subject, supported facts, service/topic scope, and useful details. Do not turn the article into a landing page or a different article.
+- Improve the title with a specific, benefit-led angle without clickbait.
+- Meta title should be concise, accurate, and contain the exact focus keyword naturally.
 - Meta description should be approximately 140-160 characters, accurate, and contain the exact focus keyword naturally.
-- Produce clean WordPress-compatible HTML using h2/h3, p, ul/ol, and strong where useful.
-- Add up to {MAX_INTERNAL_LINKS} contextual internal links ONLY to the verified WordPress candidates supplied above. Never invent URLs, never link to the current page, never use generic anchors, and never place links inside headings, existing links, code, pre, scripts, or styles.
-- If a candidate is not contextually relevant, do not force a link.
+- Produce complete WordPress-compatible HTML using h2/h3, p, ul/ol, and strong where useful.
+- Do not shorten the article. Target at least {max(source_word_count, 1200)} readable words when the source supports expansion; preserve all useful existing information while adding genuinely useful explanations, examples, steps, FAQs, or decision guidance relevant to the existing topic.
+- Do not pad with generic filler. Every added section must answer a real user need related to the existing article.
+- Add one contextual internal link to the single verified target supplied above when the target is relevant. Use a natural descriptive anchor, never a generic anchor. Do not add any other new internal-link targets. Never invent URLs. Never link to the current page.
+- Keep the existing blog as the destination being optimized; do not create or imply a new page.
 - Do not output markdown.
 - Do not invent unsupported facts.
 """
-    rewrite = await _claude_json(system, prompt, api_key=api_key, max_tokens=10000)
-    rewrite["focus_keyword"] = data.focus_keyword
+
+    rewrite = await _claude_json(system, prompt, api_key=api_key, max_tokens=14000)
+    rewrite["focus_keyword"] = chosen_keyword
     article_html = str(rewrite.get("article_html") or "")
-    article_html, verified_count, linked_targets = _sanitize_internal_links(article_html, str(data.url), data.internal_link_candidates)
-    article_html, inserted_count, inserted_targets = _insert_contextual_links(
-        article_html, str(data.url), data.internal_link_candidates, verified_count
+
+    if _word_count(_strip_html(article_html)) < max(100, int(source_word_count * 0.9)):
+        expand_prompt = f"""Expand the supplied rewritten WordPress article without changing its subject, facts, focus keyword, or title intent. The current article is too short. Return only JSON with the same fields.
+Focus keyword: {chosen_keyword}
+Minimum readable word count: {max(source_word_count, 1200)}
+Current article HTML:
+{article_html[:50000]}
+Add useful, specific sections, explanations, steps, FAQs, comparisons, or practical guidance only when supported by the existing article topic. Do not invent business facts. Keep exactly one internal-link target if already present.
+"""
+        expanded = await _claude_json(system, expand_prompt, api_key=api_key, max_tokens=14000)
+        expanded_html = str(expanded.get("article_html") or "")
+        if _word_count(_strip_html(expanded_html)) > _word_count(_strip_html(article_html)):
+            rewrite = expanded
+            rewrite["focus_keyword"] = chosen_keyword
+            article_html = expanded_html
+
+    article_html, verified_count, linked_targets = _sanitize_internal_links(
+        article_html, str(data.url), target_candidates
     )
+    article_html, inserted_count, inserted_targets = _insert_contextual_links(
+        article_html, str(data.url), target_candidates, verified_count
+    )
+
     rewrite["article_html"] = article_html
-    rewrite["internal_links_applied"] = verified_count + inserted_count
-    rewrite["internal_link_targets"] = (linked_targets + inserted_targets)[:MAX_INTERNAL_LINKS]
+    rewrite["focus_keyword"] = chosen_keyword
+    rewrite["internal_links_applied"] = min(1, verified_count + inserted_count)
+    rewrite["internal_link_targets"] = (linked_targets + inserted_targets)[:1]
+    rewrite["meta_title"] = str(
+        rewrite.get("meta_title") or rewrite.get("title") or data.title
+    ).strip()[:500]
+
+    meta_description = str(rewrite.get("meta_description") or "").strip()
+    if not meta_description:
+        meta_description = _safe_excerpt(_strip_html(article_html), 160)
+    rewrite["meta_description"] = meta_description[:1000]
+
+    if keyword_conflict:
+        rewrite.setdefault("change_summary", []).append(
+            f"Replaced the requested focus keyword with the unused keyword: {chosen_keyword}."
+        )
     if rewrite["internal_links_applied"]:
         rewrite.setdefault("change_summary", []).append(
-            f"Added {rewrite['internal_links_applied']} contextual internal link(s) using verified WordPress content."
+            "Added one contextual internal link to a verified WordPress target page/post."
         )
+
     return {"success": True, "rewrite": rewrite}
 
 
@@ -784,44 +877,75 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
     _require_company(current_user)
     site = _clean_url(str(data.wordpress_site))
     auth = (data.wordpress_username.strip(), data.wordpress_application_password.strip())
-    async with httpx.AsyncClient(timeout=WP_TIMEOUT, follow_redirects=True) as client:
-        me = await client.get(f"{site}/wp-json/wp/v2/users/me", params={"context": "edit"}, auth=auth)
-        if me.status_code >= 400:
-            raise HTTPException(status_code=401, detail="WordPress authentication failed. Use a WordPress Application Password.")
-        items: list[dict[str, Any]] = []
-        for content_type in ("posts", "pages"):
-            response = await client.get(
-                f"{site}/wp-json/wp/v2/{content_type}",
-                params={"per_page": 50, "page": 1, "context": "edit", "orderby": "modified", "order": "desc", "_fields": "id,link,title,status,modified,content,excerpt"},
-                auth=auth,
-            )
-            if response.status_code >= 400:
-                continue
-            try:
-                rows = response.json()
-            except Exception:
-                continue
-            if not isinstance(rows, list):
-                continue
-            for row in rows:
-                title = str((row.get("title") or {}).get("rendered") or "").strip()
-                if not title:
-                    continue
-                items.append({
-                    "id": int(row["id"]),
-                    "type": "post" if content_type == "posts" else "page",
-                    "title": title,
-                    "url": str(row.get("link") or ""),
-                    "status": str(row.get("status") or ""),
-                    "modified": str(row.get("modified") or ""),
-                    "content_html": str((row.get("content") or {}).get("rendered") or ""),
-                    "excerpt": str((row.get("excerpt") or {}).get("rendered") or ""),
-                    "focus_keyword": "",
-                })
 
-        # Read existing focus keyphrases only when the verified SEO Bridge is available.
-        # Fail-soft so loading WordPress content remains usable if the bridge is absent.
-        bridge = await client.get(f"{site}/wp-json/boost-rankers/v1/seo-meta/status", auth=auth)
+    async with httpx.AsyncClient(timeout=WP_TIMEOUT, follow_redirects=True) as client:
+        me = await client.get(
+            f"{site}/wp-json/wp/v2/users/me",
+            params={"context": "edit"},
+            auth=auth,
+        )
+        if me.status_code >= 400:
+            raise HTTPException(
+                status_code=401,
+                detail="WordPress authentication failed. Use a WordPress Application Password.",
+            )
+
+        items: list[dict[str, Any]] = []
+        max_items = 1000
+
+        for content_type in ("posts", "pages"):
+            page_num = 1
+            while len(items) < max_items:
+                response = await client.get(
+                    f"{site}/wp-json/wp/v2/{content_type}",
+                    params={
+                        "per_page": 100,
+                        "page": page_num,
+                        "context": "edit",
+                        "orderby": "modified",
+                        "order": "desc",
+                        "_fields": "id,link,title,status,modified,content,excerpt",
+                    },
+                    auth=auth,
+                )
+                if response.status_code >= 400:
+                    break
+                try:
+                    rows = response.json()
+                except Exception:
+                    break
+                if not isinstance(rows, list) or not rows:
+                    break
+
+                for row in rows:
+                    title = str((row.get("title") or {}).get("rendered") or "").strip()
+                    if not title:
+                        continue
+                    items.append(
+                        {
+                            "id": int(row["id"]),
+                            "type": "post" if content_type == "posts" else "page",
+                            "title": title,
+                            "url": str(row.get("link") or ""),
+                            "status": str(row.get("status") or ""),
+                            "modified": str(row.get("modified") or ""),
+                            "content_html": str((row.get("content") or {}).get("rendered") or ""),
+                            "excerpt": str((row.get("excerpt") or {}).get("rendered") or ""),
+                            "focus_keyword": "",
+                        }
+                    )
+                    if len(items) >= max_items:
+                        break
+
+                total_pages = int(response.headers.get("X-WP-TotalPages", "0") or 0)
+                if len(rows) < 100 or (total_pages and page_num >= total_pages):
+                    break
+                page_num += 1
+
+        bridge = await client.get(
+            f"{site}/wp-json/boost-rankers/v1/seo-meta/status",
+            auth=auth,
+        )
         if bridge.status_code == 200:
             semaphore = asyncio.Semaphore(10)
 
@@ -835,7 +959,11 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                         if meta.status_code >= 400:
                             return
                         payload = meta.json()
-                        value = payload.get("focus_keyword") or payload.get("focuskw") or payload.get("_yoast_wpseo_focuskw")
+                        value = (
+                            payload.get("focus_keyword")
+                            or payload.get("focuskw")
+                            or payload.get("_yoast_wpseo_focuskw")
+                        )
                         if isinstance(value, str):
                             item["focus_keyword"] = " ".join(value.split())
                     except Exception:

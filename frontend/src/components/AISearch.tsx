@@ -118,6 +118,29 @@ function normalizePhrase(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
 }
 
+function canonicalUrl(value: string) {
+  try {
+    const parsed = new URL(value);
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, "") || "/"}`.toLowerCase();
+  } catch {
+    return value.trim().replace(/\/+$/, "").toLowerCase();
+  }
+}
+
+function chooseTargetPage(items: WPItem[], sourceId: string, sourceUrl: string, focusKeyword: string, title: string) {
+  const sourceKey = canonicalUrl(sourceUrl);
+  const sourceTerms = new Set(normalizePhrase(`${focusKeyword} ${title}`).split(" " ).filter(Boolean));
+  return items
+    .filter((item) => String(item.id) !== String(sourceId) && item.status === "publish" && item.url && item.title && canonicalUrl(item.url) !== sourceKey)
+    .map((item) => {
+      const terms = new Set(normalizePhrase(item.title).split(" " ).filter(Boolean));
+      const overlap = [...sourceTerms].filter((term) => terms.has(term)).length;
+      return { item, score: overlap * 10 + (item.type === "page" ? 3 : 0) };
+    })
+    .sort((a, b) => b.score - a.score || (a.item.type === "page" ? -1 : 1) || a.item.title.length - b.item.title.length)[0]?.item || null;
+}
+
+
 export function AISearch() {
   const [url, setUrl] = useState("");
   const [focusKeyword, setFocusKeyword] = useState("");
@@ -133,6 +156,7 @@ export function AISearch() {
   const [wpPassword, setWpPassword] = useState("");
   const [wpItems, setWpItems] = useState<WPItem[]>([]);
   const [selectedPostId, setSelectedPostId] = useState("");
+  const [selectedTargetPage, setSelectedTargetPage] = useState<WPItem | null>(null);
   const [loadingWp, setLoadingWp] = useState(false);
   const [applying, setApplying] = useState(false);
   const [wpStatus, setWpStatus] = useState<"draft" | "publish">("draft");
@@ -205,27 +229,75 @@ export function AISearch() {
       toast.error("Analyze the post and provide a focus keyword first.");
       return;
     }
+    if (!wpSite || !wpUsername || !wpPassword) {
+      toast.error("Enter the WordPress site, username and Application Password first.");
+      return;
+    }
+
     setRewriting(true);
     setError("");
+
     try {
-      const internalLinkCandidates = wpItems
-        .filter((item) => String(item.id) !== String(selectedPostId) && item.status === "publish" && item.url && item.title)
-        .map((item) => ({ id: String(item.id), type: item.type, title: item.title, url: item.url }));
+      let items = wpItems;
+      if (!items.length) {
+        const result = await api.post<{ success: boolean; items: WPItem[] }>(
+          "/api/ai-search-optimization/wordpress/content",
+          {
+            wordpress_site: wpSite.trim(),
+            wordpress_username: wpUsername.trim(),
+            wordpress_application_password: wpPassword.trim(),
+          },
+        );
+        items = result.items || [];
+        setWpItems(items);
+      }
+
+      const current = items.find(
+        (item) => canonicalUrl(item.url) === canonicalUrl(analysis.measured.url),
+      );
+      if (current && String(current.id) !== String(selectedPostId)) {
+        setSelectedPostId(String(current.id));
+      }
+
+      const sourceId = String(current?.id || selectedPostId);
+      const target = chooseTargetPage(
+        items,
+        sourceId,
+        analysis.measured.url,
+        focusKeyword.trim(),
+        analysis.measured.title,
+      );
+      setSelectedTargetPage(target);
+
+      const usedFocusKeywords = items
+        .filter((item) => String(item.id) !== sourceId)
+        .map((item) => item.focus_keyword?.trim() || "")
+        .filter(Boolean);
+
       const result = await api.post<{ success: boolean; rewrite: RewriteResult }>(
         "/api/ai-search-optimization/rewrite",
         {
           url: analysis.measured.url,
           focus_keyword: focusKeyword.trim(),
+          used_focus_keywords: usedFocusKeywords,
           title: analysis.measured.title || "Optimized article",
           content_html: analysis.measured.content_html,
           meta_title: analysis.measured.meta_title,
           meta_description: analysis.measured.meta_description,
           analysis: analysis.ai_analysis,
-          internal_link_candidates: internalLinkCandidates,
+          internal_link_candidates: target
+            ? [{ id: String(target.id), type: target.type, title: target.title, url: target.url }]
+            : [],
         },
       );
+
+      setFocusKeyword(result.rewrite.focus_keyword || focusKeyword.trim());
       setRewrite(result.rewrite);
-      toast.success("The article has been rewritten and optimized for review.");
+      toast.success(
+        target
+          ? `Article optimized. One verified target ${target.type === "page" ? "page" : "post"} was selected automatically.`
+          : "Article optimized. No unrelated internal link was forced.",
+      );
     } catch (err: any) {
       const message = getErrorMessage(err, "Could not rewrite the post.");
       setError(message);
@@ -250,8 +322,40 @@ export function AISearch() {
           wordpress_application_password: wpPassword.trim(),
         },
       );
-      setWpItems(result.items || []);
-      toast.success(`${result.items?.length || 0} WordPress items loaded.`);
+      const items = result.items || [];
+      setWpItems(items);
+
+      const matched = url.trim()
+        ? items.find((item) => canonicalUrl(item.url) === canonicalUrl(url.trim()))
+        : undefined;
+
+      if (matched) {
+        setSelectedPostId(String(matched.id));
+        const otherUsed = new Set(
+          items
+            .filter((entry) => String(entry.id) !== String(matched.id))
+            .map((entry) => normalizePhrase(entry.focus_keyword || ""))
+            .filter(Boolean),
+        );
+        const existingKeyword = matched.focus_keyword?.trim() || "";
+        setFocusKeyword(
+          existingKeyword && !otherUsed.has(normalizePhrase(existingKeyword))
+            ? existingKeyword
+            : "",
+        );
+        setSelectedTargetPage(
+          chooseTargetPage(
+            items,
+            String(matched.id),
+            matched.url,
+            existingKeyword || focusKeyword.trim(),
+            matched.title,
+          ),
+        );
+        toast.success(`Loaded ${items.length} WordPress items and matched the current post automatically.`);
+      } else {
+        toast.success(`${items.length} WordPress items loaded.`);
+      }
     } catch (err: any) {
       toast.error(getErrorMessage(err, "Could not load WordPress content."));
     } finally {
@@ -273,7 +377,12 @@ export function AISearch() {
         .filter(Boolean),
     );
     const existingKeyword = item.focus_keyword?.trim() || "";
-    setFocusKeyword(existingKeyword && !otherUsed.has(normalizePhrase(existingKeyword)) ? existingKeyword : "");
+    setFocusKeyword(
+      existingKeyword && !otherUsed.has(normalizePhrase(existingKeyword))
+        ? existingKeyword
+        : "",
+    );
+    setSelectedTargetPage(chooseTargetPage(wpItems, id, item.url, existingKeyword, item.title));
     toast.success(
       existingKeyword && !otherUsed.has(normalizePhrase(existingKeyword))
         ? `${item.type === "post" ? "Post" : "Page"} selected. Existing unique focus keyword loaded automatically.`
@@ -281,13 +390,19 @@ export function AISearch() {
     );
   };
 
+
   const applyToWordPress = async () => {
     if (!rewrite) {
       toast.error("Rewrite the article first so the optimized version can be reviewed.");
       return;
     }
-    if (!wpSite || !wpUsername || !wpPassword || !selectedPostId) {
-      toast.error("Load WordPress content and select a post or page first.");
+    if (!wpSite || !wpUsername || !wpPassword) {
+      toast.error("Enter the WordPress site, username and Application Password first.");
+      return;
+    }
+    const matchedId = selectedPostId || wpItems.find((item) => canonicalUrl(item.url) === canonicalUrl(analysis?.measured.url || url))?.id?.toString() || "";
+    if (!matchedId) {
+      toast.error("Load Posts & Pages first so Boost Rankers can match the existing WordPress post automatically.");
       return;
     }
     setApplying(true);
@@ -296,7 +411,7 @@ export function AISearch() {
         wordpress_site: wpSite.trim(),
         wordpress_username: wpUsername.trim(),
         wordpress_application_password: wpPassword.trim(),
-        post_id: Number(selectedPostId),
+        post_id: Number(matchedId),
         title: activeTitle,
         content_html: activeHtml,
         meta_title: activeMetaTitle,
@@ -471,6 +586,12 @@ export function AISearch() {
               <MetaField label="Internal links" value={String(rewrite.internal_links_applied ?? 0)} />
             </div>
             <div><p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Meta description</p><div className="rounded-lg border border-slate-200 dark:border-slate-800 p-3 text-sm">{showOriginal ? analysis?.measured.meta_description : rewrite.meta_description}</div></div>
+            {selectedTargetPage && !showOriginal && (
+              <div className="rounded-lg border border-indigo-200 dark:border-indigo-900/50 bg-indigo-50/50 dark:bg-indigo-500/5 p-3 text-sm">
+                <span className="font-semibold">Verified target page:</span> {selectedTargetPage.title}
+                <span className="text-slate-500 dark:text-slate-400"> â€” one contextual link will be used; the current blog remains the destination being optimized.</span>
+              </div>
+            )}
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 p-5 max-h-[520px] overflow-auto">
               {showOriginal ? <div className="prose prose-sm dark:prose-invert max-w-none" dangerouslySetInnerHTML={{ __html: analysis?.measured.content_html || "" }} /> : <div className="prose prose-sm dark:prose-invert max-w-none" dangerouslySetInnerHTML={{ __html: rewrite.article_html }} />}
             </div>
