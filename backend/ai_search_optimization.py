@@ -54,6 +54,7 @@ class RewriteRequest(BaseModel):
     meta_title: str = Field(default="", max_length=500)
     meta_description: str = Field(default="", max_length=1000)
     analysis: dict[str, Any] = Field(default_factory=dict)
+    used_focus_keywords: list[str] = Field(default_factory=list, max_length=500)
     internal_link_candidates: list[dict[str, str]] = Field(default_factory=list, max_length=100)
 
 
@@ -1032,4 +1033,5 @@ async def apply_to_wordpress(data: WordPressApplyRequest, current_user: User = D
                 "status": data.status,
             },
         }
+
 
