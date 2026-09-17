@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import ipaddress
@@ -1032,3 +1032,4 @@ async def apply_to_wordpress(data: WordPressApplyRequest, current_user: User = D
                 "status": data.status,
             },
         }
+
