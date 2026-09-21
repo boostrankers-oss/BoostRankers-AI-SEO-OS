@@ -32,24 +32,27 @@ from services.secret_service import decrypt_secret
 
 class _PageParser(HTMLParser):
     """
-    Lightweight HTML parser used to extract:
-
-    - page title
+    Lightweight HTML parser used to extract evidence for internal-linking
+    decisions:
+    - title
+    - H1/H2/H3 headings
+    - meta title/description
     - visible text
     - internal hrefs
     """
 
     def __init__(self) -> None:
-        super().__init__(
-            convert_charrefs=True,
-        )
+        super().__init__(convert_charrefs=True)
 
         self.title_parts: list[str] = []
+        self.heading_parts: list[str] = []
         self.text_parts: list[str] = []
         self.links: list[str] = []
+        self.meta: dict[str, str] = {}
 
         self._inside_title = False
-        self._skip_text = False
+        self._inside_heading = False
+        self._skip_depth = 0
 
     def handle_starttag(
         self,
@@ -57,22 +60,35 @@ class _PageParser(HTMLParser):
         attrs: list[tuple[str, str | None]],
     ) -> None:
         tag_lower = tag.lower()
+        attributes = {
+            str(key).lower(): value
+            for key, value in attrs
+        }
 
         if tag_lower == "title":
             self._inside_title = True
 
-        if tag_lower in {
-            "script",
-            "style",
-            "noscript",
-            "svg",
-        }:
-            self._skip_text = True
+        if tag_lower in {"h1", "h2", "h3"}:
+            self._inside_heading = True
+
+        if tag_lower in {"script", "style", "noscript", "svg", "template"}:
+            self._skip_depth += 1
+
+        if tag_lower == "meta":
+            name = str(
+                attributes.get("name")
+                or attributes.get("property")
+                or ""
+            ).strip().lower()
+            content = str(
+                attributes.get("content")
+                or ""
+            ).strip()
+            if name and content:
+                self.meta[name] = content
 
         if tag_lower == "a":
-            attributes = dict(attrs)
             href = attributes.get("href")
-
             if href:
                 self.links.append(href.strip())
 
@@ -82,24 +98,24 @@ class _PageParser(HTMLParser):
         if tag_lower == "title":
             self._inside_title = False
 
-        if tag_lower in {
-            "script",
-            "style",
-            "noscript",
-            "svg",
-        }:
-            self._skip_text = False
+        if tag_lower in {"h1", "h2", "h3"}:
+            self._inside_heading = False
+
+        if tag_lower in {"script", "style", "noscript", "svg", "template"}:
+            self._skip_depth = max(0, self._skip_depth - 1)
 
     def handle_data(self, data: str) -> None:
         value = data.strip()
-
         if not value:
             return
 
         if self._inside_title:
             self.title_parts.append(value)
 
-        if not self._skip_text:
+        if self._inside_heading:
+            self.heading_parts.append(value)
+
+        if self._skip_depth == 0:
             self.text_parts.append(value)
 
     @property
@@ -107,15 +123,13 @@ class _PageParser(HTMLParser):
         return " ".join(self.title_parts).strip()
 
     @property
+    def headings(self) -> str:
+        return " ".join(self.heading_parts).strip()
+
+    @property
     def text(self) -> str:
         text = " ".join(self.text_parts)
-
-        text = re.sub(
-            r"\s+",
-            " ",
-            text,
-        )
-
+        text = re.sub(r"\s+", " ", text)
         return text.strip()
 
 
@@ -127,6 +141,7 @@ class _PageParser(HTMLParser):
 class InternalLinkingService:
     def __init__(self, db: Session):
         self.db = db
+        self._last_source_pages: list[dict[str, Any]] = []
 
     # ========================================================
     # ANTHROPIC API KEY
@@ -533,7 +548,19 @@ class InternalLinkingService:
                 return {
                     "url": final_url,
                     "title": parser.title,
-                    "text": parser.text[:12000],
+                    "headings": parser.headings[:4000],
+                    "meta_title": parser.title[:500],
+                    "meta_description": (
+                        parser.meta.get("description")
+                        or parser.meta.get("og:description")
+                        or ""
+                    )[:1000],
+                    "focus_keyword": (
+                        parser.meta.get("keywords")
+                        or parser.meta.get("article:section")
+                        or ""
+                    )[:300],
+                    "text": parser.text[:16000],
                     "links": internal_links[:100],
                     "error": None,
                 }
@@ -696,6 +723,216 @@ class InternalLinkingService:
         return []
 
     # ========================================================
+    # SEMANTIC / TARGET EVIDENCE HELPERS
+    # ========================================================
+
+    _STOPWORDS = {
+        "about", "after", "again", "also", "because", "being", "between",
+        "could", "from", "have", "into", "more", "most", "other", "over",
+        "same", "should", "some", "such", "than", "that", "their", "there",
+        "these", "they", "this", "those", "through", "under", "using",
+        "very", "what", "when", "where", "which", "while", "with", "would",
+        "your", "you", "our", "for", "and", "the", "are", "was", "were",
+        "will", "not", "but", "can", "all", "any", "its", "has", "had",
+        "how", "why", "who", "per", "www", "com", "https",
+    }
+
+    @classmethod
+    def _tokens(cls, value: str) -> set[str]:
+        words = re.findall(r"[a-z0-9]{3,}", str(value or "").lower())
+        return {
+            word
+            for word in words
+            if word not in cls._STOPWORDS
+        }
+
+    @classmethod
+    def _intent(cls, page: dict[str, Any]) -> str:
+        combined = " ".join(
+            [
+                str(page.get("title") or ""),
+                str(page.get("headings") or ""),
+                str(page.get("text") or "")[:5000],
+                str(page.get("url") or ""),
+            ]
+        ).lower()
+
+        if any(term in combined for term in (
+            "quote", "book", "booking", "contact us", "get a quote",
+            "request a quote", "enquire", "enquiry",
+        )):
+            return "transactional"
+
+        if any(term in combined for term in (
+            "price", "pricing", "cost", "how much", "compare",
+            "comparison", "best ", "choose", "review",
+        )):
+            return "commercial"
+
+        if "/blog/" in str(page.get("url") or "").lower():
+            return "informational"
+
+        if any(term in combined for term in (
+            "how to", "guide", "tips", "checklist", "explained",
+            "what is", "why ", "when to",
+        )):
+            return "informational"
+
+        return "commercial" if any(term in combined for term in (
+            "service", "services", "professional", "cleaning",
+            "solution", "solutions",
+        )) else "navigational"
+
+    @classmethod
+    def _infer_target_type(cls, page: dict[str, Any]) -> str:
+        """
+        Public-site evidence only. A WordPress REST result should be used
+        when available; otherwise this is explicitly marked as an inference.
+        """
+        url = str(page.get("url") or "").lower()
+        if "/blog/" in url:
+            return "post"
+        return "page"
+
+    @classmethod
+    def _semantic_overlap(
+        cls,
+        source: dict[str, Any],
+        target: dict[str, Any],
+    ) -> float:
+        source_tokens = cls._tokens(
+            " ".join(
+                [
+                    str(source.get("title") or ""),
+                    str(source.get("headings") or ""),
+                    str(source.get("text") or "")[:9000],
+                ]
+            )
+        )
+        target_title = cls._tokens(
+            " ".join(
+                [
+                    str(target.get("title") or ""),
+                    str(target.get("headings") or ""),
+                ]
+            )
+        )
+        target_body = cls._tokens(
+            str(target.get("text") or "")[:9000]
+        )
+
+        if not source_tokens or not target_title:
+            return 0.0
+
+        title_overlap = len(source_tokens & target_title) / max(
+            1,
+            len(target_title),
+        )
+        body_overlap = len(source_tokens & target_body) / max(
+            1,
+            len(target_body),
+        )
+
+        # Title/headings are deliberately weighted more heavily than
+        # incidental body-word overlap.
+        return min(
+            1.0,
+            (title_overlap * 0.70) + (body_overlap * 0.30),
+        )
+
+    @classmethod
+    def _location_overlap(
+        cls,
+        source: dict[str, Any],
+        target: dict[str, Any],
+    ) -> bool:
+        source_tokens = cls._tokens(
+            " ".join(
+                [
+                    str(source.get("title") or ""),
+                    str(source.get("headings") or ""),
+                    str(source.get("text") or "")[:5000],
+                ]
+            )
+        )
+        target_tokens = cls._tokens(
+            " ".join(
+                [
+                    str(target.get("title") or ""),
+                    str(target.get("headings") or ""),
+                    str(target.get("url") or ""),
+                ]
+            )
+        )
+        locations = {
+            "perth", "wa", "western", "australia",
+            "melbourne", "sydney", "brisbane", "adelaide",
+        }
+        return bool((source_tokens & locations) & target_tokens)
+
+    @classmethod
+    def _candidate_relevance(
+        cls,
+        source: dict[str, Any],
+        target: dict[str, Any],
+    ) -> dict[str, Any]:
+        overlap = cls._semantic_overlap(source, target)
+        source_intent = cls._intent(source)
+        target_intent = cls._intent(target)
+        location_match = cls._location_overlap(source, target)
+
+        intent_compatible = (
+            source_intent == target_intent
+            or (
+                source_intent == "informational"
+                and target_intent in {"commercial", "informational"}
+            )
+            or (
+                source_intent == "commercial"
+                and target_intent in {"commercial", "transactional"}
+            )
+        )
+
+        # This is an internal candidate gate, not a user-facing SEO score.
+        # It prevents Claude from considering obviously unrelated targets.
+        eligible = (
+            overlap >= 0.035
+            and intent_compatible
+        )
+
+        if location_match:
+            eligible = eligible and overlap >= 0.025
+
+        return {
+            "eligible": eligible,
+            "semantic_overlap": round(overlap, 4),
+            "source_intent": source_intent,
+            "target_intent": target_intent,
+            "location_match": location_match,
+        }
+
+    @classmethod
+    def _candidate_summary(
+        cls,
+        source: dict[str, Any],
+        target: dict[str, Any],
+    ) -> dict[str, Any]:
+        relevance = cls._candidate_relevance(source, target)
+        return {
+            "url": target.get("url", ""),
+            "title": target.get("title", "") or "Unknown",
+            "target_type": target.get("target_type")
+            or cls._infer_target_type(target),
+            "type_evidence": target.get("type_evidence", "inferred from URL structure"),
+            "headings": target.get("headings", "")[:1800],
+            "meta_description": target.get("meta_description", ""),
+            "content_excerpt": target.get("text", "")[:4500],
+            "intent": relevance["target_intent"],
+            "semantic_overlap": relevance["semantic_overlap"],
+            "location_match": relevance["location_match"],
+        }
+
+    # ========================================================
     # BUILD ANALYSIS CONTEXT
     # ========================================================
 
@@ -709,98 +946,100 @@ class InternalLinkingService:
             for url in urls
             if self._normalize_url(url)
         ]
-
-        clean_urls = list(
-            dict.fromkeys(
-                clean_urls
-            )
-        )
+        clean_urls = list(dict.fromkeys(clean_urls))
 
         if not clean_urls:
-            raise ValueError(
-                "At least one valid URL is required."
-            )
+            raise ValueError("At least one valid URL is required.")
 
         pages = await asyncio.gather(
-            *[
-                self._fetch_page(url)
-                for url in clean_urls
-            ]
+            *[self._fetch_page(url) for url in clean_urls]
         )
 
         candidates: list[str] = []
 
-        # ----------------------------------------------------
-        # Extract links already found on supplied pages
-        # ----------------------------------------------------
-
         for page in pages:
+            candidates.extend(
+                self._normalize_url(link)
+                for link in page.get("links", [])
+                if self._normalize_url(link)
+            )
 
-            for link in page.get(
-                "links",
-                [],
-            ):
-
-                normalized = self._normalize_url(
-                    link
-                )
-
-                if normalized:
-                    candidates.append(
-                        normalized
-                    )
-
-        # ----------------------------------------------------
-        # If only one URL was supplied, use sitemap
-        # discovery to find possible target pages.
-        # ----------------------------------------------------
-
+        # One source URL is enough: discover the site architecture instead
+        # of forcing users to manually supply target URLs.
         if len(clean_urls) == 1:
-
-            sitemap_candidates = (
+            candidates.extend(
                 await self._discover_from_sitemap(
                     clean_urls[0],
                     limit=75,
                 )
             )
 
-            candidates.extend(
-                sitemap_candidates
-            )
+        # With multiple supplied URLs, those URLs remain eligible targets.
+        candidates.extend(clean_urls)
 
-        # ----------------------------------------------------
-        # Supplied URLs themselves are candidates.
-        # ----------------------------------------------------
-
-        candidates.extend(
-            clean_urls
-        )
-
-        # ----------------------------------------------------
-        # Deduplicate and remove source URLs.
-        # ----------------------------------------------------
-
-        source_set = {
-            self._normalize_url(url)
-            for url in clean_urls
-        }
-
+        source_set = set(clean_urls)
         candidates = [
             url
-            for url in dict.fromkeys(
-                candidates
-            )
-            if url
-            and url not in source_set
+            for url in dict.fromkeys(candidates)
+            if url and url not in source_set
+            and self._is_http_url(url)
+            and self._same_domain(clean_urls[0], url)
         ]
 
-        # Keep context manageable.
-        candidates = candidates[:100]
+        # Fetch actual target content. URL slugs alone are never enough.
+        target_pages = await asyncio.gather(
+            *[
+                self._fetch_page(url)
+                for url in candidates[:75]
+            ]
+        )
+
+        source_page = pages[0]
+        target_candidates: list[dict[str, Any]] = []
+
+        for target in target_pages:
+            if target.get("error") or not target.get("url"):
+                continue
+
+            target_url = self._normalize_url(
+                str(target.get("url") or "")
+            )
+            if not target_url or target_url in source_set:
+                continue
+
+            target["target_type"] = self._infer_target_type(target)
+            target["type_evidence"] = (
+                "inferred from URL structure; exact WordPress post/page "
+                "type is not publicly exposed by this integration"
+            )
+
+            relevance = self._candidate_relevance(
+                source_page,
+                target,
+            )
+            if relevance["eligible"]:
+                target_candidates.append(target)
+
+        # Rank only for candidate ordering; this is an internal retrieval
+        # gate and is deliberately not exposed as a fabricated SEO score.
+        target_candidates.sort(
+            key=lambda item: self._candidate_relevance(
+                source_page,
+                item,
+            )["semantic_overlap"],
+            reverse=True,
+        )
+
+        target_candidates = target_candidates[:20]
 
         return {
             "urls": clean_urls,
             "pages": pages,
-            "candidates": candidates,
+            "candidates": [
+                str(page.get("url"))
+                for page in target_candidates
+            ],
+            "candidate_pages": target_candidates,
         }
 
     # ========================================================
@@ -944,144 +1183,113 @@ class InternalLinkingService:
         self,
         data: dict[str, Any],
         source_urls: list[str],
-        candidate_urls: list[str],
+        candidate_pages: list[dict[str, Any]],
     ) -> dict[str, Any]:
 
-        analysis = data.get(
-            "analysis",
-            "",
-        )
-
-        if analysis is None:
-            analysis = ""
-
-        analysis = str(
-            analysis
-        ).strip()
-
-        raw_suggestions = data.get(
-            "suggestions",
-            [],
-        )
-
-        if not isinstance(
-            raw_suggestions,
-            list,
-        ):
+        analysis = str(data.get("analysis") or "").strip()
+        raw_suggestions = data.get("suggestions", [])
+        if not isinstance(raw_suggestions, list):
             raw_suggestions = []
 
         allowed_sources = {
             self._normalize_url(url)
             for url in source_urls
         }
-
-        allowed_targets = {
-            self._normalize_url(url)
-            for url in candidate_urls
+        target_map = {
+            self._normalize_url(str(page.get("url") or "")): page
+            for page in candidate_pages
+            if page.get("url")
         }
 
-        # If multiple URLs were supplied, they can also be
-        # valid targets.
-        allowed_targets.update(
-            self._normalize_url(url)
-            for url in source_urls
-        )
+        # Supplied source URLs can be targets when multiple source pages
+        # were intentionally analyzed together.
+        for page in self._last_source_pages:
+            normalized = self._normalize_url(str(page.get("url") or ""))
+            if normalized and normalized not in target_map:
+                target_map[normalized] = page
 
-        suggestions: list[dict[str, str]] = []
+        suggestions: list[dict[str, Any]] = []
 
         for item in raw_suggestions:
-
-            if not isinstance(
-                item,
-                dict,
-            ):
+            if not isinstance(item, dict):
                 continue
 
             source = self._normalize_url(
-                str(
-                    item.get(
-                        "source",
-                        "",
-                    )
-                    or ""
-                )
+                str(item.get("source") or "")
             )
-
             target = self._normalize_url(
-                str(
-                    item.get(
-                        "target",
-                        "",
-                    )
-                    or ""
-                )
+                str(item.get("target") or "")
             )
+            anchor = str(item.get("anchor") or "").strip()
 
-            anchor = str(
-                item.get(
-                    "anchor",
-                    "",
-                )
+            if (
+                not source
+                or not target
+                or not anchor
+                or source not in allowed_sources
+                or source == target
+                or target not in target_map
+            ):
+                continue
+
+            target_page = target_map[target]
+            target_title = str(
+                target_page.get("title")
+                or item.get("target_title")
+                or ""
+            ).strip()
+            target_type = str(
+                item.get("target_type")
+                or target_page.get("target_type")
+                or self._infer_target_type(target_page)
+            ).strip()
+
+            reason = str(
+                item.get("reason")
                 or ""
             ).strip()
 
-            if not source or not target or not anchor:
-                continue
-
-            # ------------------------------------------------
-            # Source must be one of the URLs supplied by user.
-            # ------------------------------------------------
-
-            if source not in allowed_sources:
-                continue
-
-            # ------------------------------------------------
-            # Never allow self-links.
-            # ------------------------------------------------
-
-            if source == target:
-                continue
-
-            # ------------------------------------------------
-            # Target should be a discovered/known URL.
-            # ------------------------------------------------
-
-            if target not in allowed_targets:
-                continue
+            if not reason:
+                reason = (
+                    "Target content is contextually related to the source "
+                    "topic based on its title, headings, and page content."
+                )
 
             suggestions.append(
                 {
                     "source": source,
                     "target": target,
+                    "target_type": target_type,
+                    "target_title": target_title or "Unknown",
                     "anchor": anchor,
+                    "reason": reason,
                 }
             )
 
-        # Remove duplicate suggestions.
-        unique_suggestions = []
-        seen = set()
+        unique_suggestions: list[dict[str, Any]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        seen_anchors: set[tuple[str, str]] = set()
 
         for suggestion in suggestions:
-
-            key = (
+            pair_key = (
                 suggestion["source"],
                 suggestion["target"],
+            )
+            anchor_key = (
+                suggestion["source"],
                 suggestion["anchor"].lower(),
             )
 
-            if key in seen:
+            if pair_key in seen_pairs or anchor_key in seen_anchors:
                 continue
 
-            seen.add(key)
-            unique_suggestions.append(
-                suggestion
-            )
+            seen_pairs.add(pair_key)
+            seen_anchors.add(anchor_key)
+            unique_suggestions.append(suggestion)
 
         return {
             "analysis": analysis,
-            "suggestions": unique_suggestions[
-                :50
-            ],
+            "suggestions": unique_suggestions[:12],
         }
 
     # ========================================================
@@ -1131,6 +1339,7 @@ class InternalLinkingService:
         source_urls = context["urls"]
         pages = context["pages"]
         candidate_urls = context["candidates"]
+        candidate_pages = context.get("candidate_pages", [])
 
         # ----------------------------------------------------
         # Resolve the correct encrypted company key.
@@ -1166,118 +1375,113 @@ class InternalLinkingService:
             # Build page context.
             # ------------------------------------------------
 
+            self._last_source_pages = pages
+
             page_sections: list[str] = []
 
             for page in pages:
-
-                page_url = page.get(
-                    "url",
-                    "",
-                )
-
-                title = page.get(
-                    "title",
-                    "",
-                )
-
-                text = page.get(
-                    "text",
-                    "",
-                )
-
-                error = page.get(
-                    "error",
-                    None,
-                )
+                page_url = page.get("url", "")
+                title = page.get("title", "")
+                headings = page.get("headings", "")
+                text = page.get("text", "")
+                error = page.get("error")
 
                 section = (
                     f"SOURCE URL: {page_url}\n"
                     f"TITLE: {title or 'Unknown'}\n"
+                    f"HEADINGS: {headings[:2500]}\n"
                 )
 
                 if error:
-                    section += (
-                        f"FETCH STATUS: {error}\n"
-                    )
-
+                    section += f"FETCH STATUS: {error}\n"
                 if text:
-                    section += (
-                        "PAGE CONTENT:\n"
-                        f"{text[:8000]}\n"
+                    section += f"PAGE CONTENT:\n{text[:8500]}\n"
+
+                page_sections.append(section)
+
+            source_context = "\n\n".join(page_sections)[:32000]
+
+            candidate_pages = context.get("candidate_pages", [])
+            candidate_context_parts: list[str] = []
+
+            for candidate in candidate_pages:
+                candidate_context_parts.append(
+                    json.dumps(
+                        self._candidate_summary(
+                            pages[0],
+                            candidate,
+                        ),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     )
-
-                page_sections.append(
-                    section
                 )
 
-            source_context = "\n\n".join(
-                page_sections
-            )
-
-            candidate_context = "\n".join(
-                f"- {url}"
-                for url in candidate_urls
-            )
-
+            candidate_context = "\n".join(candidate_context_parts)
             if not candidate_context:
-                candidate_context = (
-                    "- No internal target URLs were discovered automatically."
-                )
-
-            source_context = source_context[
-                :30000
-            ]
-
-            # ------------------------------------------------
-            # Strong structured prompt.
-            # ------------------------------------------------
+                candidate_context = "- No sufficiently relevant internal targets were discovered."
 
             prompt = f"""
-You are an expert technical SEO and internal-linking strategist.
+You are an expert technical SEO internal-linking strategist.
 
-Identify ONLY REAL internal-linking opportunities supported by the
-supplied page content and discovered URLs.
+Your job is to recommend ONLY contextual internal links supported by
+REAL SOURCE CONTENT and REAL TARGET CONTENT.
 
 SOURCE URLS:
 {chr(10).join(f"- {url}" for url in source_urls)}
 
-DISCOVERED INTERNAL TARGET URLS:
-{candidate_context}
-
 SOURCE PAGE CONTEXT:
 {source_context}
 
-RULES:
+VERIFIED TARGET PAGE EVIDENCE:
+Each target below was actually fetched from the same domain. Do not infer
+target content from a URL slug when the supplied evidence says otherwise.
+
+{candidate_context}
+
+STRICT RULES:
 1. A source MUST be one of SOURCE URLS.
-2. A target MUST be one of DISCOVERED INTERNAL TARGET URLS or another
-   supplied SOURCE URL.
-3. Never invent, rewrite, shorten, or guess a URL.
+2. A target MUST be one of the VERIFIED TARGET PAGE EVIDENCE URLs.
+3. Never invent, rewrite, shorten, normalize, or guess a URL.
 4. Never use an external domain.
-5. Never recommend a source linking to itself.
-6. Anchor text must be natural and relevant to the target.
-7. Avoid repetitive exact-match keyword anchors.
-8. Recommend only contextually useful links.
-9. If there is no defensible opportunity, return an empty suggestions array.
-10. Return at most 12 suggestions.
-11. Keep "analysis" under 500 characters.
-12. Return ONLY one valid JSON object.
-13. Do NOT use Markdown, code fences, comments, or explanatory text.
-14. Escape any quotation marks inside JSON strings correctly.
-15. Keep the JSON compact.
+5. Never create a self-link.
+6. Use a target only when its actual title/headings/content support a
+   meaningful next step for the reader.
+7. Do NOT recommend a generic service page merely because it exists.
+8. Do NOT recommend carpet, school, gym, medical, warehouse or other
+   specialist services unless the source actually discusses that topic
+   or a closely connected need.
+9. Respect search intent. Informational sources should not be stuffed with
+   unrelated transactional/service links.
+10. Prefer a closely related supporting article when it is more useful than
+    a service page.
+11. Anchor text must be natural, descriptive, and supported by the source
+    context. Do not force exact-match keywords.
+12. Do not repeat the same anchor for the same source.
+13. Do not return duplicate source→target pairs.
+14. If no target is genuinely useful, return an empty suggestions array.
+15. Return at most 8 suggestions.
+16. For every suggestion provide target_type, target_title, and a concise
+    evidence-based reason.
+17. Do not invent focus keywords. No WordPress focus-keyword data is supplied
+    to this analysis.
+18. Do not claim a numeric relevance score.
+19. Return ONLY one valid JSON object.
 
 Return exactly:
 {{
-  "analysis": "Brief evidence-based explanation.",
+  "analysis": "Brief evidence-based summary of the strongest topical relationships.",
   "suggestions": [
     {{
-      "source": "https://example.com/source-page/",
-      "target": "https://example.com/target-page/",
-      "anchor": "natural contextual anchor text"
+      "source": "https://example.com/source/",
+      "target": "https://example.com/target/",
+      "target_type": "page",
+      "target_title": "Verified target title",
+      "anchor": "natural contextual anchor",
+      "reason": "Why this target is useful based on the source and target evidence."
     }}
   ]
 }}
 """
-
             # ------------------------------------------------
             # Claude request.
             #
@@ -1369,7 +1573,7 @@ The entire response must be a compact JSON object.
             result = self._normalize_ai_response(
                 data,
                 source_urls,
-                candidate_urls,
+                candidate_pages,
             )
 
             return result

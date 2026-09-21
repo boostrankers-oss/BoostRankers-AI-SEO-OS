@@ -25,8 +25,8 @@ async def analyze_internal_linking(
     company: Company = Depends(get_current_company),
 ):
     """Analyze URLs and generate internal linking suggestions."""
-    if len(request.urls) < 2:
-        raise HTTPException(status_code=400, detail="At least 2 URLs are required.")
+    if not request.urls:
+        raise HTTPException(status_code=400, detail="At least 1 URL is required.")
 
     # Check credits
     if company.ai_credits <= 0:

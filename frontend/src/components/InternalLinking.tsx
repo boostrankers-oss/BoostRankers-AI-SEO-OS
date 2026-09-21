@@ -21,7 +21,10 @@ import { api } from "@/lib/api";
 interface Suggestion {
   source: string;
   target: string;
+  target_type?: string;
+  target_title?: string;
   anchor: string;
+  reason?: string;
 }
 
 interface SuggestionRecord {
@@ -71,8 +74,8 @@ export function InternalLinking() {
 
   const handleAnalyze = async () => {
     const urlList = urls.split("\n").filter((u) => u.trim() !== "");
-    if (urlList.length < 2) {
-      toast.error("Please enter at least 2 URLs");
+    if (urlList.length < 1) {
+      toast.error("Please enter at least 1 URL");
       return;
     }
 
@@ -257,14 +260,27 @@ export function InternalLinking() {
                   key={idx}
                   className="flex items-center justify-between p-4 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-900 transition-colors"
                 >
-                  <div className="space-y-1 flex-1">
-                    <div className="text-sm font-medium text-slate-700 dark:text-slate-300">{s.source}</div>
-                    <div className="flex items-center gap-2 text-xs text-slate-500">
-                      <ArrowRight className="size-3" />
-                      <span className="text-emerald-600 dark:text-emerald-400 font-medium">{s.target}</span>
+                  <div className="space-y-2 flex-1 min-w-0">
+                    <div className="text-sm font-medium text-slate-700 dark:text-slate-300 break-all">{s.source}</div>
+                    <div className="flex items-start gap-2 text-xs text-slate-500">
+                      <ArrowRight className="size-3 mt-1 shrink-0" />
+                      <div className="min-w-0">
+                        <div className="text-emerald-600 dark:text-emerald-400 font-medium break-all">{s.target}</div>
+                        {s.target_title && (
+                          <div className="text-slate-600 dark:text-slate-400 mt-0.5">
+                            {s.target_title}
+                            {s.target_type ? ` · ${s.target_type}` : ""}
+                          </div>
+                        )}
+                        {s.reason && (
+                          <div className="text-slate-500 dark:text-slate-500 mt-1 leading-relaxed">
+                            {s.reason}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </div>
-                  <Badge variant="secondary" className="ml-4">
+                  <Badge variant="secondary" className="ml-4 shrink-0">
                     {s.anchor}
                   </Badge>
                 </div>
