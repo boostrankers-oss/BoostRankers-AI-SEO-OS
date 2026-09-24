@@ -186,38 +186,101 @@ def _normalize_phrase(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (value or "").lower())).strip()
 
 
+_FOCUS_KEY_FIELDS = {
+    "focus_keyword",
+    "focus_keyphrase",
+    "focuskeyword",
+    "focuskeyphrase",
+    "focuskw",
+    "_yoast_wpseo_focuskw",
+    "yoast_wpseo_focuskw",
+    "rank_math_focus_keyword",
+    "aioseo_keywords",
+    "keyphrase",
+}
+
+
+def _extract_focus_keyword(payload: Any) -> str:
+    """Extract a focus keyword from common SEO-bridge/meta response shapes."""
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+            if normalized_key in _FOCUS_KEY_FIELDS:
+                if isinstance(value, str) and value.strip():
+                    return " ".join(value.split())
+                if isinstance(value, list):
+                    for entry in value:
+                        if isinstance(entry, str) and entry.strip():
+                            return " ".join(entry.split())
+        for nested_key in ("meta", "seo", "data", "result", "yoast", "rank_math"):
+            found = _extract_focus_keyword(payload.get(nested_key))
+            if found:
+                return found
+        for value in payload.values():
+            if isinstance(value, (dict, list)):
+                found = _extract_focus_keyword(value)
+                if found:
+                    return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _extract_focus_keyword(value)
+            if found:
+                return found
+    return ""
+
+
 def _focus_candidates(title: str, content: str, used: set[str]) -> list[str]:
     """Build deterministic title/content-derived keyword candidates without inventing topics."""
     stop = {
         "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from",
         "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
-        "guide", "best", "ultimate", "complete", "tips", "checklist", "services", "service",
+        "guide", "best", "ultimate", "complete", "tips", "checklist",
     }
     words = re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?", title.lower())
     meaningful = [w for w in words if len(w) > 2 and w not in stop]
     content_norm = _normalize_phrase(content)
     candidates: list[tuple[float, str]] = []
-    for n in (4, 3, 2):
+    for n in (4, 3):
         for i in range(max(0, len(meaningful) - n + 1)):
             phrase = " ".join(meaningful[i:i+n])
             norm = _normalize_phrase(phrase)
             if not norm or _keyword_conflicts(norm, used) or len(norm) < 5:
                 continue
             count = content_norm.count(norm)
-            score = (count * 10) + n + (2 if i == 0 else 0)
+            # Prefer longer, title-aligned phrases while still using body frequency
+            # as supporting evidence. This keeps suggestions tightly related to the
+            # current post instead of selecting a generic two-word fragment.
+            score = (count * 5) + (n * 4) + (5 if i == 0 else 0)
             candidates.append((score, phrase))
-    for n in (3, 2, 1):
-        for i in range(max(0, len(meaningful) - n + 1)):
-            phrase = " ".join(meaningful[i:i+n])
-            norm = _normalize_phrase(phrase)
-            if norm and not _keyword_conflicts(norm, used) and len(norm) >= 5:
-                candidates.append((content_norm.count(norm) * 10 + n, phrase))
     candidates.sort(key=lambda item: (-item[0], len(item[1])))
     return [phrase for _, phrase in candidates]
 
 
+_KEYWORD_COMPARISON_STOPWORDS = {
+    "a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of", "on",
+    "or", "the", "to", "with", "without", "your", "our", "this", "that",
+}
+
+_FOCUS_SUGGESTION_GENERIC = {
+    "professional", "quality", "reliable", "trusted", "affordable", "best", "complete",
+    "help", "helps", "provide", "provides", "service", "services", "company", "companies",
+}
+
+
+def _normalize_keyword_token(token: str) -> str:
+    if token.endswith("ies") and len(token) > 4:
+        return f"{token[:-3]}y"
+    if token.endswith("s") and len(token) > 4:
+        return token[:-1]
+    return token
+
+
 def _keyword_tokens(value: str) -> set[str]:
-    return {token for token in _normalize_phrase(value).split() if token}
+    return {
+        _normalize_keyword_token(token)
+        for token in _normalize_phrase(value).split()
+        if token and token not in _KEYWORD_COMPARISON_STOPWORDS
+    }
 
 
 def _keyword_conflicts(candidate: str, used_keywords: set[str]) -> bool:
@@ -244,10 +307,12 @@ def _keyword_conflicts(candidate: str, used_keywords: set[str]) -> bool:
         if not used_tokens:
             continue
         smaller, larger = sorted((candidate_tokens, used_tokens), key=len)
-        if smaller and smaller.issubset(larger):
-            # Only treat substantial phrases as collisions; this avoids making
-            # ordinary shared words such as "cleaning" globally unavailable.
-            if len(smaller) >= 2 and len(smaller) / len(larger) >= 0.67:
+        if smaller:
+            overlap = len(smaller & larger)
+            # Treat substantial phrase overlap as a collision. This catches exact
+            # variants such as "commercial cleaning" vs "commercial cleaning
+            # services Perth" without making a single shared word unavailable.
+            if len(smaller) >= 2 and overlap / len(smaller) >= 0.75 and len(smaller) / len(larger) >= 0.40:
                 return True
     return False
 
@@ -264,16 +329,35 @@ def _choose_focus_keyword(title: str, content: str, requested: str, used_keyword
             return candidate, bool(requested)
 
     # If title-derived phrases are exhausted, derive candidates from the body
-    # rather than returning a phrase that collides with an existing page.
+    # and rank them by topical overlap with the title. Avoid location-only or
+    # generic fragments so the replacement remains useful for the same service.
+    title_terms = {
+        token for token in _keyword_tokens(title)
+        if token not in {"perth", "wa", "australia"}
+    }
     content_words = [
         word for word in re.findall(r"[A-Za-z0-9]+", _normalize_phrase(content))
-        if len(word) >= 4
+        if len(word) >= 4 and word not in _KEYWORD_COMPARISON_STOPWORDS
     ]
+    scored_body_candidates: list[tuple[float, str]] = []
+    content_norm = _normalize_phrase(content)
     for n in (4, 3, 2):
         for i in range(max(0, len(content_words) - n + 1)):
             candidate = " ".join(content_words[i:i + n])
-            if len(candidate) >= 5 and not _keyword_conflicts(candidate, used):
-                return candidate, bool(requested)
+            candidate_norm = _normalize_phrase(candidate)
+            if len(candidate_norm) < 5 or _keyword_conflicts(candidate, used):
+                continue
+            candidate_terms = _keyword_tokens(candidate)
+            overlap = len(title_terms & candidate_terms)
+            if overlap == 0:
+                continue
+            frequency = content_norm.count(candidate_norm)
+            generic_count = len(candidate_terms & _FOCUS_SUGGESTION_GENERIC)
+            score = (overlap * 20) + (n * 6) + min(frequency, 5) * 10 - (generic_count * 12)
+            scored_body_candidates.append((score, candidate))
+    scored_body_candidates.sort(key=lambda item: (-item[0], -len(item[1])))
+    if scored_body_candidates:
+        return scored_body_candidates[0][1], bool(requested)
 
     # Keep the result deterministic. This branch is only reached when there is
     # no unique phrase available in the supplied title/content evidence.
@@ -909,6 +993,23 @@ async def analyze_post(
     measured = _extract_page(html, url, data.focus_keyword)
     used_keywords = [str(x).strip() for x in data.used_focus_keywords if str(x).strip()]
     used_for_prompt = used_keywords[:250]
+    requested_keyword = data.focus_keyword.strip()
+    used_keyword_set = {_normalize_phrase(x) for x in used_keywords if _normalize_phrase(x)}
+    if requested_keyword and _keyword_conflicts(requested_keyword, used_keyword_set):
+        suggested_keyword, _ = _choose_focus_keyword(
+            measured["title"],
+            measured["content_text_excerpt"],
+            "",
+            used_keywords,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Focus keyword already in use by another WordPress post or page. "
+                "Please choose an unused keyword. "
+                f"Suggested for this post: {suggested_keyword}."
+            ),
+        )
     system = """You are a senior SEO and answer-engine optimization consultant. Analyze only supplied page evidence. Never claim that a page is cited by ChatGPT, Perplexity, Gemini, Google AI Overviews, or another AI engine unless evidence proves it. Never invent traffic, rankings, citations, entities, schema, competitor data, or search-volume data. Separate measured HTML facts from recommendations. If no focus keyword is supplied, recommend one concise topic phrase derived only from the page title/content. It must not duplicate any focus keyword in the supplied used-keyword list. Also suggest a compelling, accurate title that improves click appeal without clickbait. Return only JSON."""
     prompt = f"""
 Page: {url}
@@ -942,7 +1043,6 @@ Return exactly:
 Scores are 0-100 and must be grounded in the evidence.
 """
     ai = await _claude_json(system, prompt, api_key=api_key, max_tokens=5000)
-    requested_keyword = data.focus_keyword.strip()
     suggested_keyword = str(ai.get("suggested_focus_keyword") or "").strip()
     chosen_keyword, conflict = _choose_focus_keyword(
         measured["title"],
@@ -1150,11 +1250,31 @@ async def rewrite_post(
     if source_word_count < 100:
         raise HTTPException(status_code=400, detail="The post needs at least 100 readable words before AI rewriting.")
 
+    rewrite_used_keywords = [str(x).strip() for x in data.used_focus_keywords if str(x).strip()]
+    if data.focus_keyword.strip() and _keyword_conflicts(
+        data.focus_keyword.strip(),
+        {_normalize_phrase(x) for x in rewrite_used_keywords if _normalize_phrase(x)},
+    ):
+        suggested_keyword, _ = _choose_focus_keyword(
+            data.title,
+            source_text,
+            "",
+            rewrite_used_keywords,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Focus keyword already in use by another WordPress post or page. "
+                "Please choose an unused keyword. "
+                f"Suggested for this post: {suggested_keyword}."
+            ),
+        )
+
     chosen_keyword, keyword_conflict = _choose_focus_keyword(
         data.title,
         source_text,
         data.focus_keyword,
-        [str(x).strip() for x in data.used_focus_keywords if str(x).strip()],
+        rewrite_used_keywords,
     )
 
     # Select several evidence-backed targets instead of limiting the rewrite to
@@ -1359,7 +1479,7 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                         "context": "edit",
                         "orderby": "modified",
                         "order": "desc",
-                        "_fields": "id,link,title,status,modified,content,excerpt",
+                        "_fields": "id,link,title,status,modified,content,excerpt,meta",
                     },
                     auth=auth,
                 )
@@ -1386,7 +1506,7 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                             "modified": str(row.get("modified") or ""),
                             "content_html": str((row.get("content") or {}).get("rendered") or ""),
                             "excerpt": str((row.get("excerpt") or {}).get("rendered") or ""),
-                            "focus_keyword": "",
+                            "focus_keyword": _extract_focus_keyword(row.get("meta")),
                         }
                     )
                     if len(items) >= max_items:
@@ -1413,13 +1533,9 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                         if meta.status_code >= 400:
                             return
                         payload = meta.json()
-                        value = (
-                            payload.get("focus_keyword")
-                            or payload.get("focuskw")
-                            or payload.get("_yoast_wpseo_focuskw")
-                        )
-                        if isinstance(value, str):
-                            item["focus_keyword"] = " ".join(value.split())
+                        value = _extract_focus_keyword(payload)
+                        if value:
+                            item["focus_keyword"] = value
                     except Exception:
                         return
 

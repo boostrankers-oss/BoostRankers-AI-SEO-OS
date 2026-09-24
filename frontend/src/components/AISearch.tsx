@@ -118,28 +118,30 @@ function normalizePhrase(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
 }
 
+function normalizeKeywordToken(token: string) {
+  if (token.endsWith("ies") && token.length > 4) return `${token.slice(0, -3)}y`;
+  if (token.endsWith("s") && token.length > 4) return token.slice(0, -1);
+  return token;
+}
+
 function focusKeywordConflicts(candidate: string, usedKeywords: string[]) {
   const candidateNorm = normalizePhrase(candidate);
   if (!candidateNorm) return false;
-  const candidateTokens = new Set(candidateNorm.split(" ").filter(Boolean));
-  if (candidateTokens.size < 2) return false;
+  const candidateTokens = new Set(candidateNorm.split(" ").filter(Boolean).map(normalizeKeywordToken));
 
   return usedKeywords.some((used) => {
     const usedNorm = normalizePhrase(used);
     if (!usedNorm) return false;
     if (candidateNorm === usedNorm) return true;
-    const usedTokens = new Set(usedNorm.split(" ").filter(Boolean));
+    const usedTokens = new Set(usedNorm.split(" ").filter(Boolean).map(normalizeKeywordToken));
     const smaller = candidateTokens.size <= usedTokens.size ? candidateTokens : usedTokens;
     const larger = candidateTokens.size <= usedTokens.size ? usedTokens : candidateTokens;
     if (smaller.size < 2) return false;
-    let contained = true;
+    let overlap = 0;
     for (const token of smaller) {
-      if (!larger.has(token)) {
-        contained = false;
-        break;
-      }
+      if (larger.has(token)) overlap += 1;
     }
-    return contained && smaller.size / larger.size >= 0.67;
+    return overlap / smaller.size >= 0.75 && smaller.size / larger.size >= 0.4;
   });
 }
 
@@ -148,6 +150,28 @@ function getUsedFocusKeywords(items: WPItem[], sourceId: string) {
     .filter((item) => String(item.id) !== String(sourceId))
     .map((item) => item.focus_keyword?.trim() || "")
     .filter(Boolean);
+}
+
+function suggestUniqueFocusKeyword(item: WPItem | undefined, usedKeywords: string[]) {
+  if (!item) return "";
+  const stop = new Set([
+    "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from",
+    "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
+    "guide", "best", "ultimate", "complete", "tips", "checklist",
+  ]);
+  const text = `${item.title} ${item.content_html || ""}`.replace(/<[^>]*>/g, " ");
+  const words = normalizePhrase(text).split(" ").filter((word) => word.length > 2 && !stop.has(word));
+  const titleWords = normalizePhrase(item.title).split(" ").filter((word) => word.length > 2 && !stop.has(word));
+  const candidates: string[] = [];
+  for (const source of [titleWords, words]) {
+    for (const size of [4, 3, 2]) {
+      for (let index = 0; index <= source.length - size; index += 1) {
+        const phrase = source.slice(index, index + size).join(" ");
+        if (phrase.length >= 5 && !focusKeywordConflicts(phrase, usedKeywords)) candidates.push(phrase);
+      }
+    }
+  }
+  return candidates[0] || "";
 }
 
 function canonicalUrl(value: string) {
@@ -198,6 +222,22 @@ export function AISearch() {
   const activeMetaTitle = rewrite?.meta_title || analysis?.measured.meta_title || "";
   const activeMetaDescription = rewrite?.meta_description || analysis?.measured.meta_description || "";
   const activeHtml = rewrite?.article_html || analysis?.measured.content_html || "";
+  const usedFocusKeywords = useMemo(
+    () => getUsedFocusKeywords(wpItems, String(selectedPostId)),
+    [wpItems, selectedPostId],
+  );
+  const focusKeywordIsUsed = useMemo(
+    () => focusKeyword.trim() ? focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords) : false,
+    [focusKeyword, usedFocusKeywords],
+  );
+  const matchedWpItem = useMemo(
+    () => wpItems.find((item) => canonicalUrl(item.url) === canonicalUrl(url.trim())),
+    [wpItems, url],
+  );
+  const suggestedUniqueFocusKeyword = useMemo(
+    () => focusKeywordIsUsed ? suggestUniqueFocusKeyword(matchedWpItem, usedFocusKeywords) : "",
+    [focusKeywordIsUsed, matchedWpItem, usedFocusKeywords],
+  );
 
   const readinessCards = useMemo(() => {
     if (!analysis) {
@@ -226,9 +266,8 @@ export function AISearch() {
     setAnalysis(null);
     setRewrite(null);
     try {
-      const usedFocusKeywords = getUsedFocusKeywords(wpItems, String(selectedPostId));
-      if (focusKeyword.trim() && focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords)) {
-        toast.error("This focus keyword is already used by another WordPress post or page. Please choose a unique focus keyword.");
+      if (focusKeywordIsUsed) {
+        toast.error("Focus keyword already in use. Choose an unused keyword for this post.");
         setLoading(false);
         return;
       }
@@ -322,7 +361,7 @@ export function AISearch() {
 
       const usedFocusKeywords = getUsedFocusKeywords(items, sourceId);
       if (focusKeyword.trim() && focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords)) {
-        toast.error("This focus keyword is already used by another WordPress post or page. Please choose a unique focus keyword.");
+        toast.error("Focus keyword already in use. Choose an unused keyword for this post.");
         setRewriting(false);
         return;
       }
@@ -385,15 +424,10 @@ export function AISearch() {
 
       if (matched) {
         setSelectedPostId(String(matched.id));
-        const otherUsed = new Set(
-          items
-            .filter((entry) => String(entry.id) !== String(matched.id))
-            .map((entry) => normalizePhrase(entry.focus_keyword || ""))
-            .filter(Boolean),
-        );
+        const otherUsed = getUsedFocusKeywords(items, String(matched.id));
         const existingKeyword = matched.focus_keyword?.trim() || "";
         setFocusKeyword(
-          existingKeyword && !otherUsed.has(normalizePhrase(existingKeyword))
+          existingKeyword && !focusKeywordConflicts(existingKeyword, otherUsed)
             ? existingKeyword
             : "",
         );
@@ -429,21 +463,16 @@ export function AISearch() {
     setUrl(item.url);
     setRewrite(null);
     setAnalysis(null);
-    const otherUsed = new Set(
-      wpItems
-        .filter((entry) => String(entry.id) !== id)
-        .map((entry) => normalizePhrase(entry.focus_keyword || ""))
-        .filter(Boolean),
-    );
+    const otherUsed = getUsedFocusKeywords(wpItems, id);
     const existingKeyword = item.focus_keyword?.trim() || "";
     setFocusKeyword(
-      existingKeyword && !otherUsed.has(normalizePhrase(existingKeyword))
+      existingKeyword && !focusKeywordConflicts(existingKeyword, otherUsed)
         ? existingKeyword
         : "",
     );
     setSelectedTargetPage(chooseTargetPage(wpItems, id, item.url, existingKeyword, item.title));
     toast.success(
-      existingKeyword && !otherUsed.has(normalizePhrase(existingKeyword))
+      existingKeyword && !focusKeywordConflicts(existingKeyword, otherUsed)
         ? `${item.type === "post" ? "Post" : "Page"} selected. Existing unique focus keyword loaded automatically.`
         : `${item.type === "post" ? "Post" : "Page"} selected. The focus keyword will be selected automatically from the title/content if needed.`,
     );
@@ -534,12 +563,25 @@ export function AISearch() {
               </div>
               <div className="space-y-2 md:col-span-2">
                 <Label htmlFor="ai-focus">Focus keyword</Label>
-                <Input id="ai-focus" value={focusKeyword} onChange={(e) => setFocusKeyword(e.target.value)} placeholder="Leave blank for automatic unused keyword selection" />
-                <p className="text-xs text-slate-500">If the keyword is already used by another loaded WordPress post/page, Boost Rankers automatically selects an unused title-derived keyword.</p>
+                <Input
+                  id="ai-focus"
+                  value={focusKeyword}
+                  onChange={(e) => setFocusKeyword(e.target.value)}
+                  placeholder="Leave blank for automatic unused keyword selection"
+                  className={focusKeywordIsUsed ? "border-rose-500 focus-visible:ring-rose-500" : ""}
+                />
+                {focusKeywordIsUsed ? (
+                  <p className="text-xs text-rose-600 dark:text-rose-400">
+                    Focus keyword already in use by another WordPress post/page. Choose an unused keyword related to this post.
+                    {suggestedUniqueFocusKeyword ? ` Suggested: ${suggestedUniqueFocusKeyword}` : ""}
+                  </p>
+                ) : (
+                  <p className="text-xs text-slate-500">If the keyword is already used by another loaded WordPress post/page, Boost Rankers blocks it and requires a unique keyword.</p>
+                )}
               </div>
             </div>
             <div className="flex flex-wrap gap-3">
-              <Button onClick={analyze} disabled={loading || !url.trim()} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+              <Button onClick={analyze} disabled={loading || !url.trim() || focusKeywordIsUsed} className="bg-emerald-600 hover:bg-emerald-700 text-white">
                 {loading ? <Loader2 className="size-4 animate-spin" /> : <FileSearch className="size-4" />}
                 {loading ? "Analyzing..." : "Analyze Post"}
               </Button>
