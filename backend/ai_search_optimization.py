@@ -101,6 +101,45 @@ def _clean_url(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}{('?' + parsed.query) if parsed.query else ''}"
 
 
+async def _wordpress_request(
+    client: httpx.AsyncClient,
+    site: str,
+    route: str,
+    *,
+    method: str = "GET",
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+    auth: tuple[str, str] | None = None,
+) -> httpx.Response:
+    """Call WordPress REST API with a compatibility fallback.
+
+    Some WordPress installations return 404 for /wp-json/... when REST
+    pretty-permalink routing is unavailable or rewritten by the server.
+    WordPress also supports the same REST routes through ?rest_route=... .
+    Try the normal endpoint first, then the query-string form only on 404.
+    """
+    clean_route = "/" + str(route or "").lstrip("/")
+    primary_url = f"{site}/wp-json{clean_route}"
+    request_kwargs: dict[str, Any] = {"params": params or {}, "auth": auth}
+    if json_body is not None:
+        request_kwargs["json"] = json_body
+
+    response = await client.request(method.upper(), primary_url, **request_kwargs)
+    if response.status_code != 404:
+        return response
+
+    fallback_params = dict(params or {})
+    fallback_params["rest_route"] = clean_route
+    fallback_url = f"{site}/"
+    return await client.request(
+        method.upper(),
+        fallback_url,
+        params=fallback_params,
+        auth=auth,
+        **({"json": json_body} if json_body is not None else {}),
+    )
+
+
 def _reject_private_target(url: str) -> None:
     """Prevent the public-page analyzer from becoming an SSRF primitive."""
     parsed = urlparse(url)
@@ -1227,8 +1266,8 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
     auth = (wordpress_username, wordpress_application_password)
 
     async with httpx.AsyncClient(timeout=WP_TIMEOUT, follow_redirects=True) as client:
-        me = await client.get(
-            f"{site}/wp-json/wp/v2/users/me",
+        me = await _wordpress_request(
+            client, site, "/wp/v2/users/me",
             params={"context": "edit"},
             auth=auth,
         )
@@ -1242,7 +1281,8 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
             else:
                 detail = (
                     f"WordPress REST API returned HTTP {me.status_code}. "
-                    "Check the WordPress site URL and REST API availability."
+                    "The REST API endpoint could not be found. Verify the WordPress site URL, "
+                    "permalink/REST API configuration, and that /wp-json/ or ?rest_route= is available."
                 )
             raise HTTPException(status_code=401 if me.status_code in {401, 403} else 502, detail=detail)
 
@@ -1252,8 +1292,8 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
         for content_type in ("posts", "pages"):
             page_num = 1
             while len(items) < max_items:
-                response = await client.get(
-                    f"{site}/wp-json/wp/v2/{content_type}",
+                response = await _wordpress_request(
+                    client, site, f"/wp/v2/{content_type}",
                     params={
                         "per_page": 100,
                         "page": page_num,
@@ -1298,9 +1338,8 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                     break
                 page_num += 1
 
-        bridge = await client.get(
-            f"{site}/wp-json/boost-rankers/v1/seo-meta/status",
-            auth=auth,
+        bridge = await _wordpress_request(
+            client, site, "/boost-rankers/v1/seo-meta/status", auth=auth,
         )
         if bridge.status_code == 200:
             semaphore = asyncio.Semaphore(10)
@@ -1308,8 +1347,8 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
             async def load_focus(item: dict[str, Any]) -> None:
                 async with semaphore:
                     try:
-                        meta = await client.get(
-                            f"{site}/wp-json/boost-rankers/v1/seo-meta/{int(item['id'])}",
+                        meta = await _wordpress_request(
+                            client, site, f"/boost-rankers/v1/seo-meta/{int(item['id'])}",
                             auth=auth,
                         )
                         if meta.status_code >= 400:
@@ -1344,8 +1383,8 @@ async def apply_to_wordpress(data: WordPressApplyRequest, current_user: User = D
     )
     auth = (wordpress_username, wordpress_application_password)
     async with httpx.AsyncClient(timeout=WP_TIMEOUT, follow_redirects=True) as client:
-        me = await client.get(
-            f"{site}/wp-json/wp/v2/users/me",
+        me = await _wordpress_request(
+            client, site, "/wp/v2/users/me",
             params={"context": "edit"},
             auth=auth,
         )
@@ -1359,7 +1398,8 @@ async def apply_to_wordpress(data: WordPressApplyRequest, current_user: User = D
             else:
                 detail = (
                     f"WordPress REST API returned HTTP {me.status_code}. "
-                    "Check the WordPress site URL and REST API availability."
+                    "The REST API endpoint could not be found. Verify the WordPress site URL, "
+                    "permalink/REST API configuration, and that /wp-json/ or ?rest_route= is available."
                 )
             raise HTTPException(
                 status_code=401 if me.status_code in {401, 403} else 502,
@@ -1368,16 +1408,20 @@ async def apply_to_wordpress(data: WordPressApplyRequest, current_user: User = D
 
         content_type = None
         for candidate in ("posts", "pages"):
-            existing = await client.get(f"{site}/wp-json/wp/v2/{candidate}/{data.post_id}", params={"context": "edit"}, auth=auth)
+            existing = await _wordpress_request(
+                client, site, f"/wp/v2/{candidate}/{data.post_id}",
+                params={"context": "edit"}, auth=auth,
+            )
             if existing.status_code == 200:
                 content_type = candidate
                 break
         if content_type is None:
             raise HTTPException(status_code=404, detail=f"WordPress content ID {data.post_id} could not be loaded as a post or page.")
 
-        updated = await client.post(
-            f"{site}/wp-json/wp/v2/{content_type}/{data.post_id}",
-            json={"title": data.title, "content": data.content_html, "status": data.status},
+        updated = await _wordpress_request(
+            client, site, f"/wp/v2/{content_type}/{data.post_id}",
+            method="POST",
+            json_body={"title": data.title, "content": data.content_html, "status": data.status},
             auth=auth,
         )
         if updated.status_code >= 400:
@@ -1388,11 +1432,14 @@ async def apply_to_wordpress(data: WordPressApplyRequest, current_user: User = D
             raise HTTPException(status_code=502, detail=f"WordPress rejected the optimized content: {detail}")
 
         seo_applied = False
-        bridge = await client.get(f"{site}/wp-json/boost-rankers/v1/seo-meta/status", auth=auth)
+        bridge = await _wordpress_request(
+            client, site, "/boost-rankers/v1/seo-meta/status", auth=auth,
+        )
         if bridge.status_code == 200 and bridge.json().get("yoast_active"):
-            seo_response = await client.post(
-                f"{site}/wp-json/boost-rankers/v1/seo-meta/{data.post_id}",
-                json={"seo_title": data.meta_title[:500], "meta_description": data.meta_description[:1000], "focus_keyphrase": data.focus_keyphrase[:500]},
+            seo_response = await _wordpress_request(
+                client, site, f"/boost-rankers/v1/seo-meta/{data.post_id}",
+                method="POST",
+                json_body={"seo_title": data.meta_title[:500], "meta_description": data.meta_description[:1000], "focus_keyphrase": data.focus_keyphrase[:500]},
                 auth=auth,
             )
             if seo_response.status_code >= 400:
