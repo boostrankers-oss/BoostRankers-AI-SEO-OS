@@ -36,8 +36,15 @@ HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=25.0, write=15.0, pool=10.
 WP_TIMEOUT = httpx.Timeout(45.0, connect=15.0, read=35.0, write=15.0, pool=10.0)
 USER_AGENT = "BoostRankers-AISearchOptimizer/1.0"
 MAX_CONTENT_CHARS = 30000
-MAX_INTERNAL_LINKS = 6
+MIN_INTERNAL_LINKS = 3
+MAX_INTERNAL_LINKS = 5
 GENERIC_ANCHORS = {"click here", "read more", "learn more", "here", "more", "this article"}
+LINK_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from", "by",
+    "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
+    "best", "guide", "complete", "ultimate", "tips", "checklist", "services", "service",
+    "company", "companies", "business", "businesses", "professional", "local", "near", "perth",
+}
 
 
 class AnalyzeRequest(BaseModel):
@@ -181,10 +188,15 @@ def _canonical_url(value: str, base: str | None = None) -> str:
     return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path.rstrip('/') or '/'}"
 
 
-def _sanitize_internal_links(html: str, source_url: str, candidates: list[dict[str, str]]) -> tuple[str, int, list[str]]:
-    """Keep only links to verified WordPress candidates on the same site."""
+def _sanitize_internal_links(
+    html: str,
+    source_url: str,
+    candidates: list[dict[str, str]],
+) -> tuple[str, int, list[str]]:
+    """Keep only verified candidate links, remove self-links/duplicates, and cap at five."""
     if not html or not candidates:
         return html, 0, []
+
     source_key = _canonical_url(source_url)
     allowed: dict[str, dict[str, str]] = {}
     for candidate in candidates:
@@ -194,10 +206,17 @@ def _sanitize_internal_links(html: str, source_url: str, candidates: list[dict[s
             continue
         key = _canonical_url(target, source_url)
         if key != source_key:
-            allowed[key] = {"url": urljoin(source_url, target), "title": title}
+            allowed[key] = {
+                "url": urljoin(source_url, target),
+                "title": title,
+                "focus_keyword": str(candidate.get("focus_keyword") or "").strip(),
+            }
+
     soup = BeautifulSoup(html, "html.parser")
     applied = 0
     targets: list[str] = []
+    used_target_keys: set[str] = set()
+
     for anchor in list(soup.find_all("a", href=True)):
         href = str(anchor.get("href") or "").strip()
         key = _canonical_url(href, source_url)
@@ -206,52 +225,111 @@ def _sanitize_internal_links(html: str, source_url: str, candidates: list[dict[s
         parsed_href = urlparse(urljoin(source_url, href))
         source_host = urlparse(source_url).netloc.lower().lstrip("www.")
         href_host = parsed_href.netloc.lower().lstrip("www.")
-        # Preserve external links; only sanitize AI-generated same-site links.
+
+        # Preserve external links.
         if href_host and href_host != source_host:
             continue
+
+        # Only retain links to verified candidates. The rewrite is generated
+        # from source text, so unsupported same-site links are not trustworthy.
         if not target or not anchor_text or _normalize_phrase(anchor_text) in GENERIC_ANCHORS:
-            if not target:
-                anchor.unwrap()
-            else:
-                anchor.unwrap()
-            continue
-        if applied >= MAX_INTERNAL_LINKS:
             anchor.unwrap()
             continue
+
+        # Prevent multiple links to the same target and cap the final count.
+        if key in used_target_keys or applied >= MAX_INTERNAL_LINKS:
+            anchor.unwrap()
+            continue
+
         anchor["href"] = target["url"]
         applied += 1
+        used_target_keys.add(key)
         targets.append(target["title"])
+
     return str(soup), applied, targets
 
 
-def _insert_contextual_links(html: str, source_url: str, candidates: list[dict[str, str]], already_linked: int) -> tuple[str, int, list[str]]:
-    """Safely add missing contextual links only when candidate wording occurs in a paragraph."""
+def _candidate_anchor_phrases(candidate: dict[str, str]) -> list[str]:
+    """Generate natural target phrases from title/focus-keyword evidence."""
+    phrases: list[str] = []
+    for raw in (
+        str(candidate.get("focus_keyword") or ""),
+        str(candidate.get("title") or ""),
+    ):
+        clean = _strip_html(raw)
+        if not clean:
+            continue
+        words = [w for w in re.findall(r"[A-Za-z0-9]+", clean) if len(w) > 2]
+        for count in (5, 4, 3, 2):
+            if len(words) >= count:
+                phrase = " ".join(words[:count]).strip()
+                if phrase and _normalize_phrase(phrase) not in GENERIC_ANCHORS:
+                    phrases.append(phrase)
+    # Preserve order while removing duplicate phrases.
+    return list(dict.fromkeys(phrases))
+
+
+def _insert_contextual_links(
+    html: str,
+    source_url: str,
+    candidates: list[dict[str, str]],
+    already_linked: int,
+) -> tuple[str, int, list[str]]:
+    """
+    Add missing links when target wording naturally exists in the article.
+    This is intentionally conservative; a separate fallback handles the
+    minimum count using a compact related-resources block.
+    """
     if already_linked >= MAX_INTERNAL_LINKS or not candidates:
         return html, 0, []
+
     soup = BeautifulSoup(html, "html.parser")
     source_key = _canonical_url(source_url)
     added = 0
     targets: list[str] = []
     used_targets: set[str] = set()
-    paragraphs = [p for p in soup.find_all(["p", "li"]) if p.find_parent(["a", "h1", "h2", "h3", "h4", "h5", "h6", "code", "pre", "script", "style"]) is None]
+
+    for anchor in soup.find_all("a", href=True):
+        used_targets.add(_canonical_url(str(anchor.get("href") or ""), source_url))
+
+    paragraphs = [
+        p
+        for p in soup.find_all(["p", "li"])
+        if p.find_parent(
+            ["a", "h1", "h2", "h3", "h4", "h5", "h6", "code", "pre", "script", "style"]
+        )
+        is None
+    ]
+
     for candidate in candidates:
         if already_linked + added >= MAX_INTERNAL_LINKS:
             break
+
         url = str(candidate.get("url") or "").strip()
         title = str(candidate.get("title") or "").strip()
         if not url or not title:
             continue
+
         target_key = _canonical_url(url, source_url)
         if target_key == source_key or target_key in used_targets:
             continue
-        title_words = [w for w in re.findall(r"[A-Za-z0-9]+", title) if len(w) > 2]
-        phrases = [" ".join(title_words[:4]), " ".join(title_words[:3]), " ".join(title_words[:2])]
+
+        phrases = _candidate_anchor_phrases(candidate)
         found = False
+
         for para in paragraphs:
             text = para.get_text(" ", strip=True)
-            phrase = next((x for x in phrases if x and re.search(r"\b" + re.escape(x) + r"\b", text, re.I)), None)
+            phrase = next(
+                (
+                    x
+                    for x in phrases
+                    if x and re.search(r"\b" + re.escape(x) + r"\b", text, re.I)
+                ),
+                None,
+            )
             if not phrase:
                 continue
+
             for node in list(para.find_all(string=re.compile(re.escape(phrase), re.I))):
                 parent = node.parent
                 if parent and parent.name in {"a", "strong", "em"}:
@@ -259,9 +337,13 @@ def _insert_contextual_links(html: str, source_url: str, candidates: list[dict[s
                 match = re.search(re.escape(phrase), str(node), re.I)
                 if not match:
                     continue
-                before, matched, after = str(node)[:match.start()], str(node)[match.start():match.end()], str(node)[match.end():]
+
+                before = str(node)[: match.start()]
+                matched = str(node)[match.start() : match.end()]
+                after = str(node)[match.end() :]
                 link = soup.new_tag("a", href=urljoin(source_url, url))
                 link.string = matched
+
                 replacement = []
                 if before:
                     replacement.append(BeautifulSoup(before, "html.parser"))
@@ -269,14 +351,82 @@ def _insert_contextual_links(html: str, source_url: str, candidates: list[dict[s
                 if after:
                     replacement.append(BeautifulSoup(after, "html.parser"))
                 node.replace_with(*replacement)
+
                 added += 1
                 used_targets.add(target_key)
                 targets.append(title)
                 found = True
                 break
+
             if found:
                 break
+
     return str(soup), added, targets
+
+
+def _append_minimum_internal_links(
+    html: str,
+    source_url: str,
+    candidates: list[dict[str, str]],
+    already_linked: int,
+) -> tuple[str, int, list[str]]:
+    """
+    Guarantee the requested minimum of three verified links when three or more
+    suitable targets exist. The fallback is a compact related-resources block,
+    never invented URLs and never a self-link.
+    """
+    if already_linked >= MIN_INTERNAL_LINKS or not candidates:
+        return html, 0, []
+
+    soup = BeautifulSoup(html, "html.parser")
+    source_key = _canonical_url(source_url)
+    existing_keys = {
+        _canonical_url(str(a.get("href") or ""), source_url)
+        for a in soup.find_all("a", href=True)
+    }
+
+    selected: list[dict[str, str]] = []
+    for candidate in candidates:
+        target = str(candidate.get("url") or "").strip()
+        title = str(candidate.get("title") or "").strip()
+        if not target or not title:
+            continue
+        target_key = _canonical_url(target, source_url)
+        if target_key == source_key or target_key in existing_keys:
+            continue
+        selected.append(candidate)
+        if already_linked + len(selected) >= MIN_INTERNAL_LINKS:
+            break
+
+    if not selected:
+        return str(soup), 0, []
+
+    heading = soup.new_tag("h3")
+    heading.string = "Related resources"
+    ul = soup.new_tag("ul")
+
+    for candidate in selected:
+        target = str(candidate.get("url") or "").strip()
+        title = str(candidate.get("title") or "").strip()
+        if not target or not title:
+            continue
+        li = soup.new_tag("li")
+        anchor = soup.new_tag("a", href=urljoin(source_url, target))
+        anchor.string = title
+        li.append(anchor)
+        ul.append(li)
+
+    if not ul.find("a"):
+        return str(soup), 0, []
+
+    # Put the fallback block at the end of the article body without touching
+    # headings or existing content structure.
+    container = soup.find("article") or soup.find("main") or soup.body or soup
+    container.append(heading)
+    container.append(ul)
+
+    count = len(selected)
+    return str(soup), count, [str(item.get("title") or "") for item in selected]
 
 
 def _schema_type_names(value: Any) -> set[str]:
@@ -710,44 +860,144 @@ Scores are 0-100 and must be grounded in the evidence.
     return {"success": True, "measured": measured, "ai_analysis": ai}
 
 
-def _select_single_internal_link_candidate(
+def _link_terms(value: str) -> set[str]:
+    """Return meaningful lexical terms used for conservative target relevance matching."""
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", _normalize_phrase(value))
+        if len(token) >= 3 and token not in LINK_STOPWORDS
+    }
+
+
+def _is_service_target(candidate: dict[str, str]) -> bool:
+    """Identify likely service/solution pages without assuming a WordPress URL structure."""
+    text = _normalize_phrase(
+        " ".join(
+            [
+                str(candidate.get("title") or ""),
+                str(candidate.get("focus_keyword") or ""),
+                str(candidate.get("excerpt") or ""),
+            ]
+        )
+    )
+    service_terms = {
+        "service", "services", "cleaning", "commercial", "office", "school", "warehouse",
+        "carpet", "house", "industrial", "retail", "medical", "hotel", "gym", "window",
+        "disinfection", "sanitation", "facility", "janitorial",
+    }
+    return bool(set(text.split()) & service_terms)
+
+
+def _select_internal_link_candidates(
     source_url: str,
     title: str,
     content: str,
     focus_keyword: str,
     candidates: list[dict[str, str]],
 ) -> list[dict[str, str]]:
-    """Select at most one verified, non-self WordPress target for the rewritten article."""
+    """
+    Select 3-5 verified, non-self WordPress targets using the source topic plus
+    target title, focus keyword, excerpt and content evidence.
+
+    The selector is deliberately conservative: it prefers topical matches and
+    relevant service pages, but never invents a URL or forces a target with no
+    meaningful topical connection.
+    """
     source_key = _canonical_url(source_url)
-    source_terms = set(re.findall(r"[a-z0-9]+", _normalize_phrase(f"{title} {focus_keyword}")))
-    scored: list[tuple[int, dict[str, str]]] = []
+    source_text = " ".join([title, focus_keyword, content[:16000]])
+    source_terms = _link_terms(source_text)
+    focus_norm = _normalize_phrase(focus_keyword)
+
+    scored: list[tuple[float, dict[str, str]]] = []
+    seen: set[str] = set()
+
     for candidate in candidates:
         url = str(candidate.get("url") or "").strip()
         target_title = str(candidate.get("title") or "").strip()
         if not url or not target_title:
             continue
-        if _canonical_url(url, source_url) == source_key:
+
+        target_key = _canonical_url(url, source_url)
+        if target_key == source_key or target_key in seen:
             continue
-        target_terms = set(re.findall(r"[a-z0-9]+", _normalize_phrase(target_title)))
-        overlap = len(source_terms & target_terms)
-        score = overlap * 10
+        seen.add(target_key)
+
+        target_focus = str(candidate.get("focus_keyword") or "").strip()
+        target_excerpt = _strip_html(str(candidate.get("excerpt") or ""))
+        target_content = _strip_html(str(candidate.get("content_html") or ""))[:12000]
+        target_text = " ".join([target_title, target_focus, target_excerpt, target_content])
+        target_terms = _link_terms(target_text)
+
+        title_overlap = len(_link_terms(target_title) & source_terms)
+        focus_overlap = len(_link_terms(target_focus) & source_terms)
+        body_overlap = len(_link_terms(target_excerpt + " " + target_content) & source_terms)
+        total_overlap = len(source_terms & target_terms)
+
+        score = (
+            (title_overlap * 14)
+            + (focus_overlap * 18)
+            + (body_overlap * 2)
+            + (total_overlap * 3)
+        )
+
+        if focus_norm and focus_norm in _normalize_phrase(target_title + " " + target_focus):
+            score += 18
+
         if str(candidate.get("type") or "").lower() == "page":
             score += 3
-        if _normalize_phrase(focus_keyword) and _normalize_phrase(focus_keyword) in _normalize_phrase(target_title):
-            score += 8
-        scored.append((
-            score,
-            {
-                "id": str(candidate.get("id") or ""),
-                "type": str(candidate.get("type") or ""),
-                "title": target_title,
-                "url": url,
-            },
-        ))
+
+        # Prefer a genuinely relevant service target, but only when the source
+        # itself contains related service language.
+        if _is_service_target(candidate):
+            service_overlap = len(
+                _link_terms(target_title + " " + target_focus) & source_terms
+            )
+            if service_overlap:
+                score += 14 + (service_overlap * 3)
+
+        # A target with no meaningful lexical evidence should not be selected
+        # merely because it is a page or service.
+        if title_overlap == 0 and focus_overlap == 0 and total_overlap == 0:
+            continue
+
+        normalized = {
+            "id": str(candidate.get("id") or ""),
+            "type": str(candidate.get("type") or ""),
+            "title": target_title,
+            "url": url,
+            "focus_keyword": target_focus,
+            "excerpt": target_excerpt[:2500],
+            "content_html": str(candidate.get("content_html") or "")[:6000],
+        }
+        scored.append((score, normalized))
+
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            item[1]["type"] != "page",
+            len(item[1]["title"]),
+        )
+    )
+
     if not scored:
         return []
-    scored.sort(key=lambda item: (-item[0], item[1]["type"] != "page", len(item[1]["title"])))
-    return [scored[0][1]]
+
+    # Start with the strongest topical candidates.
+    selected: list[dict[str, str]] = [item[1] for item in scored[:MAX_INTERNAL_LINKS]]
+
+    # If a relevant service target exists just outside the first five, reserve
+    # one slot for it rather than filling every slot with generic blog posts.
+    service_selected = any(_is_service_target(item) for item in selected)
+    if not service_selected:
+        for _, candidate in scored[MAX_INTERNAL_LINKS:]:
+            if _is_service_target(candidate):
+                if selected:
+                    selected[-1] = candidate
+                else:
+                    selected.append(candidate)
+                break
+
+    return selected[:MAX_INTERNAL_LINKS]
 
 
 @router.post("/rewrite")
@@ -769,9 +1019,28 @@ async def rewrite_post(
         data.focus_keyword,
         [str(x).strip() for x in data.used_focus_keywords if str(x).strip()],
     )
-    target_candidates = _select_single_internal_link_candidate(
-        str(data.url), data.title, source_text, chosen_keyword, data.internal_link_candidates
+
+    # Select several evidence-backed targets instead of limiting the rewrite to
+    # one page. Candidate content/excerpts/focus keywords are used when present.
+    target_candidates = _select_internal_link_candidates(
+        str(data.url),
+        data.title,
+        source_text,
+        chosen_keyword,
+        data.internal_link_candidates,
     )
+
+    target_summary = [
+        {
+            "id": item.get("id", ""),
+            "type": item.get("type", ""),
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "focus_keyword": item.get("focus_keyword", ""),
+            "excerpt": item.get("excerpt", ""),
+        }
+        for item in target_candidates
+    ]
 
     system = """You are a senior SEO content editor specializing in helpful content and AI search / answer-engine optimization. Rewrite the supplied article without inventing business facts, statistics, credentials, locations, prices, awards, reviews, or guarantees. Preserve supported facts and the article's real subject. Improve clarity, topical completeness, passage-level answers, entity clarity, headings, internal coherence, and natural focus-keyword usage. Do not keyword-stuff. The rewritten article must remain about the same existing blog topic, not become a new page or a different service. Return only valid JSON."""
 
@@ -790,8 +1059,8 @@ Existing analysis:
 Original article:
 {source_text[:28000]}
 
-Exactly one verified internal-link target may be used:
-{json.dumps(target_candidates, ensure_ascii=False, indent=2)}
+Verified internal-link targets selected from the connected WordPress site:
+{json.dumps(target_summary, ensure_ascii=False, indent=2)}
 
 Return ONLY:
 {{
@@ -816,8 +1085,10 @@ Rules:
 - Produce complete WordPress-compatible HTML using h2/h3, p, ul/ol, and strong where useful.
 - Do not shorten the article. Target at least {max(source_word_count, 1200)} readable words when the source supports expansion; preserve all useful existing information while adding genuinely useful explanations, examples, steps, FAQs, or decision guidance relevant to the existing topic.
 - Do not pad with generic filler. Every added section must answer a real user need related to the existing article.
-- Add one contextual internal link to the single verified target supplied above when the target is relevant. Use a natural descriptive anchor, never a generic anchor. Do not add any other new internal-link targets. Never invent URLs. Never link to the current page.
-- Keep the existing blog as the destination being optimized; do not create or imply a new page.
+- Use between {MIN_INTERNAL_LINKS} and {MAX_INTERNAL_LINKS} contextual internal links when that many verified targets are supplied. Prefer the supplied service/solution target when it is genuinely relevant to the article, and use different relevant targets rather than linking the same URL repeatedly.
+- Only link to the verified targets supplied above. Never invent URLs, never link to the current page, and never link to an unrelated service merely to reach the minimum.
+- Use natural descriptive anchors based on the target title/focus keyword. Never use generic anchors such as "click here", "read more", or "learn more".
+- Place internal links in relevant body paragraphs or lists, never inside headings, existing links, code, pre, scripts, or styles.
 - Do not output markdown.
 - Do not invent unsupported facts.
 """
@@ -832,7 +1103,11 @@ Focus keyword: {chosen_keyword}
 Minimum readable word count: {max(source_word_count, 1200)}
 Current article HTML:
 {article_html[:50000]}
-Add useful, specific sections, explanations, steps, FAQs, comparisons, or practical guidance only when supported by the existing article topic. Do not invent business facts. Keep exactly one internal-link target if already present.
+
+Verified internal-link targets that must remain available:
+{json.dumps(target_summary, ensure_ascii=False, indent=2)}
+
+Add useful, specific sections, explanations, steps, FAQs, comparisons, or practical guidance only when supported by the existing article topic. Do not invent business facts. Preserve any valid internal links already present and, where natural, add links to other verified targets. Do not invent URLs or add unrelated service links.
 """
         expanded = await _claude_json(system, expand_prompt, api_key=api_key, max_tokens=14000)
         expanded_html = str(expanded.get("article_html") or "")
@@ -841,6 +1116,8 @@ Add useful, specific sections, explanations, steps, FAQs, comparisons, or practi
             rewrite["focus_keyword"] = chosen_keyword
             article_html = expanded_html
 
+    # First keep only verified candidate links. Then add missing links naturally
+    # where target wording already exists in the rewritten article.
     article_html, verified_count, linked_targets = _sanitize_internal_links(
         article_html, str(data.url), target_candidates
     )
@@ -848,10 +1125,28 @@ Add useful, specific sections, explanations, steps, FAQs, comparisons, or practi
         article_html, str(data.url), target_candidates, verified_count
     )
 
+    current_link_count = verified_count + inserted_count
+
+    # If the article still has fewer than three links but three or more suitable
+    # verified targets exist, append a compact related-resources block. This
+    # guarantees the product requirement without fabricating or self-linking.
+    article_html, minimum_added, minimum_targets = _append_minimum_internal_links(
+        article_html,
+        str(data.url),
+        target_candidates,
+        current_link_count,
+    )
+
+    final_link_count = min(
+        MAX_INTERNAL_LINKS,
+        verified_count + inserted_count + minimum_added,
+    )
+    final_targets = (linked_targets + inserted_targets + minimum_targets)[:MAX_INTERNAL_LINKS]
+
     rewrite["article_html"] = article_html
     rewrite["focus_keyword"] = chosen_keyword
-    rewrite["internal_links_applied"] = min(1, verified_count + inserted_count)
-    rewrite["internal_link_targets"] = (linked_targets + inserted_targets)[:1]
+    rewrite["internal_links_applied"] = final_link_count
+    rewrite["internal_link_targets"] = final_targets
     rewrite["meta_title"] = str(
         rewrite.get("meta_title") or rewrite.get("title") or data.title
     ).strip()[:500]
@@ -865,9 +1160,14 @@ Add useful, specific sections, explanations, steps, FAQs, comparisons, or practi
         rewrite.setdefault("change_summary", []).append(
             f"Replaced the requested focus keyword with the unused keyword: {chosen_keyword}."
         )
-    if rewrite["internal_links_applied"]:
+
+    if final_link_count:
         rewrite.setdefault("change_summary", []).append(
-            "Added one contextual internal link to a verified WordPress target page/post."
+            f"Added {final_link_count} contextual internal link(s) using verified WordPress targets."
+        )
+    elif len(target_candidates) < MIN_INTERNAL_LINKS:
+        rewrite.setdefault("change_summary", []).append(
+            f"Fewer than {MIN_INTERNAL_LINKS} suitable verified internal-link targets were available, so unrelated URLs were not forced."
         )
 
     return {"success": True, "rewrite": rewrite}
