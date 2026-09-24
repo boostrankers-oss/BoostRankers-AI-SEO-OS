@@ -118,6 +118,38 @@ function normalizePhrase(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
 }
 
+function focusKeywordConflicts(candidate: string, usedKeywords: string[]) {
+  const candidateNorm = normalizePhrase(candidate);
+  if (!candidateNorm) return false;
+  const candidateTokens = new Set(candidateNorm.split(" ").filter(Boolean));
+  if (candidateTokens.size < 2) return false;
+
+  return usedKeywords.some((used) => {
+    const usedNorm = normalizePhrase(used);
+    if (!usedNorm) return false;
+    if (candidateNorm === usedNorm) return true;
+    const usedTokens = new Set(usedNorm.split(" ").filter(Boolean));
+    const smaller = candidateTokens.size <= usedTokens.size ? candidateTokens : usedTokens;
+    const larger = candidateTokens.size <= usedTokens.size ? usedTokens : candidateTokens;
+    if (smaller.size < 2) return false;
+    let contained = true;
+    for (const token of smaller) {
+      if (!larger.has(token)) {
+        contained = false;
+        break;
+      }
+    }
+    return contained && smaller.size / larger.size >= 0.67;
+  });
+}
+
+function getUsedFocusKeywords(items: WPItem[], sourceId: string) {
+  return items
+    .filter((item) => String(item.id) !== String(sourceId))
+    .map((item) => item.focus_keyword?.trim() || "")
+    .filter(Boolean);
+}
+
 function canonicalUrl(value: string) {
   try {
     const parsed = new URL(value);
@@ -194,10 +226,12 @@ export function AISearch() {
     setAnalysis(null);
     setRewrite(null);
     try {
-      const usedFocusKeywords = wpItems
-        .filter((item) => String(item.id) !== String(selectedPostId))
-        .map((item) => item.focus_keyword?.trim() || "")
-        .filter(Boolean);
+      const usedFocusKeywords = getUsedFocusKeywords(wpItems, String(selectedPostId));
+      if (focusKeyword.trim() && focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords)) {
+        toast.error("This focus keyword is already used by another WordPress post or page. Please choose a unique focus keyword.");
+        setLoading(false);
+        return;
+      }
       const result = await api.post<{ success: boolean; measured: MeasuredPage; ai_analysis: AIAnalysis }>(
         "/api/ai-search-optimization/analyze",
         {
@@ -286,10 +320,12 @@ export function AISearch() {
       );
       setSelectedTargetPage(target);
 
-      const usedFocusKeywords = items
-        .filter((item) => String(item.id) !== sourceId)
-        .map((item) => item.focus_keyword?.trim() || "")
-        .filter(Boolean);
+      const usedFocusKeywords = getUsedFocusKeywords(items, sourceId);
+      if (focusKeyword.trim() && focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords)) {
+        toast.error("This focus keyword is already used by another WordPress post or page. Please choose a unique focus keyword.");
+        setRewriting(false);
+        return;
+      }
 
       const result = await api.post<{ success: boolean; rewrite: RewriteResult }>(
         "/api/ai-search-optimization/rewrite",
@@ -385,6 +421,11 @@ export function AISearch() {
     setSelectedPostId(id);
     const item = wpItems.find((entry) => String(entry.id) === id);
     if (!item) return;
+    // Preserve the existing WordPress publication state when an item is selected.
+    // This prevents an already-published SEO permalink from being changed to a
+    // draft URL such as ?p=123 by the Apply step. Users can still switch to
+    // "Save as Draft" explicitly in the status selector.
+    setWpStatus(item.status === "publish" ? "publish" : "draft");
     setUrl(item.url);
     setRewrite(null);
     setAnalysis(null);

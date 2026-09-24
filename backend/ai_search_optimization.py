@@ -201,7 +201,7 @@ def _focus_candidates(title: str, content: str, used: set[str]) -> list[str]:
         for i in range(max(0, len(meaningful) - n + 1)):
             phrase = " ".join(meaningful[i:i+n])
             norm = _normalize_phrase(phrase)
-            if not norm or norm in used or len(norm) < 5:
+            if not norm or _keyword_conflicts(norm, used) or len(norm) < 5:
                 continue
             count = content_norm.count(norm)
             score = (count * 10) + n + (2 if i == 0 else 0)
@@ -210,21 +210,80 @@ def _focus_candidates(title: str, content: str, used: set[str]) -> list[str]:
         for i in range(max(0, len(meaningful) - n + 1)):
             phrase = " ".join(meaningful[i:i+n])
             norm = _normalize_phrase(phrase)
-            if norm and norm not in used and len(norm) >= 5:
+            if norm and not _keyword_conflicts(norm, used) and len(norm) >= 5:
                 candidates.append((content_norm.count(norm) * 10 + n, phrase))
     candidates.sort(key=lambda item: (-item[0], len(item[1])))
     return [phrase for _, phrase in candidates]
 
 
+def _keyword_tokens(value: str) -> set[str]:
+    return {token for token in _normalize_phrase(value).split() if token}
+
+
+def _keyword_conflicts(candidate: str, used_keywords: set[str]) -> bool:
+    """Treat exact phrases and obvious phrase variants as the same focus keyword.
+
+    This prevents collisions such as:
+      commercial cleaning perth
+      commercial cleaning services perth
+    from being assigned to different pages.
+    """
+    candidate_norm = _normalize_phrase(candidate)
+    if not candidate_norm:
+        return False
+    candidate_tokens = _keyword_tokens(candidate_norm)
+    if not candidate_tokens:
+        return False
+    for used in used_keywords:
+        used_norm = _normalize_phrase(used)
+        if not used_norm:
+            continue
+        if candidate_norm == used_norm:
+            return True
+        used_tokens = _keyword_tokens(used_norm)
+        if not used_tokens:
+            continue
+        smaller, larger = sorted((candidate_tokens, used_tokens), key=len)
+        if smaller and smaller.issubset(larger):
+            # Only treat substantial phrases as collisions; this avoids making
+            # ordinary shared words such as "cleaning" globally unavailable.
+            if len(smaller) >= 2 and len(smaller) / len(larger) >= 0.67:
+                return True
+    return False
+
+
 def _choose_focus_keyword(title: str, content: str, requested: str, used_keywords: list[str]) -> tuple[str, bool]:
     used = {_normalize_phrase(x) for x in used_keywords if _normalize_phrase(x)}
     requested = re.sub(r"\s+", " ", requested or "").strip()
-    if requested and _normalize_phrase(requested) not in used:
+    requested_conflict = bool(requested and _keyword_conflicts(requested, used))
+    if requested and not requested_conflict:
         return requested, False
+
     for candidate in _focus_candidates(title, content, used):
-        return candidate, bool(requested)
-    fallback = " ".join(re.findall(r"[A-Za-z0-9]+", title)[:4]).strip() or "primary topic"
-    return fallback, bool(requested and _normalize_phrase(requested) in used)
+        if not _keyword_conflicts(candidate, used):
+            return candidate, bool(requested)
+
+    # If title-derived phrases are exhausted, derive candidates from the body
+    # rather than returning a phrase that collides with an existing page.
+    content_words = [
+        word for word in re.findall(r"[A-Za-z0-9]+", _normalize_phrase(content))
+        if len(word) >= 4
+    ]
+    for n in (4, 3, 2):
+        for i in range(max(0, len(content_words) - n + 1)):
+            candidate = " ".join(content_words[i:i + n])
+            if len(candidate) >= 5 and not _keyword_conflicts(candidate, used):
+                return candidate, bool(requested)
+
+    # Keep the result deterministic. This branch is only reached when there is
+    # no unique phrase available in the supplied title/content evidence.
+    base = " ".join(re.findall(r"[A-Za-z0-9]+", title)[:4]).strip() or "primary topic"
+    candidate = base
+    suffix = 2
+    while _keyword_conflicts(candidate, used):
+        candidate = f"{base} {suffix}"
+        suffix += 1
+    return candidate, bool(requested)
 
 
 def _canonical_url(value: str, base: str | None = None) -> str:
