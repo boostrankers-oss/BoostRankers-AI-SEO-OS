@@ -39,11 +39,17 @@ MAX_CONTENT_CHARS = 30000
 MIN_INTERNAL_LINKS = 3
 MAX_INTERNAL_LINKS = 5
 GENERIC_ANCHORS = {"click here", "read more", "learn more", "here", "more", "this article"}
+# Only remove true linguistic stopwords here. SEO/topic terms such as
+# "service", "cleaning", "commercial", "company", "local", and location names
+# are intentionally retained because they can be the only evidence connecting
+# a blog post to a relevant service/page target.
 LINK_STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from", "by",
     "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
-    "best", "guide", "complete", "ultimate", "tips", "checklist", "services", "service",
-    "company", "companies", "business", "businesses", "professional", "local", "near", "perth",
+    "these", "those", "is", "are", "was", "were", "be", "been", "being",
+    "as", "at", "it", "its", "into", "about", "over", "under", "than", "then",
+    "can", "could", "should", "would", "will", "may", "might", "do", "does", "did",
+    "you", "we", "they", "he", "she", "them", "their", "there", "here",
 }
 
 
@@ -940,7 +946,28 @@ def _select_internal_link_candidates(
             + (total_overlap * 3)
         )
 
-        if focus_norm and focus_norm in _normalize_phrase(target_title + " " + target_focus):
+        normalized_target_title = _normalize_phrase(target_title)
+        normalized_target_focus = _normalize_phrase(target_focus)
+
+        # Phrase-level evidence is stronger than isolated word overlap. This
+        # helps distinguish genuinely related service/topic pages from pages
+        # that happen to share one broad word.
+        normalized_source_title = _normalize_phrase(title)
+        normalized_source_focus = _normalize_phrase(focus_keyword)
+
+        if normalized_source_focus and normalized_source_focus in (
+            normalized_target_title + " " + normalized_target_focus
+        ):
+            score += 24
+
+        if normalized_source_title and normalized_source_title in (
+            normalized_target_title + " " + normalized_target_focus
+        ):
+            score += 16
+
+        if focus_norm and focus_norm in (
+            normalized_target_title + " " + normalized_target_focus
+        ):
             score += 18
 
         if str(candidate.get("type") or "").lower() == "page":
@@ -982,7 +1009,9 @@ def _select_internal_link_candidates(
     if not scored:
         return []
 
-    # Start with the strongest topical candidates.
+    # At this point every candidate has at least one piece of topical evidence.
+    # Select the strongest distinct targets first. Do not pad with zero-evidence
+    # URLs merely to satisfy the numeric minimum.
     selected: list[dict[str, str]] = [item[1] for item in scored[:MAX_INTERNAL_LINKS]]
 
     # If a relevant service target exists just outside the first five, reserve

@@ -127,80 +127,17 @@ function canonicalUrl(value: string) {
   }
 }
 
-function chooseTargetPages(
-  items: WPItem[],
-  sourceId: string,
-  sourceUrl: string,
-  focusKeyword: string,
-  title: string,
-): WPItem[] {
+function chooseTargetPage(items: WPItem[], sourceId: string, sourceUrl: string, focusKeyword: string, title: string) {
   const sourceKey = canonicalUrl(sourceUrl);
-  const sourceText = normalizePhrase(`${focusKeyword} ${title}`);
-  const sourceTerms = new Set(sourceText.split(" ").filter((term) => term.length >= 3));
-
-  const serviceTerms = new Set([
-    "service", "services", "cleaning", "commercial", "office", "school", "warehouse",
-    "carpet", "house", "industrial", "retail", "medical", "hotel", "gym", "window",
-    "disinfection", "sanitation", "facility", "janitorial",
-  ]);
-
-  const scored = items
-    .filter(
-      (item) =>
-        String(item.id) !== String(sourceId) &&
-        item.status === "publish" &&
-        item.url &&
-        item.title &&
-        canonicalUrl(item.url) !== sourceKey,
-    )
+  const sourceTerms = new Set(normalizePhrase(`${focusKeyword} ${title}`).split(" " ).filter(Boolean));
+  return items
+    .filter((item) => String(item.id) !== String(sourceId) && item.status === "publish" && item.url && item.title && canonicalUrl(item.url) !== sourceKey)
     .map((item) => {
-      const targetText = normalizePhrase(
-        `${item.title} ${item.focus_keyword || ""} ${item.excerpt || ""} ${item.content_html || ""}`.slice(0, 12000),
-      );
-      const targetTerms = new Set(targetText.split(" ").filter((term) => term.length >= 3));
-      const titleTerms = new Set(normalizePhrase(item.title).split(" ").filter(Boolean));
-      const focusTerms = new Set(normalizePhrase(item.focus_keyword || "").split(" ").filter(Boolean));
-      const overlap = [...sourceTerms].filter((term) => targetTerms.has(term)).length;
-      const titleOverlap = [...sourceTerms].filter((term) => titleTerms.has(term)).length;
-      const focusOverlap = [...sourceTerms].filter((term) => focusTerms.has(term)).length;
-      const sharedServiceTerms = [...serviceTerms].filter(
-        (term) => sourceTerms.has(term) && targetTerms.has(term),
-      ).length;
-
-      let score = titleOverlap * 14 + focusOverlap * 18 + overlap * 2;
-      if (item.type === "page") score += 3;
-      if (sharedServiceTerms) score += 14 + sharedServiceTerms * 3;
-
-      return { item, score, sharedServiceTerms };
+      const terms = new Set(normalizePhrase(item.title).split(" " ).filter(Boolean));
+      const overlap = [...sourceTerms].filter((term) => terms.has(term)).length;
+      return { item, score: overlap * 10 + (item.type === "page" ? 3 : 0) };
     })
-    .filter(({ score }) => score > 0)
-    .sort(
-      (a, b) =>
-        b.score - a.score ||
-        b.sharedServiceTerms - a.sharedServiceTerms ||
-        (a.item.type === "page" ? -1 : 1) ||
-        a.item.title.length - b.item.title.length,
-    );
-
-  const selected = scored.slice(0, 30).map(({ item }) => item);
-
-  // Keep a relevant service/solution page in the candidate pool when one exists,
-  // even if it falls just outside the first 30.
-  const hasServiceTarget = selected.some((item) => {
-    const text = normalizePhrase(`${item.title} ${item.focus_keyword || ""}`);
-    return [...serviceTerms].some((term) => text.includes(term) && sourceTerms.has(term));
-  });
-
-  if (!hasServiceTarget) {
-    const serviceCandidate = scored
-      .slice(30)
-      .find(({ sharedServiceTerms }) => sharedServiceTerms > 0)?.item;
-    if (serviceCandidate) {
-      selected[selected.length - 1] = serviceCandidate;
-    }
-  }
-
-  return selected.slice(0, 30);
+    .sort((a, b) => b.score - a.score || (a.item.type === "page" ? -1 : 1) || a.item.title.length - b.item.title.length)[0]?.item || null;
 }
 
 
@@ -219,7 +156,7 @@ export function AISearch() {
   const [wpPassword, setWpPassword] = useState("");
   const [wpItems, setWpItems] = useState<WPItem[]>([]);
   const [selectedPostId, setSelectedPostId] = useState("");
-  const [, setSelectedTargetPages] = useState<WPItem[]>([]);
+  const [selectedTargetPage, setSelectedTargetPage] = useState<WPItem | null>(null);
   const [loadingWp, setLoadingWp] = useState(false);
   const [applying, setApplying] = useState(false);
   const [wpStatus, setWpStatus] = useState<"draft" | "publish">("draft");
@@ -323,14 +260,31 @@ export function AISearch() {
       }
 
       const sourceId = String(current?.id || selectedPostId);
-      const targets = chooseTargetPages(
+      const targetCandidates = items
+        .filter((item) =>
+          String(item.id) !== sourceId &&
+          item.status === "publish" &&
+          item.url &&
+          item.title &&
+          canonicalUrl(item.url) !== canonicalUrl(analysis.measured.url),
+        )
+        .map((item) => ({
+          id: String(item.id),
+          type: item.type,
+          title: item.title,
+          url: item.url,
+          focus_keyword: item.focus_keyword || "",
+          excerpt: item.excerpt || "",
+          content_html: item.content_html || "",
+        }));
+      const target = chooseTargetPage(
         items,
         sourceId,
         analysis.measured.url,
         focusKeyword.trim(),
         analysis.measured.title,
       );
-      setSelectedTargetPages(targets);
+      setSelectedTargetPage(target);
 
       const usedFocusKeywords = items
         .filter((item) => String(item.id) !== sourceId)
@@ -348,26 +302,18 @@ export function AISearch() {
           meta_title: analysis.measured.meta_title,
           meta_description: analysis.measured.meta_description,
           analysis: analysis.ai_analysis,
-          internal_link_candidates: targets.map((item) => ({
-            id: String(item.id),
-            type: item.type,
-            title: item.title,
-            url: item.url,
-            focus_keyword: item.focus_keyword || "",
-            excerpt: (item.excerpt || "").slice(0, 2500),
-            content_html: (item.content_html || "").slice(0, 6000),
-          })),
+          internal_link_candidates: targetCandidates,
         },
       );
 
       setFocusKeyword(result.rewrite.focus_keyword || focusKeyword.trim());
       setRewrite(result.rewrite);
-      const linkCount = Number(result.rewrite.internal_links_applied || 0);
+      const appliedLinks = result.rewrite.internal_links_applied || 0;
       toast.success(
-        linkCount >= 3
-          ? `Article optimized with ${linkCount} verified contextual internal links.`
-          : linkCount > 0
-            ? `Article optimized with ${linkCount} verified contextual internal link(s).`
+        appliedLinks >= 3
+          ? `Article optimized with ${appliedLinks} verified internal links.`
+          : appliedLinks > 0
+            ? `Article optimized with ${appliedLinks} verified internal link(s).`
             : "Article optimized. No unrelated internal link was forced.",
       );
     } catch (err: any) {
@@ -415,8 +361,8 @@ export function AISearch() {
             ? existingKeyword
             : "",
         );
-        setSelectedTargetPages(
-          chooseTargetPages(
+        setSelectedTargetPage(
+          chooseTargetPage(
             items,
             String(matched.id),
             matched.url,
@@ -454,7 +400,7 @@ export function AISearch() {
         ? existingKeyword
         : "",
     );
-    setSelectedTargetPages(chooseTargetPages(wpItems, id, item.url, existingKeyword, item.title));
+    setSelectedTargetPage(chooseTargetPage(wpItems, id, item.url, existingKeyword, item.title));
     toast.success(
       existingKeyword && !otherUsed.has(normalizePhrase(existingKeyword))
         ? `${item.type === "post" ? "Post" : "Page"} selected. Existing unique focus keyword loaded automatically.`
@@ -658,16 +604,12 @@ export function AISearch() {
               <MetaField label="Internal links" value={String(rewrite.internal_links_applied ?? 0)} />
             </div>
             <div><p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Meta description</p><div className="rounded-lg border border-slate-200 dark:border-slate-800 p-3 text-sm">{showOriginal ? analysis?.measured.meta_description : rewrite.meta_description}</div></div>
-            {!showOriginal && rewrite.internal_link_targets?.length ? (
+            {selectedTargetPage && !showOriginal && (
               <div className="rounded-lg border border-indigo-200 dark:border-indigo-900/50 bg-indigo-50/50 dark:bg-indigo-500/5 p-3 text-sm">
-                <span className="font-semibold">Verified internal-link targets:</span>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {rewrite.internal_link_targets.map((target, index) => (
-                    <Badge key={`${target}-${index}`} variant="outline">{target}</Badge>
-                  ))}
-                </div>
+                <span className="font-semibold">Verified target page:</span> {selectedTargetPage.title}
+                <span className="text-slate-500 dark:text-slate-400"> — verified contextual internal-link targets are selected automatically; the current blog remains the destination being optimized.</span>
               </div>
-            ) : null}
+            )}
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 p-5 max-h-[520px] overflow-auto">
               {showOriginal ? <div className="prose prose-sm dark:prose-invert max-w-none" dangerouslySetInnerHTML={{ __html: analysis?.measured.content_html || "" }} /> : <div className="prose prose-sm dark:prose-invert max-w-none" dangerouslySetInnerHTML={{ __html: rewrite.article_html }} />}
             </div>
