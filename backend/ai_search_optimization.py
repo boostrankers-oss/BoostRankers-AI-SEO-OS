@@ -321,47 +321,22 @@ def _keyword_tokens(value: str) -> set[str]:
     }
 
 
-_KEYWORD_CANONICAL_STOPWORDS = {
-    "a", "an", "and", "as", "at", "by", "for", "from", "in", "into",
-    "of", "on", "or", "the", "to", "with", "without",
-}
-
-
-def _canonical_focus_keyword(value: str) -> str:
-    """Canonical form used only for focus-keyword assignment uniqueness.
-
-    It ignores harmless connector words and normalizes simple singular/plural
-    forms, while preserving the meaningful words and their order. It does not
-    use broad semantic similarity and does not block shorter/longer partial
-    phrases.
-    """
-    canonical: list[str] = []
-    for token in _normalize_phrase(value).split():
-        if token in _KEYWORD_CANONICAL_STOPWORDS:
-            continue
-        if token.endswith("ies") and len(token) > 4:
-            token = token[:-3] + "y"
-        elif token.endswith("s") and len(token) > 4:
-            token = token[:-1]
-        canonical.append(token)
-    return " ".join(canonical)
-
-
 def _keyword_conflicts(candidate: str, used_keywords: set[str] | list[str]) -> bool:
-    """Return True when the same focus-keyword assignment is already used.
+    """Return True only when the same normalized focus-keyword phrase is assigned.
 
-    Google result occurrences are irrelevant here. Only focus keywords actually
-    assigned to other WordPress posts/pages are considered. Connector-word and
-    simple singular/plural variants count as the same assignment; partial phrases
-    do not.
+    This is an assignment-uniqueness check, not a semantic/cannibalization check.
+    Search-result occurrences, shared words, shorter/longer phrases, connector
+    differences, and singular/plural variants do not block a different phrase.
+    Only the actual focus keyword stored on another WordPress post/page can
+    block the requested phrase.
     """
-    candidate_norm = _canonical_focus_keyword(candidate)
+    candidate_norm = _normalize_phrase(candidate)
     if not candidate_norm:
         return False
     return any(
-        candidate_norm == _canonical_focus_keyword(used)
+        candidate_norm == _normalize_phrase(used)
         for used in used_keywords
-        if _canonical_focus_keyword(used)
+        if _normalize_phrase(used)
     )
 
 
@@ -1039,16 +1014,17 @@ async def _ai_focus_keyword_suggestion(
     """Generate unused, topic-specific focus-keyword options with Claude.
 
     The AI is constrained by the site's actual assigned focus-keyword inventory.
-    Search-result appearances, partial phrase overlap, and shared words are not
-    treated as uniqueness conflicts.
+    Search-result appearances, partial phrase overlap, shared words, connector
+    differences, and singular/plural variants are not treated as uniqueness
+    conflicts. The exact normalized assigned phrase is the hard-block rule.
     """
     used_clean = [
         str(value).strip()
         for value in used_keywords
         if str(value).strip()
     ][:500]
-    used_normalized = {_canonical_focus_keyword(value) for value in used_clean if _canonical_focus_keyword(value)}
-    current_normalized = _canonical_focus_keyword(current_keyword)
+    used_normalized = {_normalize_phrase(value) for value in used_clean if _normalize_phrase(value)}
+    current_normalized = _normalize_phrase(current_keyword)
 
     system = """You are a senior SEO keyword strategist. Generate focus-keyword
 options for an existing article using only the supplied title and content.
@@ -1104,8 +1080,8 @@ Return exactly:
     seen: set[str] = set()
     for candidate in raw_candidates:
         normalized = _normalize_phrase(candidate)
-        canonical = _canonical_focus_keyword(candidate)
-        if not normalized or not canonical or canonical in seen or canonical in used_normalized:
+        canonical = normalized
+        if not normalized or canonical in seen or canonical in used_normalized:
             continue
         if current_normalized and canonical == current_normalized and current_normalized in used_normalized:
             continue
@@ -1687,11 +1663,19 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                     break
                 page_num += 1
 
+        # Focus-keyword uniqueness must be based on the complete, authoritative
+        # WordPress inventory. The SEO Bridge is therefore verified separately
+        # from the normal post/page REST listing. We fail closed for uniqueness
+        # validation if the bridge is unavailable or any per-item focus lookup
+        # fails, rather than silently treating an unknown keyword as unused.
         bridge = await _wordpress_request(
             client, site, "/boost-rankers/v1/seo-meta/status", auth=auth,
         )
+        focus_keyword_inventory_verified = False
+        focus_keyword_inventory_error = ""
         if bridge.status_code == 200:
             semaphore = asyncio.Semaphore(10)
+            lookup_failures: list[int] = []
 
             async def load_focus(item: dict[str, Any]) -> None:
                 async with semaphore:
@@ -1701,17 +1685,36 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                             auth=auth,
                         )
                         if meta.status_code >= 400:
+                            lookup_failures.append(int(item["id"]))
                             return
                         payload = meta.json()
                         value = _extract_focus_keyword(payload)
                         if value:
                             item["focus_keyword"] = value
                     except Exception:
-                        return
+                        lookup_failures.append(int(item["id"]))
 
             await asyncio.gather(*(load_focus(item) for item in items))
+            if lookup_failures:
+                focus_keyword_inventory_error = (
+                    "Could not verify the stored focus keyword for "
+                    f"{len(lookup_failures)} WordPress item(s). Refresh Posts & Pages "
+                    "before using a focus keyword."
+                )
+            else:
+                focus_keyword_inventory_verified = True
+        else:
+            focus_keyword_inventory_error = (
+                "Boost Rankers SEO Bridge could not be verified. Stored WordPress "
+                "focus keywords cannot be checked safely until the SEO Bridge is available."
+            )
 
-        return {"success": True, "items": items}
+        return {
+            "success": True,
+            "items": items,
+            "focus_keyword_inventory_verified": focus_keyword_inventory_verified,
+            "focus_keyword_inventory_error": focus_keyword_inventory_error,
+        }
 
 
 @router.post("/wordpress/apply")
