@@ -125,24 +125,12 @@ function normalizeKeywordToken(token: string) {
 }
 
 function focusKeywordConflicts(candidate: string, usedKeywords: string[]) {
+  // Uniqueness is based only on the focus keyword actually assigned to another
+  // WordPress item. Search-result occurrences, partial phrases, and shared
+  // words must never block a keyword.
   const candidateNorm = normalizePhrase(candidate);
   if (!candidateNorm) return false;
-  const candidateTokens = new Set(candidateNorm.split(" ").filter(Boolean).map(normalizeKeywordToken));
-
-  return usedKeywords.some((used) => {
-    const usedNorm = normalizePhrase(used);
-    if (!usedNorm) return false;
-    if (candidateNorm === usedNorm) return true;
-    const usedTokens = new Set(usedNorm.split(" ").filter(Boolean).map(normalizeKeywordToken));
-    const smaller = candidateTokens.size <= usedTokens.size ? candidateTokens : usedTokens;
-    const larger = candidateTokens.size <= usedTokens.size ? usedTokens : candidateTokens;
-    if (smaller.size < 2) return false;
-    let overlap = 0;
-    for (const token of smaller) {
-      if (larger.has(token)) overlap += 1;
-    }
-    return overlap / smaller.size >= 0.75 && smaller.size / larger.size >= 0.4;
-  });
+  return usedKeywords.some((used) => normalizePhrase(used) === candidateNorm);
 }
 
 function getUsedFocusKeywords(items: WPItem[], sourceId: string) {
@@ -154,24 +142,59 @@ function getUsedFocusKeywords(items: WPItem[], sourceId: string) {
 
 function suggestUniqueFocusKeyword(item: WPItem | undefined, usedKeywords: string[]) {
   if (!item) return "";
-  const stop = new Set([
-    "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from",
-    "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
-    "guide", "best", "ultimate", "complete", "tips", "checklist",
+
+  // Generate a useful topical phrase from the actual post rather than a
+  // fragment such as "need pick end lease". Keep phrase connectors such as
+  // "of" because they are part of real search phrases like
+  // "end of lease cleaning".
+  const generic = new Set([
+    "the", "a", "an", "and", "or", "for", "to", "in", "on", "with", "from",
+    "how", "what", "why", "when", "where", "who", "which", "your", "our",
+    "this", "that", "guide", "best", "ultimate", "complete", "tips",
+    "checklist", "need", "pick", "choose", "does", "do", "we",
   ]);
   const text = `${item.title} ${item.content_html || ""}`.replace(/<[^>]*>/g, " ");
-  const words = normalizePhrase(text).split(" ").filter((word) => word.length > 2 && !stop.has(word));
-  const titleWords = normalizePhrase(item.title).split(" ").filter((word) => word.length > 2 && !stop.has(word));
-  const candidates: string[] = [];
-  for (const source of [titleWords, words]) {
-    for (const size of [4, 3, 2]) {
+  const titleWords = normalizePhrase(item.title).split(" ").filter(Boolean);
+  const bodyWords = normalizePhrase(text).split(" ").filter(Boolean);
+  const candidates: Array<{ phrase: string; score: number }> = [];
+
+  const addCandidates = (source: string[], sourceWeight: number) => {
+    for (const size of [5, 4, 3]) {
       for (let index = 0; index <= source.length - size; index += 1) {
-        const phrase = source.slice(index, index + size).join(" ");
-        if (phrase.length >= 5 && !focusKeywordConflicts(phrase, usedKeywords)) candidates.push(phrase);
+        const phrase = source.slice(index, index + size).join(" ").trim();
+        if (phrase.length < 8 || focusKeywordConflicts(phrase, usedKeywords)) continue;
+
+        const tokens = phrase.split(" ");
+        const meaningful = tokens.filter((token) => !generic.has(token) && token.length >= 3);
+        if (meaningful.length < 2) continue;
+
+        const exactBodyCount = normalizePhrase(item.content_html || "").split(phrase).length - 1;
+        const serviceTerms = new Set([
+          "cleaning", "service", "services", "commercial", "office", "house",
+          "end", "lease", "bond", "vacate", "vacate", "perth", "school",
+          "warehouse", "carpet", "industrial",
+        ]);
+        const topicalCount = meaningful.filter((token) => serviceTerms.has(token)).length;
+
+        // Prefer phrases from the title, 3-5 words, containing multiple
+        // topical terms and, when present, actually repeated in the article.
+        const score =
+          sourceWeight +
+          (meaningful.length * 10) +
+          (topicalCount * 18) +
+          Math.min(exactBodyCount, 3) * 8 -
+          Math.max(0, size - 4) * 2;
+
+        candidates.push({ phrase, score });
       }
     }
-  }
-  return candidates[0] || "";
+  };
+
+  addCandidates(titleWords, 100);
+  addCandidates(bodyWords, 40);
+
+  candidates.sort((a, b) => b.score - a.score || a.phrase.length - b.phrase.length);
+  return candidates[0]?.phrase || "";
 }
 
 function canonicalUrl(value: string) {
@@ -266,17 +289,59 @@ export function AISearch() {
     setAnalysis(null);
     setRewrite(null);
     try {
-      if (focusKeywordIsUsed) {
-        toast.error("Focus keyword already in use. Choose an unused keyword for this post.");
+      // Keyword uniqueness must be checked against the current WordPress
+      // inventory, not only against whatever was previously loaded in React
+      // state. If the user has supplied WordPress credentials, automatically
+      // refresh the inventory before analysis so a newly entered duplicate
+      // cannot slip through because the list is stale/empty.
+      let validationItems = wpItems;
+      if (!validationItems.length && wpSite.trim() && wpUsername.trim() && wpPassword.trim()) {
+        const wpResult = await api.post<{ success: boolean; items: WPItem[] }>(
+          "/api/ai-search-optimization/wordpress/content",
+          {
+            wordpress_site: wpSite.trim(),
+            wordpress_username: wpUsername.trim(),
+            wordpress_application_password: wpPassword.trim(),
+          },
+        );
+        validationItems = wpResult.items || [];
+        setWpItems(validationItems);
+      }
+
+      const matchedForValidation = validationItems.find(
+        (item) => canonicalUrl(item.url) === canonicalUrl(url.trim()),
+      );
+      const validationSourceId = String(matchedForValidation?.id || selectedPostId || "");
+      const validationUsedKeywords = getUsedFocusKeywords(validationItems, validationSourceId);
+
+      if (focusKeyword.trim() && focusKeywordConflicts(focusKeyword.trim(), validationUsedKeywords)) {
+        const suggestion = suggestUniqueFocusKeyword(matchedForValidation, validationUsedKeywords);
+        const message = suggestion
+          ? `Focus keyword already in use. Choose an unused keyword. Suggested: ${suggestion}`
+          : "Focus keyword already in use. Choose an unused keyword for this post.";
+        toast.error(message);
+        setError(message);
         setLoading(false);
         return;
       }
+
+      // If WordPress credentials were supplied but no keyword inventory could
+      // be loaded, do not claim that uniqueness was verified. The public-page
+      // analyzer can still be used when no WordPress connection is configured.
+      if (focusKeyword.trim() && wpSite.trim() && wpUsername.trim() && wpPassword.trim() && !validationItems.length) {
+        const message = "WordPress Posts & Pages could not be loaded, so this focus keyword cannot be verified as unique. Load Posts & Pages successfully before analyzing.";
+        toast.error(message);
+        setError(message);
+        setLoading(false);
+        return;
+      }
+
       const result = await api.post<{ success: boolean; measured: MeasuredPage; ai_analysis: AIAnalysis }>(
         "/api/ai-search-optimization/analyze",
         {
           url: url.trim(),
           focus_keyword: focusKeyword.trim(),
-          used_focus_keywords: usedFocusKeywords,
+          used_focus_keywords: validationUsedKeywords,
         },
       );
       setAnalysis({ measured: result.measured, ai_analysis: result.ai_analysis });

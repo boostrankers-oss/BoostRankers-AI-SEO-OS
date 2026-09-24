@@ -201,8 +201,16 @@ _FOCUS_KEY_FIELDS = {
 
 
 def _extract_focus_keyword(payload: Any) -> str:
-    """Extract a focus keyword from common SEO-bridge/meta response shapes."""
+    """Extract the stored primary focus keyword from common SEO plugin/meta shapes.
+
+    WordPress exposes SEO metadata differently depending on the active SEO
+    plugin and whether the plugin registers its meta keys with REST.  Do not
+    rely on one exact key: recognize explicit focus-keyword fields and common
+    plugin naming patterns, while avoiding generic fields such as arbitrary
+    ``keywords`` values.
+    """
     if isinstance(payload, dict):
+        # Prefer explicit known fields first.
         for key, value in payload.items():
             normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
             if normalized_key in _FOCUS_KEY_FIELDS:
@@ -212,10 +220,33 @@ def _extract_focus_keyword(payload: Any) -> str:
                     for entry in value:
                         if isinstance(entry, str) and entry.strip():
                             return " ".join(entry.split())
-        for nested_key in ("meta", "seo", "data", "result", "yoast", "rank_math"):
-            found = _extract_focus_keyword(payload.get(nested_key))
-            if found:
-                return found
+
+        # Then support additional SEO plugins/custom bridges whose field name
+        # explicitly identifies a focus keyword/keyphrase.  This covers keys
+        # such as _seopress_analysis_target_kw without treating generic
+        # metadata like "keywords" as a focus keyword.
+        for key, value in payload.items():
+            normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+            is_focus_field = (
+                ("focus" in normalized_key and ("keyword" in normalized_key or "keyphrase" in normalized_key or "kw" in normalized_key))
+                or ("target" in normalized_key and "kw" in normalized_key)
+                or normalized_key in {"seopress_analysis_target_kw", "seopress_target_kw"}
+            )
+            if not is_focus_field:
+                continue
+            if isinstance(value, str) and value.strip():
+                return " ".join(value.split())
+            if isinstance(value, list):
+                for entry in value:
+                    if isinstance(entry, str) and entry.strip():
+                        return " ".join(entry.split())
+
+        for nested_key in ("meta", "seo", "data", "result", "yoast", "rank_math", "aioseo", "seopress"):
+            nested = payload.get(nested_key)
+            if isinstance(nested, (dict, list)):
+                found = _extract_focus_keyword(nested)
+                if found:
+                    return found
         for value in payload.values():
             if isinstance(value, (dict, list)):
                 found = _extract_focus_keyword(value)
@@ -232,7 +263,7 @@ def _extract_focus_keyword(payload: Any) -> str:
 def _focus_candidates(title: str, content: str, used: set[str]) -> list[str]:
     """Build deterministic title/content-derived keyword candidates without inventing topics."""
     stop = {
-        "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from",
+        "the", "a", "an", "and", "or", "for", "to", "in", "on", "with", "from",
         "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
         "guide", "best", "ultimate", "complete", "tips", "checklist",
     }
@@ -284,37 +315,21 @@ def _keyword_tokens(value: str) -> set[str]:
 
 
 def _keyword_conflicts(candidate: str, used_keywords: set[str]) -> bool:
-    """Treat exact phrases and obvious phrase variants as the same focus keyword.
+    """Return True only when the focus-keyword phrase itself is already assigned.
 
-    This prevents collisions such as:
-      commercial cleaning perth
-      commercial cleaning services perth
-    from being assigned to different pages.
+    Search-result occurrences, partial phrases, and shared words are NOT
+    uniqueness conflicts. For example, ``end of`` must remain available when
+    another page uses ``end of lease cleaning Perth``. The uniqueness rule is
+    intentionally based on the site's stored focus-keyword assignments, not on
+    what Google happens to display for a query.
+
+    Case, punctuation, whitespace, and URL-style separators are normalized so
+    harmless formatting differences still count as the same assigned keyword.
     """
     candidate_norm = _normalize_phrase(candidate)
     if not candidate_norm:
         return False
-    candidate_tokens = _keyword_tokens(candidate_norm)
-    if not candidate_tokens:
-        return False
-    for used in used_keywords:
-        used_norm = _normalize_phrase(used)
-        if not used_norm:
-            continue
-        if candidate_norm == used_norm:
-            return True
-        used_tokens = _keyword_tokens(used_norm)
-        if not used_tokens:
-            continue
-        smaller, larger = sorted((candidate_tokens, used_tokens), key=len)
-        if smaller:
-            overlap = len(smaller & larger)
-            # Treat substantial phrase overlap as a collision. This catches exact
-            # variants such as "commercial cleaning" vs "commercial cleaning
-            # services Perth" without making a single shared word unavailable.
-            if len(smaller) >= 2 and overlap / len(smaller) >= 0.75 and len(smaller) / len(larger) >= 0.40:
-                return True
-    return False
+    return any(candidate_norm == _normalize_phrase(used) for used in used_keywords if _normalize_phrase(used))
 
 
 def _choose_focus_keyword(title: str, content: str, requested: str, used_keywords: list[str]) -> tuple[str, bool]:
