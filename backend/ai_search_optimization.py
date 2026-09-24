@@ -321,22 +321,48 @@ def _keyword_tokens(value: str) -> set[str]:
     }
 
 
-def _keyword_conflicts(candidate: str, used_keywords: set[str]) -> bool:
-    """Return True only when the focus-keyword phrase itself is already assigned.
+_KEYWORD_CANONICAL_STOPWORDS = {
+    "a", "an", "and", "as", "at", "by", "for", "from", "in", "into",
+    "of", "on", "or", "the", "to", "with", "without",
+}
 
-    Search-result occurrences, partial phrases, and shared words are NOT
-    uniqueness conflicts. For example, ``end of`` must remain available when
-    another page uses ``end of lease cleaning Perth``. The uniqueness rule is
-    intentionally based on the site's stored focus-keyword assignments, not on
-    what Google happens to display for a query.
 
-    Case, punctuation, whitespace, and URL-style separators are normalized so
-    harmless formatting differences still count as the same assigned keyword.
+def _canonical_focus_keyword(value: str) -> str:
+    """Canonical form used only for focus-keyword assignment uniqueness.
+
+    It ignores harmless connector words and normalizes simple singular/plural
+    forms, while preserving the meaningful words and their order. It does not
+    use broad semantic similarity and does not block shorter/longer partial
+    phrases.
     """
-    candidate_norm = _normalize_phrase(candidate)
+    canonical: list[str] = []
+    for token in _normalize_phrase(value).split():
+        if token in _KEYWORD_CANONICAL_STOPWORDS:
+            continue
+        if token.endswith("ies") and len(token) > 4:
+            token = token[:-3] + "y"
+        elif token.endswith("s") and len(token) > 4:
+            token = token[:-1]
+        canonical.append(token)
+    return " ".join(canonical)
+
+
+def _keyword_conflicts(candidate: str, used_keywords: set[str] | list[str]) -> bool:
+    """Return True when the same focus-keyword assignment is already used.
+
+    Google result occurrences are irrelevant here. Only focus keywords actually
+    assigned to other WordPress posts/pages are considered. Connector-word and
+    simple singular/plural variants count as the same assignment; partial phrases
+    do not.
+    """
+    candidate_norm = _canonical_focus_keyword(candidate)
     if not candidate_norm:
         return False
-    return any(candidate_norm == _normalize_phrase(used) for used in used_keywords if _normalize_phrase(used))
+    return any(
+        candidate_norm == _canonical_focus_keyword(used)
+        for used in used_keywords
+        if _canonical_focus_keyword(used)
+    )
 
 
 def _choose_focus_keyword(title: str, content: str, requested: str, used_keywords: list[str]) -> tuple[str, bool]:
@@ -1021,8 +1047,8 @@ async def _ai_focus_keyword_suggestion(
         for value in used_keywords
         if str(value).strip()
     ][:500]
-    used_normalized = {_normalize_phrase(value) for value in used_clean if _normalize_phrase(value)}
-    current_normalized = _normalize_phrase(current_keyword)
+    used_normalized = {_canonical_focus_keyword(value) for value in used_clean if _canonical_focus_keyword(value)}
+    current_normalized = _canonical_focus_keyword(current_keyword)
 
     system = """You are a senior SEO keyword strategist. Generate focus-keyword
 options for an existing article using only the supplied title and content.
@@ -1031,8 +1057,8 @@ the site's broader service-page architecture without creating a duplicate
 focus-keyword assignment.
 
 Hard rules:
-1. Never return a phrase that exactly matches any already-used focus keyword
-   after case, punctuation, whitespace, and separator normalization.
+1. Never return a phrase that matches an already-used focus-keyword assignment
+   after connector-word and simple singular/plural normalization.
 2. Do NOT treat partial phrase overlap or shared words as a duplicate. For
    example, "end of" and "end of lease cleaning Perth" are different phrases.
 3. Prefer a natural 3-6 word search phrase that accurately describes the
@@ -1078,15 +1104,16 @@ Return exactly:
     seen: set[str] = set()
     for candidate in raw_candidates:
         normalized = _normalize_phrase(candidate)
-        if not normalized or normalized in seen or normalized in used_normalized:
+        canonical = _canonical_focus_keyword(candidate)
+        if not normalized or not canonical or canonical in seen or canonical in used_normalized:
             continue
-        if current_normalized and normalized == current_normalized and current_normalized in used_normalized:
+        if current_normalized and canonical == current_normalized and current_normalized in used_normalized:
             continue
         # Keep suggestions as meaningful phrases rather than one/two-word fragments.
         token_count = len(normalized.split())
         if token_count < 3 or token_count > 8:
             continue
-        seen.add(normalized)
+        seen.add(canonical)
         valid.append(re.sub(r"\s+", " ", candidate).strip())
         if len(valid) >= 4:
             break
@@ -1135,7 +1162,7 @@ async def analyze_post(
     used_keywords = [str(x).strip() for x in data.used_focus_keywords if str(x).strip()]
     used_for_prompt = used_keywords[:250]
     requested_keyword = data.focus_keyword.strip()
-    used_keyword_set = {_normalize_phrase(x) for x in used_keywords if _normalize_phrase(x)}
+    used_keyword_set = set(used_keywords)
     if requested_keyword and _keyword_conflicts(requested_keyword, used_keyword_set):
         suggested_keyword, alternatives = await _ai_focus_keyword_suggestion(
             api_key=api_key,
@@ -1395,7 +1422,7 @@ async def rewrite_post(
     rewrite_used_keywords = [str(x).strip() for x in data.used_focus_keywords if str(x).strip()]
     if data.focus_keyword.strip() and _keyword_conflicts(
         data.focus_keyword.strip(),
-        {_normalize_phrase(x) for x in rewrite_used_keywords if _normalize_phrase(x)},
+        rewrite_used_keywords,
     ):
         suggested_keyword, alternatives = await _ai_focus_keyword_suggestion(
             api_key=api_key,

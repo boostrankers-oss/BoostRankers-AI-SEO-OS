@@ -111,21 +111,58 @@ function scoreBarClass(score: number) {
 }
 
 function getErrorMessage(error: any, fallback: string) {
-  return error?.data?.detail || error?.response?.data?.detail || error?.message || fallback;
+  const detail = error?.data?.detail || error?.response?.data?.detail;
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object") {
+    const message = String(detail.message || "").trim();
+    if (message) return message;
+  }
+  return error?.message || fallback;
+}
+
+function getFocusKeywordError(error: any) {
+  const detail = error?.data?.detail || error?.response?.data?.detail;
+  if (!detail || typeof detail !== "object") return null;
+  return {
+    message: String(detail.message || "Focus keyword is already in use.").trim(),
+    suggestion: String(detail.suggested_focus_keyword || "").trim(),
+    alternatives: Array.isArray(detail.alternatives)
+      ? detail.alternatives.map((value: unknown) => String(value).trim()).filter(Boolean)
+      : [],
+  };
 }
 
 function normalizePhrase(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
 }
 
-function focusKeywordConflicts(candidate: string, usedKeywords: string[]) {
-  // Uniqueness is based only on the focus keyword actually assigned to another
-  // WordPress item. Search-result occurrences, partial phrases, and shared
-  // words must never block a keyword.
-  const candidateNorm = normalizePhrase(candidate);
-  if (!candidateNorm) return false;
-  return usedKeywords.some((used) => normalizePhrase(used) === candidateNorm);
+const FOCUS_KEYWORD_CONNECTORS = new Set([
+  "a", "an", "and", "as", "at", "by", "for", "from", "in", "into",
+  "of", "on", "or", "the", "to", "with", "without",
+]);
+
+function canonicalFocusKeyword(value: string) {
+  return normalizePhrase(value)
+    .split(" ")
+    .filter(Boolean)
+    .filter((token) => !FOCUS_KEYWORD_CONNECTORS.has(token))
+    .map((token) => {
+      if (token.endsWith("ies") && token.length > 4) return `${token.slice(0, -3)}y`;
+      if (token.endsWith("s") && token.length > 4) return token.slice(0, -1);
+      return token;
+    })
+    .join(" ");
 }
+
+function focusKeywordConflicts(candidate: string, usedKeywords: string[]) {
+  // Compare actual WordPress focus-keyword assignments. Connector-word and
+  // simple singular/plural variants count as the same assignment. Shorter or
+  // longer partial phrases and Google search-result occurrences do not.
+  const candidateNorm = canonicalFocusKeyword(candidate);
+  if (!candidateNorm) return false;
+  return usedKeywords.some((used) => canonicalFocusKeyword(used) === candidateNorm);
+}
+
 
 function getUsedFocusKeywords(items: WPItem[], sourceId: string) {
   return items
@@ -242,17 +279,18 @@ export function AISearch() {
   const activeMetaTitle = rewrite?.meta_title || analysis?.measured.meta_title || "";
   const activeMetaDescription = rewrite?.meta_description || analysis?.measured.meta_description || "";
   const activeHtml = rewrite?.article_html || analysis?.measured.content_html || "";
+  const matchedWpItem = useMemo(
+    () => wpItems.find((item) => canonicalUrl(item.url) === canonicalUrl(url.trim())),
+    [wpItems, url],
+  );
+  const sourceWpId = String(selectedPostId || matchedWpItem?.id || "");
   const usedFocusKeywords = useMemo(
-    () => getUsedFocusKeywords(wpItems, String(selectedPostId)),
-    [wpItems, selectedPostId],
+    () => getUsedFocusKeywords(wpItems, sourceWpId),
+    [wpItems, sourceWpId],
   );
   const focusKeywordIsUsed = useMemo(
     () => focusKeyword.trim() ? focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords) : false,
     [focusKeyword, usedFocusKeywords],
-  );
-  const matchedWpItem = useMemo(
-    () => wpItems.find((item) => canonicalUrl(item.url) === canonicalUrl(url.trim())),
-    [wpItems, url],
   );
   const suggestedUniqueFocusKeyword = useMemo(
     () => focusKeywordIsUsed ? suggestUniqueFocusKeyword(matchedWpItem, usedFocusKeywords) : "",
@@ -533,9 +571,23 @@ export function AISearch() {
             : "Article optimized. No unrelated internal link was forced.",
       );
     } catch (err: any) {
-      const message = getErrorMessage(err, "Could not rewrite the post.");
-      setError(message);
-      toast.error(message);
+      const keywordError = getFocusKeywordError(err);
+      if (keywordError) {
+        if (keywordError.suggestion) setAiSuggestedFocusKeyword(keywordError.suggestion);
+        if (keywordError.alternatives.length) setAiKeywordAlternatives(keywordError.alternatives);
+        setError(keywordError.message);
+        toast.error(
+          keywordError.suggestion
+            ? `${keywordError.message} AI suggestion: ${keywordError.suggestion}`
+            : keywordError.message,
+        );
+      } else {
+        const message = getErrorMessage(err, "Could not rewrite the post.");
+        const suggestedMatch = String(message).match(/AI suggestion:\s*([^\.]+?)(?:\.|$)/i);
+        if (suggestedMatch?.[1]) setAiSuggestedFocusKeyword(suggestedMatch[1].trim());
+        setError(message);
+        toast.error(message);
+      }
     } finally {
       setRewriting(false);
     }
@@ -714,7 +766,7 @@ export function AISearch() {
                 {focusKeywordIsUsed ? (
                   <div className="space-y-2 text-xs text-rose-600 dark:text-rose-400">
                     <p>
-                      <strong>Duplicate focus keyword.</strong> This exact focus keyword is already assigned to another WordPress post/page, so Analyze and Rewrite are blocked until you select an unused keyword.
+                      <strong>Duplicate focus keyword.</strong> This focus-keyword assignment is already used by another WordPress post/page, so Analyze and Rewrite are blocked until you select an unused keyword.
                     </p>
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-slate-600 dark:text-slate-300">
@@ -743,7 +795,7 @@ export function AISearch() {
                     )}
                   </div>
                 ) : (
-                  <p className="text-xs text-slate-500">Focus keywords are unique by exact assigned phrase. Search-result occurrences or partial phrase overlap do not block a keyword.</p>
+                  <p className="text-xs text-slate-500">Focus keywords are unique by their assigned phrase. Simple singular/plural or connector-word variants count as duplicates; partial phrases and search-result occurrences do not.</p>
                 )}
               </div>
             </div>
