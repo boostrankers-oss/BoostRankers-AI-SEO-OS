@@ -68,7 +68,7 @@ class RewriteRequest(BaseModel):
     meta_description: str = Field(default="", max_length=1000)
     analysis: dict[str, Any] = Field(default_factory=dict)
     used_focus_keywords: list[str] = Field(default_factory=list, max_length=500)
-    internal_link_candidates: list[dict[str, str]] = Field(default_factory=list, max_length=100)
+    internal_link_candidates: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
 
 
 class WordPressCredentialsRequest(BaseModel):
@@ -1038,6 +1038,23 @@ async def rewrite_post(
     company_id = _require_company(current_user)
     api_key = _resolve_anthropic_api_key(db, company_id)
     source_text = _strip_html(data.content_html)
+
+    # WordPress can return hundreds of published items. The frontend is allowed
+    # to send a larger candidate set, but the rewrite engine only needs a bounded
+    # set for relevance scoring and the Claude prompt. This also prevents a 422
+    # validation failure when a site has more than 100 published targets.
+    raw_candidates = data.internal_link_candidates[:100]
+    normalized_candidates: list[dict[str, str]] = []
+    for candidate in raw_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        normalized = {
+            str(key): str(value or "").strip()
+            for key, value in candidate.items()
+        }
+        if normalized.get("url") and normalized.get("title"):
+            normalized_candidates.append(normalized)
+
     source_word_count = _word_count(source_text)
     if source_word_count < 100:
         raise HTTPException(status_code=400, detail="The post needs at least 100 readable words before AI rewriting.")
@@ -1056,7 +1073,7 @@ async def rewrite_post(
         data.title,
         source_text,
         chosen_keyword,
-        data.internal_link_candidates,
+        normalized_candidates,
     )
 
     target_summary = [
