@@ -118,11 +118,6 @@ function normalizePhrase(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
 }
 
-function normalizeKeywordToken(token: string) {
-  if (token.endsWith("ies") && token.length > 4) return `${token.slice(0, -3)}y`;
-  if (token.endsWith("s") && token.length > 4) return token.slice(0, -1);
-  return token;
-}
 
 function focusKeywordConflicts(candidate: string, usedKeywords: string[]) {
   // Uniqueness is based only on the focus keyword actually assigned to another
