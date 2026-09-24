@@ -1,4 +1,4 @@
-﻿import { useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
 import {
   AlertCircle,
   ArrowRight,
@@ -118,7 +118,6 @@ function normalizePhrase(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
 }
 
-
 function focusKeywordConflicts(candidate: string, usedKeywords: string[]) {
   // Uniqueness is based only on the focus keyword actually assigned to another
   // WordPress item. Search-result occurrences, partial phrases, and shared
@@ -234,6 +233,9 @@ export function AISearch() {
   const [loadingWp, setLoadingWp] = useState(false);
   const [applying, setApplying] = useState(false);
   const [wpStatus, setWpStatus] = useState<"draft" | "publish">("draft");
+  const [aiSuggestedFocusKeyword, setAiSuggestedFocusKeyword] = useState("");
+  const [aiKeywordAlternatives, setAiKeywordAlternatives] = useState<string[]>([]);
+  const [suggestingFocusKeyword, setSuggestingFocusKeyword] = useState(false);
 
   const activeTitle = rewrite?.title || analysis?.measured.title || "";
   const activeKeyword = rewrite?.focus_keyword || focusKeyword;
@@ -256,6 +258,76 @@ export function AISearch() {
     () => focusKeywordIsUsed ? suggestUniqueFocusKeyword(matchedWpItem, usedFocusKeywords) : "",
     [focusKeywordIsUsed, matchedWpItem, usedFocusKeywords],
   );
+
+  // Ask Claude for a topic-specific unused keyword only when a duplicate is
+  // actually detected. This avoids an AI request on every keystroke while
+  // ensuring the replacement is based on the real article.
+  useEffect(() => {
+    if (!focusKeywordIsUsed || !matchedWpItem || !wpSite || !wpUsername || !wpPassword) {
+      if (!focusKeywordIsUsed) {
+        setAiSuggestedFocusKeyword("");
+        setAiKeywordAlternatives([]);
+      }
+      return;
+    }
+
+    let cancelled = false;
+    const requestSuggestion = async () => {
+      setSuggestingFocusKeyword(true);
+      try {
+        const result = await api.post<{
+          success: boolean;
+          suggested_focus_keyword: string;
+          alternatives?: string[];
+        }>("/api/ai-search-optimization/suggest-focus-keyword", {
+          title: analysis?.measured.title || matchedWpItem.title,
+          content: analysis?.measured.content_html || matchedWpItem.content_html || matchedWpItem.excerpt,
+          current_focus_keyword: focusKeyword.trim(),
+          used_focus_keywords: usedFocusKeywords,
+        });
+        if (!cancelled) {
+          setAiSuggestedFocusKeyword(result.suggested_focus_keyword || "");
+          setAiKeywordAlternatives(result.alternatives || []);
+        }
+      } catch {
+        // Keep the local evidence-based suggestion visible if Claude is
+        // unavailable; the duplicate must still remain blocked.
+        if (!cancelled) {
+          setAiSuggestedFocusKeyword(suggestedUniqueFocusKeyword || "");
+          setAiKeywordAlternatives([]);
+        }
+      } finally {
+        if (!cancelled) setSuggestingFocusKeyword(false);
+      }
+    };
+
+    void requestSuggestion();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    focusKeywordIsUsed,
+    focusKeyword,
+    matchedWpItem,
+    wpSite,
+    wpUsername,
+    wpPassword,
+    analysis?.measured.title,
+    analysis?.measured.content_html,
+    usedFocusKeywords,
+    suggestedUniqueFocusKeyword,
+  ]);
+
+  const applySuggestedFocusKeyword = (keyword: string) => {
+    const value = keyword.trim();
+    if (!value) return;
+    setFocusKeyword(value);
+    setAiSuggestedFocusKeyword(value);
+    setError("");
+    setAnalysis(null);
+    setRewrite(null);
+    toast.success(`AI-selected unused focus keyword: ${value}`);
+  };
 
   const readinessCards = useMemo(() => {
     if (!analysis) {
@@ -350,6 +422,10 @@ export function AISearch() {
       }
     } catch (err: any) {
       const message = getErrorMessage(err, "Could not analyze the post.");
+      const suggestedMatch = String(message).match(/(?:AI suggestion|Suggested for this post):\s*([^\.]+?)(?:\.|$)/i);
+      if (suggestedMatch?.[1]) {
+        setAiSuggestedFocusKeyword(suggestedMatch[1].trim());
+      }
       setError(message);
       toast.error(message);
     } finally {
@@ -421,7 +497,12 @@ export function AISearch() {
 
       const usedFocusKeywords = getUsedFocusKeywords(items, sourceId);
       if (focusKeyword.trim() && focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords)) {
-        toast.error("Focus keyword already in use. Choose an unused keyword for this post.");
+        const suggestion = aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword;
+        const message = suggestion
+          ? `Rewrite blocked: focus keyword already in use. Select an unused keyword. AI suggestion: ${suggestion}`
+          : "Rewrite blocked: focus keyword already in use. Select an unused keyword before rewriting.";
+        setError(message);
+        toast.error(message);
         setRewriting(false);
         return;
       }
@@ -631,12 +712,38 @@ export function AISearch() {
                   className={focusKeywordIsUsed ? "border-rose-500 focus-visible:ring-rose-500" : ""}
                 />
                 {focusKeywordIsUsed ? (
-                  <p className="text-xs text-rose-600 dark:text-rose-400">
-                    Focus keyword already in use by another WordPress post/page. Choose an unused keyword related to this post.
-                    {suggestedUniqueFocusKeyword ? ` Suggested: ${suggestedUniqueFocusKeyword}` : ""}
-                  </p>
+                  <div className="space-y-2 text-xs text-rose-600 dark:text-rose-400">
+                    <p>
+                      <strong>Duplicate focus keyword.</strong> This exact focus keyword is already assigned to another WordPress post/page, so Analyze and Rewrite are blocked until you select an unused keyword.
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-slate-600 dark:text-slate-300">
+                        {suggestingFocusKeyword
+                          ? "Claude is generating a topic-specific unused keyword..."
+                          : `AI suggestion: ${aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword || "No suggestion available yet."}`}
+                      </span>
+                      {(aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword) && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => applySuggestedFocusKeyword(aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword)}
+                          disabled={suggestingFocusKeyword}
+                          className="h-7"
+                        >
+                          <Sparkles className="size-3.5 mr-1" />
+                          Use AI suggestion
+                        </Button>
+                      )}
+                    </div>
+                    {aiKeywordAlternatives.length > 0 && (
+                      <p className="text-slate-500 dark:text-slate-400">
+                        Alternatives: {aiKeywordAlternatives.join(" • ")}
+                      </p>
+                    )}
+                  </div>
                 ) : (
-                  <p className="text-xs text-slate-500">If the keyword is already used by another loaded WordPress post/page, Boost Rankers blocks it and requires a unique keyword.</p>
+                  <p className="text-xs text-slate-500">Focus keywords are unique by exact assigned phrase. Search-result occurrences or partial phrase overlap do not block a keyword.</p>
                 )}
               </div>
             </div>
@@ -646,7 +753,7 @@ export function AISearch() {
                 {loading ? "Analyzing..." : "Analyze Post"}
               </Button>
               {analysis && (
-                <Button variant="outline" onClick={rewritePost} disabled={rewriting}>
+                <Button variant="outline" onClick={rewritePost} disabled={rewriting || focusKeywordIsUsed}>
                   {rewriting ? <Loader2 className="size-4 animate-spin" /> : <Wand2 className="size-4" />}
                   {rewriting ? "Rewriting..." : "Rewrite & Optimize"}
                 </Button>

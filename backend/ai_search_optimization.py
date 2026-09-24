@@ -59,6 +59,13 @@ class AnalyzeRequest(BaseModel):
     used_focus_keywords: list[str] = Field(default_factory=list, max_length=500)
 
 
+class FocusKeywordSuggestionRequest(BaseModel):
+    title: str = Field(min_length=3, max_length=500)
+    content: str = Field(min_length=50, max_length=120000)
+    current_focus_keyword: str = Field(default="", max_length=500)
+    used_focus_keywords: list[str] = Field(default_factory=list, max_length=500)
+
+
 class RewriteRequest(BaseModel):
     url: HttpUrl
     focus_keyword: str = Field(min_length=1, max_length=500)
@@ -995,6 +1002,125 @@ async def _claude_json(
     return _parse_json("".join(block.text for block in response.content if hasattr(block, "text")))
 
 
+async def _ai_focus_keyword_suggestion(
+    *,
+    api_key: str,
+    title: str,
+    content: str,
+    current_keyword: str,
+    used_keywords: list[str],
+) -> tuple[str, list[str]]:
+    """Generate unused, topic-specific focus-keyword options with Claude.
+
+    The AI is constrained by the site's actual assigned focus-keyword inventory.
+    Search-result appearances, partial phrase overlap, and shared words are not
+    treated as uniqueness conflicts.
+    """
+    used_clean = [
+        str(value).strip()
+        for value in used_keywords
+        if str(value).strip()
+    ][:500]
+    used_normalized = {_normalize_phrase(value) for value in used_clean if _normalize_phrase(value)}
+    current_normalized = _normalize_phrase(current_keyword)
+
+    system = """You are a senior SEO keyword strategist. Generate focus-keyword
+options for an existing article using only the supplied title and content.
+The goal is to give this article a distinct, useful search topic that supports
+the site's broader service-page architecture without creating a duplicate
+focus-keyword assignment.
+
+Hard rules:
+1. Never return a phrase that exactly matches any already-used focus keyword
+   after case, punctuation, whitespace, and separator normalization.
+2. Do NOT treat partial phrase overlap or shared words as a duplicate. For
+   example, "end of" and "end of lease cleaning Perth" are different phrases.
+3. Prefer a natural 3-6 word search phrase that accurately describes the
+   article's actual topic.
+4. Prefer a specific long-tail phrase over generic fragments such as "need
+   cleaning" or "cleaning tips".
+5. Do not invent a service, location, price, guarantee, credential, or fact
+   that is not supported by the supplied article.
+6. Do not force the exact current keyword if it is already assigned elsewhere.
+7. Return only JSON with a primary keyword and up to three alternatives."""
+
+    prompt = f"""
+Article title:
+{title}
+
+Current focus keyword:
+{current_keyword or "(none)"}
+
+Already-assigned focus keywords on this WordPress site:
+{json.dumps(used_clean, ensure_ascii=False)}
+
+Article content:
+{_safe_excerpt(_strip_html(content), 18000)}
+
+Return exactly:
+{{
+  "primary": "",
+  "alternatives": ["", "", ""],
+  "reason": ""
+}}
+"""
+    ai = await _claude_json(system, prompt, api_key=api_key, max_tokens=1200)
+
+    raw_candidates: list[str] = []
+    primary = str(ai.get("primary") or "").strip()
+    if primary:
+        raw_candidates.append(primary)
+    alternatives = ai.get("alternatives")
+    if isinstance(alternatives, list):
+        raw_candidates.extend(str(value).strip() for value in alternatives if str(value).strip())
+
+    valid: list[str] = []
+    seen: set[str] = set()
+    for candidate in raw_candidates:
+        normalized = _normalize_phrase(candidate)
+        if not normalized or normalized in seen or normalized in used_normalized:
+            continue
+        if current_normalized and normalized == current_normalized and current_normalized in used_normalized:
+            continue
+        # Keep suggestions as meaningful phrases rather than one/two-word fragments.
+        token_count = len(normalized.split())
+        if token_count < 3 or token_count > 8:
+            continue
+        seen.add(normalized)
+        valid.append(re.sub(r"\s+", " ", candidate).strip())
+        if len(valid) >= 4:
+            break
+
+    if valid:
+        return valid[0], valid[1:]
+
+    # Deterministic evidence-based fallback if Claude returns unusable output.
+    fallback, _ = _choose_focus_keyword(title, content, "", used_clean)
+    return fallback, []
+
+
+@router.post("/suggest-focus-keyword")
+async def suggest_focus_keyword(
+    data: FocusKeywordSuggestionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    company_id = _require_company(current_user)
+    api_key = _resolve_anthropic_api_key(db, company_id)
+    primary, alternatives = await _ai_focus_keyword_suggestion(
+        api_key=api_key,
+        title=data.title,
+        content=data.content,
+        current_keyword=data.current_focus_keyword,
+        used_keywords=data.used_focus_keywords,
+    )
+    return {
+        "success": True,
+        "suggested_focus_keyword": primary,
+        "alternatives": alternatives,
+    }
+
+
 @router.post("/analyze")
 async def analyze_post(
     data: AnalyzeRequest,
@@ -1011,20 +1137,21 @@ async def analyze_post(
     requested_keyword = data.focus_keyword.strip()
     used_keyword_set = {_normalize_phrase(x) for x in used_keywords if _normalize_phrase(x)}
     if requested_keyword and _keyword_conflicts(requested_keyword, used_keyword_set):
-        suggested_keyword, _ = _choose_focus_keyword(
-            measured["title"],
-            measured["content_text_excerpt"],
-            "",
-            used_keywords,
+        suggested_keyword, alternatives = await _ai_focus_keyword_suggestion(
+            api_key=api_key,
+            title=measured["title"],
+            content=measured["content_text_excerpt"],
+            current_keyword=requested_keyword,
+            used_keywords=used_keywords,
         )
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Focus keyword already in use by another WordPress post or page. "
-                "Please choose an unused keyword. "
-                f"Suggested for this post: {suggested_keyword}."
-            ),
+        detail = (
+            "Focus keyword already in use by another WordPress post or page. "
+            "Choose an unused keyword before analysis. "
+            f"AI suggestion: {suggested_keyword}."
         )
+        if alternatives:
+            detail += f" Alternatives: {', '.join(alternatives[:3])}."
+        raise HTTPException(status_code=409, detail=detail)
     system = """You are a senior SEO and answer-engine optimization consultant. Analyze only supplied page evidence. Never claim that a page is cited by ChatGPT, Perplexity, Gemini, Google AI Overviews, or another AI engine unless evidence proves it. Never invent traffic, rankings, citations, entities, schema, competitor data, or search-volume data. Separate measured HTML facts from recommendations. If no focus keyword is supplied, recommend one concise topic phrase derived only from the page title/content. It must not duplicate any focus keyword in the supplied used-keyword list. Also suggest a compelling, accurate title that improves click appeal without clickbait. Return only JSON."""
     prompt = f"""
 Page: {url}
@@ -1270,20 +1397,21 @@ async def rewrite_post(
         data.focus_keyword.strip(),
         {_normalize_phrase(x) for x in rewrite_used_keywords if _normalize_phrase(x)},
     ):
-        suggested_keyword, _ = _choose_focus_keyword(
-            data.title,
-            source_text,
-            "",
-            rewrite_used_keywords,
+        suggested_keyword, alternatives = await _ai_focus_keyword_suggestion(
+            api_key=api_key,
+            title=data.title,
+            content=source_text,
+            current_keyword=data.focus_keyword.strip(),
+            used_keywords=rewrite_used_keywords,
         )
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Focus keyword already in use by another WordPress post or page. "
-                "Please choose an unused keyword. "
-                f"Suggested for this post: {suggested_keyword}."
-            ),
+        detail = (
+            "Focus keyword already in use by another WordPress post or page. "
+            "Rewrite is blocked until an unused keyword is selected. "
+            f"AI suggestion: {suggested_keyword}."
         )
+        if alternatives:
+            detail += f" Alternatives: {', '.join(alternatives[:3])}."
+        raise HTTPException(status_code=409, detail=detail)
 
     chosen_keyword, keyword_conflict = _choose_focus_keyword(
         data.title,
