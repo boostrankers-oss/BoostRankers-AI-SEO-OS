@@ -39,10 +39,10 @@ MAX_CONTENT_CHARS = 30000
 MIN_INTERNAL_LINKS = 3
 MAX_INTERNAL_LINKS = 5
 GENERIC_ANCHORS = {"click here", "read more", "learn more", "here", "more", "this article"}
-# Only remove true linguistic stopwords here. SEO/topic terms such as
-# "service", "cleaning", "commercial", "company", "local", and location names
-# are intentionally retained because they can be the only evidence connecting
-# a blog post to a relevant service/page target.
+# Only remove linguistic stopwords. SEO/topic terms such as "service",
+# "cleaning", "commercial", "company", "local", and location names are kept
+# because they can be the only evidence connecting a source article to a
+# legitimate service or location page.
 LINK_STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from", "by",
     "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
@@ -948,13 +948,10 @@ def _select_internal_link_candidates(
 
         normalized_target_title = _normalize_phrase(target_title)
         normalized_target_focus = _normalize_phrase(target_focus)
-
-        # Phrase-level evidence is stronger than isolated word overlap. This
-        # helps distinguish genuinely related service/topic pages from pages
-        # that happen to share one broad word.
         normalized_source_title = _normalize_phrase(title)
         normalized_source_focus = _normalize_phrase(focus_keyword)
 
+        # Phrase-level evidence is stronger than isolated word overlap.
         if normalized_source_focus and normalized_source_focus in (
             normalized_target_title + " " + normalized_target_focus
         ):
@@ -1009,9 +1006,7 @@ def _select_internal_link_candidates(
     if not scored:
         return []
 
-    # At this point every candidate has at least one piece of topical evidence.
-    # Select the strongest distinct targets first. Do not pad with zero-evidence
-    # URLs merely to satisfy the numeric minimum.
+    # Start with the strongest topical candidates.
     selected: list[dict[str, str]] = [item[1] for item in scored[:MAX_INTERNAL_LINKS]]
 
     # If a relevant service target exists just outside the first five, reserve
@@ -1039,10 +1034,8 @@ async def rewrite_post(
     api_key = _resolve_anthropic_api_key(db, company_id)
     source_text = _strip_html(data.content_html)
 
-    # WordPress can return hundreds of published items. The frontend is allowed
-    # to send a larger candidate set, but the rewrite engine only needs a bounded
-    # set for relevance scoring and the Claude prompt. This also prevents a 422
-    # validation failure when a site has more than 100 published targets.
+    # Accept a larger verified candidate set from WordPress, but keep the
+    # rewrite/scoring workload bounded and predictable.
     raw_candidates = data.internal_link_candidates[:100]
     normalized_candidates: list[dict[str, str]] = []
     for candidate in raw_candidates:
@@ -1223,7 +1216,15 @@ Add useful, specific sections, explanations, steps, FAQs, comparisons, or practi
 async def wordpress_content(data: WordPressCredentialsRequest, current_user: User = Depends(get_current_user)):
     _require_company(current_user)
     site = _clean_url(str(data.wordpress_site))
-    auth = (data.wordpress_username.strip(), data.wordpress_application_password.strip())
+    wordpress_username = data.wordpress_username.strip()
+    # WordPress displays Application Passwords in groups separated by spaces.
+    # Basic Auth is more reliable when those presentation spaces are removed.
+    wordpress_application_password = re.sub(
+        r"\s+",
+        "",
+        data.wordpress_application_password or "",
+    )
+    auth = (wordpress_username, wordpress_application_password)
 
     async with httpx.AsyncClient(timeout=WP_TIMEOUT, follow_redirects=True) as client:
         me = await client.get(
@@ -1232,10 +1233,18 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
             auth=auth,
         )
         if me.status_code >= 400:
-            raise HTTPException(
-                status_code=401,
-                detail="WordPress authentication failed. Use a WordPress Application Password.",
-            )
+            if me.status_code in {401, 403}:
+                detail = (
+                    "WordPress authentication failed. Check the WordPress username "
+                    "and Application Password. Use a WordPress Application Password "
+                    "(not the normal account password)."
+                )
+            else:
+                detail = (
+                    f"WordPress REST API returned HTTP {me.status_code}. "
+                    "Check the WordPress site URL and REST API availability."
+                )
+            raise HTTPException(status_code=401 if me.status_code in {401, 403} else 502, detail=detail)
 
         items: list[dict[str, Any]] = []
         max_items = 1000
@@ -1325,11 +1334,37 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
 async def apply_to_wordpress(data: WordPressApplyRequest, current_user: User = Depends(get_current_user)):
     _require_company(current_user)
     site = _clean_url(str(data.wordpress_site))
-    auth = (data.wordpress_username.strip(), data.wordpress_application_password.strip())
+    wordpress_username = data.wordpress_username.strip()
+    # WordPress displays Application Passwords in groups separated by spaces.
+    # Basic Auth is more reliable when those presentation spaces are removed.
+    wordpress_application_password = re.sub(
+        r"\s+",
+        "",
+        data.wordpress_application_password or "",
+    )
+    auth = (wordpress_username, wordpress_application_password)
     async with httpx.AsyncClient(timeout=WP_TIMEOUT, follow_redirects=True) as client:
-        me = await client.get(f"{site}/wp-json/wp/v2/users/me", params={"context": "edit"}, auth=auth)
+        me = await client.get(
+            f"{site}/wp-json/wp/v2/users/me",
+            params={"context": "edit"},
+            auth=auth,
+        )
         if me.status_code >= 400:
-            raise HTTPException(status_code=401, detail="WordPress authentication failed. Use a WordPress Application Password.")
+            if me.status_code in {401, 403}:
+                detail = (
+                    "WordPress authentication failed. Check the WordPress username "
+                    "and Application Password. Use a WordPress Application Password "
+                    "(not the normal account password)."
+                )
+            else:
+                detail = (
+                    f"WordPress REST API returned HTTP {me.status_code}. "
+                    "Check the WordPress site URL and REST API availability."
+                )
+            raise HTTPException(
+                status_code=401 if me.status_code in {401, 403} else 502,
+                detail=detail,
+            )
 
         content_type = None
         for candidate in ("posts", "pages"):
