@@ -1,4 +1,4 @@
-﻿import { useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
 import {
   AlertCircle,
   ArrowRight,
@@ -106,6 +106,7 @@ interface WPItem {
   content_html: string;
   excerpt: string;
   focus_keyword?: string;
+  focus_keyword_source?: string;
   meta_title?: string;
   meta_description?: string;
 }
@@ -227,6 +228,10 @@ export function AISearch() {
   const [wpFocusInventoryVerified, setWpFocusInventoryVerified] = useState(false);
   const [, setWpFocusInventoryError] = useState("");
   const [aiSuggestedFocusKeyword, setAiSuggestedFocusKeyword] = useState("");
+  const [aiKeywordAlternatives, setAiKeywordAlternatives] = useState<string[]>([]);
+  const [suggestingFocusKeyword, setSuggestingFocusKeyword] = useState(false);
+  const [focusInventoryCount, setFocusInventoryCount] = useState(0);
+  const [focusInventoryTotal, setFocusInventoryTotal] = useState(0);
 
 
   const activeTitle = rewrite?.title || analysis?.measured.title || "";
@@ -234,22 +239,63 @@ export function AISearch() {
   const activeMetaTitle = rewrite?.meta_title || analysis?.measured.meta_title || "";
   const activeMetaDescription = rewrite?.meta_description || analysis?.measured.meta_description || "";
   const activeHtml = rewrite?.article_html || analysis?.measured.content_html || "";
+  const matchedWpItem = useMemo(
+    () => wpItems.find((item) => canonicalUrl(item.url) === canonicalUrl(url.trim())),
+    [wpItems, url],
+  );
+  const sourceWpId = String(matchedWpItem?.id || selectedPostId || "");
   const usedFocusKeywords = useMemo(
-    () => getUsedFocusKeywords(wpItems, String(selectedPostId)),
-    [wpItems, selectedPostId],
+    () => getUsedFocusKeywords(wpItems, sourceWpId),
+    [wpItems, sourceWpId],
   );
   const focusKeywordIsUsed = useMemo(
     () => focusKeyword.trim() ? focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords) : false,
     [focusKeyword, usedFocusKeywords],
   );
-  const matchedWpItem = useMemo(
-    () => wpItems.find((item) => canonicalUrl(item.url) === canonicalUrl(url.trim())),
-    [wpItems, url],
-  );
   const suggestedUniqueFocusKeyword = useMemo(
     () => focusKeywordIsUsed ? suggestUniqueFocusKeyword(matchedWpItem, usedFocusKeywords) : "",
     [focusKeywordIsUsed, matchedWpItem, usedFocusKeywords],
   );
+
+  useEffect(() => {
+    if (!focusKeywordIsUsed || !matchedWpItem || !wpSite.trim() || !wpUsername.trim() || !wpPassword.trim()) {
+      if (!focusKeywordIsUsed) {
+        setAiSuggestedFocusKeyword("");
+        setAiKeywordAlternatives([]);
+      }
+      return;
+    }
+
+    let cancelled = false;
+    const requestSuggestion = async () => {
+      setSuggestingFocusKeyword(true);
+      try {
+        const result = await api.post<{
+          success: boolean;
+          suggested_focus_keyword?: string;
+          alternatives?: string[];
+        }>("/api/ai-search-optimization/suggest-focus-keyword", {
+          title: analysis?.measured.title || matchedWpItem.title,
+          content: analysis?.measured.content_html || matchedWpItem.content_html || matchedWpItem.excerpt || "",
+          current_focus_keyword: focusKeyword.trim(),
+          used_focus_keywords: usedFocusKeywords,
+        });
+        if (!cancelled) {
+          setAiSuggestedFocusKeyword(result.suggested_focus_keyword || suggestedUniqueFocusKeyword || "");
+          setAiKeywordAlternatives((result.alternatives || []).filter((x) => !focusKeywordConflicts(x, usedFocusKeywords)));
+        }
+      } catch {
+        if (!cancelled) {
+          setAiSuggestedFocusKeyword(suggestedUniqueFocusKeyword || "");
+          setAiKeywordAlternatives([]);
+        }
+      } finally {
+        if (!cancelled) setSuggestingFocusKeyword(false);
+      }
+    };
+    void requestSuggestion();
+    return () => { cancelled = true; };
+  }, [focusKeywordIsUsed, matchedWpItem, wpSite, wpUsername, wpPassword, focusKeyword, usedFocusKeywords, suggestedUniqueFocusKeyword, analysis?.measured.title, analysis?.measured.content_html]);
 
   const readinessCards = useMemo(() => {
     if (!analysis) {
@@ -278,6 +324,8 @@ export function AISearch() {
       items: WPItem[];
       focus_keyword_inventory_verified?: boolean;
       focus_keyword_inventory_error?: string;
+      focus_keyword_count?: number;
+      focus_keyword_total_items?: number;
     }>("/api/ai-search-optimization/wordpress/content", {
       wordpress_site: wpSite.trim(),
       wordpress_username: wpUsername.trim(),
@@ -291,6 +339,8 @@ export function AISearch() {
     setWpItems(items);
     setWpFocusInventoryVerified(verified);
     setWpFocusInventoryError(inventoryError);
+    setFocusInventoryCount(Number(result.focus_keyword_count || items.filter((item) => item.focus_keyword?.trim()).length));
+    setFocusInventoryTotal(Number(result.focus_keyword_total_items || items.length));
 
     return { items, verified, error: inventoryError };
   };
@@ -548,6 +598,8 @@ export function AISearch() {
         items: WPItem[];
         focus_keyword_inventory_verified?: boolean;
         focus_keyword_inventory_error?: string;
+        focus_keyword_count?: number;
+        focus_keyword_total_items?: number;
       }>(
         "/api/ai-search-optimization/wordpress/content",
         {
@@ -560,7 +612,10 @@ export function AISearch() {
       setWpItems(items);
       setWpFocusInventoryVerified(result.focus_keyword_inventory_verified === true);
       setWpFocusInventoryError(result.focus_keyword_inventory_error || "");
+      setFocusInventoryCount(Number(result.focus_keyword_count || items.filter((item) => item.focus_keyword?.trim()).length));
+      setFocusInventoryTotal(Number(result.focus_keyword_total_items || items.length));
       setAiSuggestedFocusKeyword("");
+      setAiKeywordAlternatives([]);
 
       const matched = url.trim()
         ? items.find((item) => canonicalUrl(item.url) === canonicalUrl(url.trim()))
@@ -723,6 +778,9 @@ export function AISearch() {
                     <p className="text-xs text-rose-600 dark:text-rose-400">
                       Focus keyword already in use by another WordPress post/page. Analyze and Rewrite are blocked until you choose an unused keyword.
                     </p>
+                    <p className="text-xs text-rose-600 dark:text-rose-400">
+                      {matchedWpItem?.title ? `Conflicting assignment found on: ${matchedWpItem.title}` : "The entered phrase matches an assigned WordPress focus keyword."}
+                    </p>
                     {(aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword) && (
                       <button
                         type="button"
@@ -732,16 +790,26 @@ export function AISearch() {
                         {aiSuggestedFocusKeyword ? "AI suggestion" : "Suggested unused keyword"}: {aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword} · Use this
                       </button>
                     )}
+                    {aiKeywordAlternatives.length > 0 && (
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        {aiKeywordAlternatives.map((keyword) => (
+                          <button key={keyword} type="button" className="rounded-full border px-2 py-1 text-[11px] hover:bg-slate-50 dark:hover:bg-slate-800" onClick={() => setFocusKeyword(keyword)}>
+                            {keyword}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {suggestingFocusKeyword && <p className="text-xs text-indigo-600">Generating a topic-specific unused suggestion…</p>}
                   </div>
                 ) : (
                   <p className="text-xs text-slate-500">
-                    Focus-keyword uniqueness is checked against the assigned WordPress focus keywords, not Google search-result occurrences.
+                    Focus-keyword uniqueness is checked against assigned WordPress focus keywords, not Google search-result occurrences. {wpFocusInventoryVerified ? `${focusInventoryCount} of ${focusInventoryTotal} WordPress items have mapped focus keywords.` : "Inventory not verified."}
                   </p>
                 )}
               </div>
             </div>
             <div className="flex flex-wrap gap-3">
-              <Button onClick={analyze} disabled={loading || !url.trim()} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+              <Button onClick={analyze} disabled={loading || !url.trim() || focusKeywordIsUsed || (!!wpSite.trim() && !!wpUsername.trim() && !!wpPassword.trim() && !wpFocusInventoryVerified)} className="bg-emerald-600 hover:bg-emerald-700 text-white">
                 {loading ? <Loader2 className="size-4 animate-spin" /> : <FileSearch className="size-4" />}
                 {loading ? "Analyzing..." : "Analyze Post"}
               </Button>

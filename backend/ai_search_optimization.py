@@ -74,6 +74,13 @@ class RewriteRequest(BaseModel):
     site_content_inventory: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
 
 
+class FocusKeywordSuggestionRequest(BaseModel):
+    title: str = Field(min_length=3, max_length=500)
+    content: str = Field(default="", max_length=120000)
+    current_focus_keyword: str = Field(default="", max_length=500)
+    used_focus_keywords: list[str] = Field(default_factory=list, max_length=5000)
+
+
 class WordPressCredentialsRequest(BaseModel):
     wordpress_site: HttpUrl
     wordpress_username: str = Field(min_length=1, max_length=255)
@@ -1348,6 +1355,46 @@ Rules:
         return {}
 
 
+@router.post("/suggest-focus-keyword")
+async def suggest_focus_keyword(
+    data: FocusKeywordSuggestionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return an AI-generated unused focus keyword plus deterministic alternatives.
+
+    This endpoint is intentionally separate from analysis so the UI can show a useful
+    replacement immediately when a duplicate assigned WordPress focus keyword is typed.
+    Uniqueness is validated locally against the authoritative inventory supplied by the UI.
+    """
+    company_id = _require_company(current_user)
+    api_key = _resolve_anthropic_api_key(db, company_id)
+    used = _dedupe_keywords([str(x).strip() for x in data.used_focus_keywords if str(x).strip()])
+    primary = await _ai_unique_focus_keyword(
+        data.title,
+        _strip_html(data.content),
+        data.current_focus_keyword.strip(),
+        used,
+        api_key,
+        [],
+    )
+    alternatives: list[str] = []
+    for candidate in _focus_candidates(data.title, _strip_html(data.content), {_normalize_phrase(x) for x in used}):
+        if _normalize_phrase(candidate) == _normalize_phrase(primary):
+            continue
+        if _keyword_conflicts(candidate, used):
+            continue
+        if candidate not in alternatives:
+            alternatives.append(candidate)
+        if len(alternatives) >= 4:
+            break
+    return {
+        "success": True,
+        "suggested_focus_keyword": primary,
+        "alternatives": alternatives,
+    }
+
+
 @router.post("/analyze")
 async def analyze_post(
     data: AnalyzeRequest,
@@ -1989,6 +2036,7 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                             "content_html": str((row.get("content") or {}).get("rendered") or ""),
                             "excerpt": str((row.get("excerpt") or {}).get("rendered") or ""),
                             "focus_keyword": _extract_focus_keyword(row_meta),
+                            "focus_keyword_source": "wp_rest_meta" if _extract_focus_keyword(row_meta) else "",
                             "meta_title": row_seo["meta_title"],
                             "meta_description": row_seo["meta_description"],
                         }
@@ -2036,11 +2084,17 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                         payload = meta.json()
                         value = _extract_focus_keyword(payload)
                         seo_values = _extract_seo_metadata(payload)
+                        # The bridge is authoritative when available. Keep an explicit
+                        # source marker so the frontend can distinguish a mapped
+                        # keyword from an unassigned keyword.
+                        if value:
+                            item["focus_keyword"] = value
+                            item["focus_keyword_source"] = "seo_bridge"
+                        elif not item.get("focus_keyword"):
+                            item["focus_keyword_source"] = "seo_bridge_empty"
                         # Empty is valid: it means this item has no assigned focus
                         # keyword. A failed lookup is different and must not be
                         # treated as "unused".
-                        if value:
-                            item["focus_keyword"] = value
                         if seo_values["meta_title"]:
                             item["meta_title"] = seo_values["meta_title"]
                         if seo_values["meta_description"]:
@@ -2061,11 +2115,14 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                 "focus keywords could not be verified."
             )
 
+        mapped_focus_keyword_count = sum(1 for item in items if str(item.get("focus_keyword") or "").strip())
         return {
             "success": True,
             "items": items,
             "focus_keyword_inventory_verified": focus_inventory_verified,
             "focus_keyword_inventory_error": focus_inventory_error,
+            "focus_keyword_count": mapped_focus_keyword_count,
+            "focus_keyword_total_items": len(items),
         }
 
 
