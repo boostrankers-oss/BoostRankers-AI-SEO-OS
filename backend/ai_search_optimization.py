@@ -59,13 +59,6 @@ class AnalyzeRequest(BaseModel):
     used_focus_keywords: list[str] = Field(default_factory=list, max_length=500)
 
 
-class FocusKeywordSuggestionRequest(BaseModel):
-    title: str = Field(min_length=3, max_length=500)
-    content: str = Field(min_length=50, max_length=120000)
-    current_focus_keyword: str = Field(default="", max_length=500)
-    used_focus_keywords: list[str] = Field(default_factory=list, max_length=500)
-
-
 class RewriteRequest(BaseModel):
     url: HttpUrl
     focus_keyword: str = Field(min_length=1, max_length=500)
@@ -270,7 +263,7 @@ def _extract_focus_keyword(payload: Any) -> str:
 def _focus_candidates(title: str, content: str, used: set[str]) -> list[str]:
     """Build deterministic title/content-derived keyword candidates without inventing topics."""
     stop = {
-        "the", "a", "an", "and", "or", "for", "to", "in", "on", "with", "from",
+        "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from",
         "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
         "guide", "best", "ultimate", "complete", "tips", "checklist",
     }
@@ -302,13 +295,16 @@ _KEYWORD_COMPARISON_STOPWORDS = {
 _FOCUS_SUGGESTION_GENERIC = {
     "professional", "quality", "reliable", "trusted", "affordable", "best", "complete",
     "help", "helps", "provide", "provides", "service", "services", "company", "companies",
+    "guide", "guides", "tips", "ultimate", "local",
 }
 
 
 def _normalize_keyword_token(token: str) -> str:
+    """Normalize simple English singular/plural variants for keyword ownership."""
+    token = token.strip().lower()
     if token.endswith("ies") and len(token) > 4:
         return f"{token[:-3]}y"
-    if token.endswith("s") and len(token) > 4:
+    if token.endswith("s") and len(token) > 4 and not token.endswith("ss"):
         return token[:-1]
     return token
 
@@ -322,23 +318,53 @@ def _keyword_tokens(value: str) -> set[str]:
 
 
 def _keyword_conflicts(candidate: str, used_keywords: set[str] | list[str]) -> bool:
-    """Return True only when the same normalized focus-keyword phrase is assigned.
+    """Return True for the same assigned focus-keyword intent, not loose word overlap.
 
-    This is an assignment-uniqueness check, not a semantic/cannibalization check.
-    Search-result occurrences, shared words, shorter/longer phrases, connector
-    differences, and singular/plural variants do not block a different phrase.
-    Only the actual focus keyword stored on another WordPress post/page can
-    block the requested phrase.
+    Exact normalized phrases are duplicates.  We also treat grammatical variants
+    and one-word service/connective expansions as the same assignment, e.g.
+    ``end of lease cleaning service Perth`` vs
+    ``End of Lease Cleaning Services in Perth``.
+
+    Short fragments such as ``end of`` must NOT conflict with a longer keyword
+    because their meaningful-token set is too small.  Search-result occurrences
+    are irrelevant; only supplied WordPress focus-keyword assignments are checked.
     """
     candidate_norm = _normalize_phrase(candidate)
     if not candidate_norm:
         return False
-    return any(
-        candidate_norm == _normalize_phrase(used)
-        for used in used_keywords
-        if _normalize_phrase(used)
-    )
 
+    candidate_tokens = _keyword_tokens(candidate_norm)
+    for used in used_keywords:
+        used_norm = _normalize_phrase(str(used))
+        if not used_norm:
+            continue
+        if candidate_norm == used_norm:
+            return True
+
+        used_tokens = _keyword_tokens(used_norm)
+        if not candidate_tokens or not used_tokens:
+            continue
+
+        # Treat grammatical variants as the same assignment only when their
+        # complete meaningful-token sets are identical. This catches
+        # "service" vs "services" and connector-word differences such as
+        # "in", while allowing genuinely different phrases.
+        if len(candidate_tokens) >= 2 and candidate_tokens == used_tokens:
+            return True
+
+    return False
+
+
+def _dedupe_keywords(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        clean = re.sub(r"\s+", " ", str(value or "")).strip()
+        norm = _normalize_phrase(clean)
+        if clean and norm and norm not in seen:
+            seen.add(norm)
+            result.append(clean)
+    return result
 
 def _choose_focus_keyword(title: str, content: str, requested: str, used_keywords: list[str]) -> tuple[str, bool]:
     used = {_normalize_phrase(x) for x in used_keywords if _normalize_phrase(x)}
@@ -1003,126 +1029,55 @@ async def _claude_json(
     return _parse_json("".join(block.text for block in response.content if hasattr(block, "text")))
 
 
-async def _ai_focus_keyword_suggestion(
-    *,
-    api_key: str,
+
+async def _ai_unique_focus_keyword(
     title: str,
     content: str,
-    current_keyword: str,
+    requested_keyword: str,
     used_keywords: list[str],
-) -> tuple[str, list[str]]:
-    """Generate unused, topic-specific focus-keyword options with Claude.
+    api_key: str,
+) -> str:
+    """Ask Claude for a topic-specific unused focus keyword and validate it locally."""
+    fallback, _ = _choose_focus_keyword(title, content, "", used_keywords)
 
-    The AI is constrained by the site's actual assigned focus-keyword inventory.
-    Search-result appearances, partial phrase overlap, shared words, connector
-    differences, and singular/plural variants are not treated as uniqueness
-    conflicts. The exact normalized assigned phrase is the hard-block rule.
-    """
-    used_clean = [
-        str(value).strip()
-        for value in used_keywords
-        if str(value).strip()
-    ][:500]
-    used_normalized = {_normalize_phrase(value) for value in used_clean if _normalize_phrase(value)}
-    current_normalized = _normalize_phrase(current_keyword)
-
-    system = """You are a senior SEO keyword strategist. Generate focus-keyword
-options for an existing article using only the supplied title and content.
-The goal is to give this article a distinct, useful search topic that supports
-the site's broader service-page architecture without creating a duplicate
-focus-keyword assignment.
-
-Hard rules:
-1. Never return a phrase that matches an already-used focus-keyword assignment
-   after connector-word and simple singular/plural normalization.
-2. Do NOT treat partial phrase overlap or shared words as a duplicate. For
-   example, "end of" and "end of lease cleaning Perth" are different phrases.
-3. Prefer a natural 3-6 word search phrase that accurately describes the
-   article's actual topic.
-4. Prefer a specific long-tail phrase over generic fragments such as "need
-   cleaning" or "cleaning tips".
-5. Do not invent a service, location, price, guarantee, credential, or fact
-   that is not supported by the supplied article.
-6. Do not force the exact current keyword if it is already assigned elsewhere.
-7. Return only JSON with a primary keyword and up to three alternatives."""
-
+    system = """You are an expert SEO keyword strategist.
+Choose ONE useful focus keyword for the supplied article.
+The phrase must describe the article's actual primary topic, be natural for a Google search,
+and be specific enough to distinguish this article from the site's existing keyword assignments.
+Do not invent services, locations, facts, prices, guarantees, or topics not supported by the article.
+Do not use a keyword from the used-keyword list.
+Do not return a sentence, punctuation, quotes, or an explanation.
+Return JSON only: {"focus_keyword": "..."}. The phrase should normally contain 3-7 meaningful words."""
     prompt = f"""
 Article title:
 {title}
 
-Current focus keyword:
-{current_keyword or "(none)"}
+Article content excerpt:
+{_safe_excerpt(content, 9000)}
 
-Already-assigned focus keywords on this WordPress site:
-{json.dumps(used_clean, ensure_ascii=False)}
+Requested keyword that is unavailable:
+{requested_keyword or "(none)"}
 
-Article content:
-{_safe_excerpt(_strip_html(content), 18000)}
+Existing WordPress focus-keyword assignments. Do NOT reuse these:
+{json.dumps(_dedupe_keywords(used_keywords)[:500], ensure_ascii=False)}
 
-Return exactly:
-{{
-  "primary": "",
-  "alternatives": ["", "", ""],
-  "reason": ""
-}}
+Return one replacement focus keyword that is genuinely useful for this exact article.
 """
-    ai = await _claude_json(system, prompt, api_key=api_key, max_tokens=1200)
+    try:
+        result = await _claude_json(system, prompt, api_key=api_key, max_tokens=800)
+        candidate = re.sub(
+            r"^[\s\"'`]+|[\s\"'`,.]+$",
+            "",
+            str(result.get("focus_keyword") or result.get("suggested_focus_keyword") or ""),
+        ).strip()
+        if candidate and not _keyword_conflicts(candidate, set(used_keywords)):
+            # Reject suggestions that are essentially generic fragments.
+            if len(_keyword_tokens(candidate)) >= 3:
+                return candidate
+    except HTTPException:
+        logger.exception("AI focus-keyword suggestion failed; using deterministic fallback")
 
-    raw_candidates: list[str] = []
-    primary = str(ai.get("primary") or "").strip()
-    if primary:
-        raw_candidates.append(primary)
-    alternatives = ai.get("alternatives")
-    if isinstance(alternatives, list):
-        raw_candidates.extend(str(value).strip() for value in alternatives if str(value).strip())
-
-    valid: list[str] = []
-    seen: set[str] = set()
-    for candidate in raw_candidates:
-        normalized = _normalize_phrase(candidate)
-        canonical = normalized
-        if not normalized or canonical in seen or canonical in used_normalized:
-            continue
-        if current_normalized and canonical == current_normalized and current_normalized in used_normalized:
-            continue
-        # Keep suggestions as meaningful phrases rather than one/two-word fragments.
-        token_count = len(normalized.split())
-        if token_count < 3 or token_count > 8:
-            continue
-        seen.add(canonical)
-        valid.append(re.sub(r"\s+", " ", candidate).strip())
-        if len(valid) >= 4:
-            break
-
-    if valid:
-        return valid[0], valid[1:]
-
-    # Deterministic evidence-based fallback if Claude returns unusable output.
-    fallback, _ = _choose_focus_keyword(title, content, "", used_clean)
-    return fallback, []
-
-
-@router.post("/suggest-focus-keyword")
-async def suggest_focus_keyword(
-    data: FocusKeywordSuggestionRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    company_id = _require_company(current_user)
-    api_key = _resolve_anthropic_api_key(db, company_id)
-    primary, alternatives = await _ai_focus_keyword_suggestion(
-        api_key=api_key,
-        title=data.title,
-        content=data.content,
-        current_keyword=data.current_focus_keyword,
-        used_keywords=data.used_focus_keywords,
-    )
-    return {
-        "success": True,
-        "suggested_focus_keyword": primary,
-        "alternatives": alternatives,
-    }
-
+    return fallback
 
 @router.post("/analyze")
 async def analyze_post(
@@ -1138,23 +1093,25 @@ async def analyze_post(
     used_keywords = [str(x).strip() for x in data.used_focus_keywords if str(x).strip()]
     used_for_prompt = used_keywords[:250]
     requested_keyword = data.focus_keyword.strip()
-    used_keyword_set = set(used_keywords)
+    used_keyword_set = {_normalize_phrase(x) for x in used_keywords if _normalize_phrase(x)}
     if requested_keyword and _keyword_conflicts(requested_keyword, used_keyword_set):
-        suggested_keyword, alternatives = await _ai_focus_keyword_suggestion(
-            api_key=api_key,
-            title=measured["title"],
-            content=measured["content_text_excerpt"],
-            current_keyword=requested_keyword,
-            used_keywords=used_keywords,
+        suggested_keyword = await _ai_unique_focus_keyword(
+            measured["title"],
+            measured["content_text_excerpt"],
+            requested_keyword,
+            used_keywords,
+            api_key,
         )
-        detail = (
-            "Focus keyword already in use by another WordPress post or page. "
-            "Choose an unused keyword before analysis. "
-            f"AI suggestion: {suggested_keyword}."
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "FOCUS_KEYWORD_DUPLICATE",
+                "message": "Focus keyword already in use by another WordPress post or page. Choose an unused keyword before analyzing or rewriting.",
+                "conflicting_keyword": requested_keyword,
+                "suggested_keyword": suggested_keyword,
+                "suggestion_source": "ai",
+            },
         )
-        if alternatives:
-            detail += f" Alternatives: {', '.join(alternatives[:3])}."
-        raise HTTPException(status_code=409, detail=detail)
     system = """You are a senior SEO and answer-engine optimization consultant. Analyze only supplied page evidence. Never claim that a page is cited by ChatGPT, Perplexity, Gemini, Google AI Overviews, or another AI engine unless evidence proves it. Never invent traffic, rankings, citations, entities, schema, competitor data, or search-volume data. Separate measured HTML facts from recommendations. If no focus keyword is supplied, recommend one concise topic phrase derived only from the page title/content. It must not duplicate any focus keyword in the supplied used-keyword list. Also suggest a compelling, accurate title that improves click appeal without clickbait. Return only JSON."""
     prompt = f"""
 Page: {url}
@@ -1400,21 +1357,23 @@ async def rewrite_post(
         data.focus_keyword.strip(),
         rewrite_used_keywords,
     ):
-        suggested_keyword, alternatives = await _ai_focus_keyword_suggestion(
-            api_key=api_key,
-            title=data.title,
-            content=source_text,
-            current_keyword=data.focus_keyword.strip(),
-            used_keywords=rewrite_used_keywords,
+        suggested_keyword = await _ai_unique_focus_keyword(
+            data.title,
+            source_text,
+            data.focus_keyword.strip(),
+            rewrite_used_keywords,
+            api_key,
         )
-        detail = (
-            "Focus keyword already in use by another WordPress post or page. "
-            "Rewrite is blocked until an unused keyword is selected. "
-            f"AI suggestion: {suggested_keyword}."
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "FOCUS_KEYWORD_DUPLICATE",
+                "message": "Focus keyword already in use by another WordPress post or page. Choose an unused keyword before rewriting.",
+                "conflicting_keyword": data.focus_keyword.strip(),
+                "suggested_keyword": suggested_keyword,
+                "suggestion_source": "ai",
+            },
         )
-        if alternatives:
-            detail += f" Alternatives: {', '.join(alternatives[:3])}."
-        raise HTTPException(status_code=409, detail=detail)
 
     chosen_keyword, keyword_conflict = _choose_focus_keyword(
         data.title,
@@ -1612,7 +1571,7 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
             raise HTTPException(status_code=401 if me.status_code in {401, 403} else 502, detail=detail)
 
         items: list[dict[str, Any]] = []
-        max_items = 1000
+        max_items = 5000
 
         for content_type in ("posts", "pages"):
             page_num = 1
@@ -1663,21 +1622,25 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                     break
                 page_num += 1
 
-        # Focus-keyword uniqueness must be based on the complete, authoritative
-        # WordPress inventory. The SEO Bridge is therefore verified separately
-        # from the normal post/page REST listing. We fail closed for uniqueness
-        # validation if the bridge is unavailable or any per-item focus lookup
-        # fails, rather than silently treating an unknown keyword as unused.
+        inventory_capped = len(items) >= max_items
+
         bridge = await _wordpress_request(
             client, site, "/boost-rankers/v1/seo-meta/status", auth=auth,
         )
-        focus_keyword_inventory_verified = False
-        focus_keyword_inventory_error = ""
-        if bridge.status_code == 200:
+        focus_inventory_verified = False
+        focus_inventory_error = ""
+
+        if inventory_capped:
+            focus_inventory_error = (
+                f"WordPress contains more than {max_items} posts/pages, so the full "
+                "focus-keyword inventory could not be verified."
+            )
+        elif bridge.status_code == 200:
+            focus_inventory_verified = True
             semaphore = asyncio.Semaphore(10)
-            lookup_failures: list[int] = []
 
             async def load_focus(item: dict[str, Any]) -> None:
+                nonlocal focus_inventory_verified, focus_inventory_error
                 async with semaphore:
                     try:
                         meta = await _wordpress_request(
@@ -1685,35 +1648,40 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                             auth=auth,
                         )
                         if meta.status_code >= 400:
-                            lookup_failures.append(int(item["id"]))
+                            focus_inventory_verified = False
+                            focus_inventory_error = (
+                                f"Could not verify the focus keyword for WordPress "
+                                f"{item.get('type', 'item')} {item.get('id')}."
+                            )
                             return
                         payload = meta.json()
                         value = _extract_focus_keyword(payload)
+                        # Empty is valid: it means this item has no assigned focus
+                        # keyword. A failed lookup is different and must not be
+                        # treated as "unused".
                         if value:
                             item["focus_keyword"] = value
-                    except Exception:
-                        lookup_failures.append(int(item["id"]))
+                    except Exception as exc:
+                        focus_inventory_verified = False
+                        focus_inventory_error = (
+                            f"Could not verify the focus-keyword inventory: {exc}"
+                        )
 
             await asyncio.gather(*(load_focus(item) for item in items))
-            if lookup_failures:
-                focus_keyword_inventory_error = (
-                    "Could not verify the stored focus keyword for "
-                    f"{len(lookup_failures)} WordPress item(s). Refresh Posts & Pages "
-                    "before using a focus keyword."
-                )
-            else:
-                focus_keyword_inventory_verified = True
         else:
-            focus_keyword_inventory_error = (
-                "Boost Rankers SEO Bridge could not be verified. Stored WordPress "
-                "focus keywords cannot be checked safely until the SEO Bridge is available."
+            # The standard WP REST response may expose SEO meta directly. If the
+            # Bridge is unavailable we cannot safely claim that an empty field is
+            # an unused focus keyword, so callers must fail closed for uniqueness.
+            focus_inventory_error = (
+                "Boost Rankers SEO Bridge is not available, so assigned WordPress "
+                "focus keywords could not be verified."
             )
 
         return {
             "success": True,
             "items": items,
-            "focus_keyword_inventory_verified": focus_keyword_inventory_verified,
-            "focus_keyword_inventory_error": focus_keyword_inventory_error,
+            "focus_keyword_inventory_verified": focus_inventory_verified,
+            "focus_keyword_inventory_error": focus_inventory_error,
         }
 
 
