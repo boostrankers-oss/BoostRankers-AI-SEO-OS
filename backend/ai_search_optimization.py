@@ -210,6 +210,29 @@ _FOCUS_KEY_FIELDS = {
 }
 
 
+def _has_explicit_focus_keyword_field(payload: Any) -> bool:
+    """Return True when the payload explicitly exposes a focus-keyphrase field.
+
+    An empty focus keyphrase is a valid Yoast state, but a response that simply
+    omits the field is not evidence that the post has no focus keyphrase.
+    """
+    if isinstance(payload, dict):
+        for key in payload:
+            normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+            if normalized_key in {
+                "focus_keyword", "focus_keyphrase", "focuskeyword", "focuskeyphrase",
+                "focuskw", "yoast_wpseo_focuskw", "_yoast_wpseo_focuskw",
+                "rank_math_focus_keyword", "aioseo_keywords", "keyphrase",
+            }:
+                return True
+            if ("focus" in normalized_key and ("keyword" in normalized_key or "keyphrase" in normalized_key or "kw" in normalized_key)) or ("target" in normalized_key and "kw" in normalized_key):
+                return True
+        return any(_has_explicit_focus_keyword_field(v) for v in payload.values() if isinstance(v, (dict, list)))
+    if isinstance(payload, list):
+        return any(_has_explicit_focus_keyword_field(v) for v in payload)
+    return False
+
+
 def _extract_focus_keyword(payload: Any) -> str:
     """Extract the stored primary focus keyword from common SEO plugin/meta shapes.
 
@@ -2062,50 +2085,65 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                 f"WordPress contains more than {max_items} posts/pages, so the full "
                 "focus-keyword inventory could not be verified."
             )
-        elif bridge.status_code == 200:
+        elif bridge.status_code == 200 and bool((bridge.json() if bridge.content else {}).get("yoast_active", True)):
             focus_inventory_verified = True
             semaphore = asyncio.Semaphore(10)
+            lookup_failures: list[str] = []
 
             async def load_focus(item: dict[str, Any]) -> None:
-                nonlocal focus_inventory_verified, focus_inventory_error
+                nonlocal focus_inventory_verified
                 async with semaphore:
                     try:
                         meta = await _wordpress_request(
                             client, site, f"/boost-rankers/v1/seo-meta/{int(item['id'])}",
                             auth=auth,
                         )
-                        if meta.status_code >= 400:
-                            focus_inventory_verified = False
-                            focus_inventory_error = (
-                                f"Could not verify the focus keyword for WordPress "
-                                f"{item.get('type', 'item')} {item.get('id')}."
+                        payload: Any = meta.json() if meta.status_code < 400 else None
+                        has_focus_field = _has_explicit_focus_keyword_field(payload) if payload is not None else False
+                        value = _extract_focus_keyword(payload) if payload is not None else ""
+
+                        # If the bridge returns HTTP 200 but omits the Yoast field,
+                        # verify through native WordPress REST meta before declaring
+                        # the keyphrase empty. This prevents false "unused" results.
+                        if not has_focus_field:
+                            native = await _wordpress_request(
+                                client, site,
+                                f"/wp/v2/{'posts' if item.get('type') == 'post' else 'pages'}/{int(item['id'])}",
+                                params={"context": "edit", "_fields": "id,meta"},
+                                auth=auth,
                             )
+                            if native.status_code < 400:
+                                native_payload = native.json()
+                                has_focus_field = _has_explicit_focus_keyword_field(native_payload)
+                                if has_focus_field:
+                                    value = _extract_focus_keyword(native_payload)
+                                    payload = {"bridge": payload, "native": native_payload}
+
+                        if not has_focus_field:
+                            lookup_failures.append(f"{item.get('type', 'item')} {item.get('id')}")
+                            focus_inventory_verified = False
                             return
-                        payload = meta.json()
-                        value = _extract_focus_keyword(payload)
-                        seo_values = _extract_seo_metadata(payload)
-                        # The bridge is authoritative when available. Keep an explicit
-                        # source marker so the frontend can distinguish a mapped
-                        # keyword from an unassigned keyword.
-                        if value:
-                            item["focus_keyword"] = value
-                            item["focus_keyword_source"] = "seo_bridge"
-                        elif not item.get("focus_keyword"):
-                            item["focus_keyword_source"] = "seo_bridge_empty"
-                        # Empty is valid: it means this item has no assigned focus
-                        # keyword. A failed lookup is different and must not be
-                        # treated as "unused".
+
+                        item["focus_keyword"] = value
+                        item["focus_keyword_source"] = "yoast"
+                        seo_values = _extract_seo_metadata(payload) if payload is not None else {"meta_title": "", "meta_description": ""}
                         if seo_values["meta_title"]:
                             item["meta_title"] = seo_values["meta_title"]
                         if seo_values["meta_description"]:
                             item["meta_description"] = seo_values["meta_description"]
                     except Exception as exc:
+                        lookup_failures.append(f"{item.get('type', 'item')} {item.get('id')}: {exc}")
                         focus_inventory_verified = False
-                        focus_inventory_error = (
-                            f"Could not verify the focus-keyword inventory: {exc}"
-                        )
 
             await asyncio.gather(*(load_focus(item) for item in items))
+            if lookup_failures:
+                focus_inventory_error = (
+                    "Yoast focus-keyphrase inventory could not be verified for "
+                    f"{len(lookup_failures)} WordPress item(s). The SEO Bridge must expose "
+                    "the Yoast focus keyphrase field; an omitted field is not treated as empty."
+                )
+        elif bridge.status_code == 200:
+            focus_inventory_error = "Yoast SEO is not reported as active by the Boost Rankers SEO Bridge."
         else:
             # The standard WP REST response may expose SEO meta directly. If the
             # Bridge is unavailable we cannot safely claim that an empty field is

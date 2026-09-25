@@ -252,6 +252,14 @@ export function AISearch() {
     () => focusKeyword.trim() ? focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords) : false,
     [focusKeyword, usedFocusKeywords],
   );
+  const conflictingWpItem = useMemo(() => {
+    const candidate = normalizePhrase(focusKeyword);
+    if (!candidate) return undefined;
+    return wpItems.find((item) =>
+      String(item.id) !== sourceWpId &&
+      normalizePhrase(item.focus_keyword || "") === candidate,
+    );
+  }, [focusKeyword, wpItems, sourceWpId]);
   const suggestedUniqueFocusKeyword = useMemo(
     () => focusKeywordIsUsed ? suggestUniqueFocusKeyword(matchedWpItem, usedFocusKeywords) : "",
     [focusKeywordIsUsed, matchedWpItem, usedFocusKeywords],
@@ -779,7 +787,7 @@ export function AISearch() {
                       Focus keyword already in use by another WordPress post/page. Analyze and Rewrite are blocked until you choose an unused keyword.
                     </p>
                     <p className="text-xs text-rose-600 dark:text-rose-400">
-                      {matchedWpItem?.title ? `Conflicting assignment found on: ${matchedWpItem.title}` : "The entered phrase matches an assigned WordPress focus keyword."}
+                      {conflictingWpItem?.title ? `Conflicting assignment found on: ${conflictingWpItem.title}` : "The entered phrase matches an assigned WordPress focus keyword."}
                     </p>
                     {(aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword) && (
                       <button
