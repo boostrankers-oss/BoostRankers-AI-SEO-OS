@@ -72,6 +72,11 @@ interface AIAnalysis {
   suggested_title: string;
   suggested_meta_title: string;
   suggested_meta_description: string;
+  search_intent?: string;
+  topic_cluster?: string;
+  intent_collision_risk?: string;
+  intent_collision_with?: Array<{ title?: string; url?: string; focus_keyword?: string; intent?: string; topic_overlap?: number }>;
+  keyword_plan?: { role?: string; reason?: string };
 }
 
 interface RewriteResult {
@@ -84,6 +89,11 @@ interface RewriteResult {
   focus_keyword_usage: Record<string, boolean>;
   internal_links_applied?: number;
   internal_link_targets?: string[];
+  search_intent?: string;
+  topic_cluster?: string;
+  intent_collision_risk?: string;
+  intent_collision_with?: Array<{ title?: string; url?: string; focus_keyword?: string; intent?: string; topic_overlap?: number }>;
+  keyword_plan?: { role?: string; reason?: string };
 }
 
 interface WPItem {
@@ -96,6 +106,8 @@ interface WPItem {
   content_html: string;
   excerpt: string;
   focus_keyword?: string;
+  meta_title?: string;
+  meta_description?: string;
 }
 
 function scoreClass(score: number) {
@@ -118,48 +130,12 @@ function normalizePhrase(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
 }
 
-function normalizeKeywordToken(token: string) {
-  if (token.endsWith("ies") && token.length > 4) return `${token.slice(0, -3)}y`;
-  if (token.endsWith("s") && token.length > 4 && !token.endsWith("ss")) return token.slice(0, -1);
-  return token;
-}
-
-const KEYWORD_COMPARISON_STOPWORDS = new Set([
-  "a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of", "on",
-  "or", "the", "to", "with", "without", "your", "our", "this", "that",
-]);
-
-function keywordTokens(value: string) {
-  return new Set(
-    normalizePhrase(value)
-      .split(" ")
-      .filter(Boolean)
-      .filter((token) => !KEYWORD_COMPARISON_STOPWORDS.has(token))
-      .map(normalizeKeywordToken),
-  );
-}
-
 function focusKeywordConflicts(candidate: string, usedKeywords: string[]) {
   const candidateNorm = normalizePhrase(candidate);
   if (!candidateNorm) return false;
-
-  const candidateTokens = keywordTokens(candidateNorm);
-
-  return usedKeywords.some((used) => {
-    const usedNorm = normalizePhrase(used);
-    if (!usedNorm) return false;
-    if (candidateNorm === usedNorm) return true;
-
-    const usedTokens = keywordTokens(usedNorm);
-    if (!candidateTokens.size || !usedTokens.size) return false;
-
-    // Treat grammatical variants as the same assignment only when the complete
-    // meaningful-token sets are identical. This catches "service" vs "services"
-    // and connector-word differences such as "in", while allowing genuinely
-    // different phrases and short fragments such as "end of".
-    if (candidateTokens.size < 2 || candidateTokens.size !== usedTokens.size) return false;
-    return [...candidateTokens].every((token) => usedTokens.has(token));
-  });
+  // Focus-keyword ownership is exact after normalization. Shared words,
+  // partial phrases, and Google result occurrences are not duplicates.
+  return usedKeywords.some((used) => normalizePhrase(used) === candidateNorm);
 }
 
 function getUsedFocusKeywords(items: WPItem[], sourceId: string) {
@@ -167,6 +143,21 @@ function getUsedFocusKeywords(items: WPItem[], sourceId: string) {
     .filter((item) => String(item.id) !== String(sourceId))
     .map((item) => item.focus_keyword?.trim() || "")
     .filter(Boolean);
+}
+
+function buildSiteContentInventory(items: WPItem[], sourceId: string) {
+  return items
+    .filter((item) => String(item.id) !== String(sourceId))
+    .map((item) => ({
+      id: String(item.id),
+      type: item.type,
+      status: item.status,
+      title: item.title,
+      url: item.url,
+      focus_keyword: item.focus_keyword || "",
+      meta_title: item.meta_title || "",
+      meta_description: item.meta_description || "",
+    }));
 }
 
 function suggestUniqueFocusKeyword(item: WPItem | undefined, usedKeywords: string[]) {
@@ -379,6 +370,7 @@ export function AISearch() {
         url: url.trim(),
         focus_keyword: focusKeyword.trim(),
         used_focus_keywords: validationUsedKeywords,
+        site_content_inventory: buildSiteContentInventory(validationItems, validationSourceId),
       });
 
       setAnalysis({ measured: result.measured, ai_analysis: result.ai_analysis });
@@ -510,6 +502,7 @@ export function AISearch() {
           meta_description: analysis.measured.meta_description,
           analysis: analysis.ai_analysis,
           internal_link_candidates: targetCandidates,
+          site_content_inventory: buildSiteContentInventory(items, sourceId),
         },
       );
 
@@ -817,6 +810,11 @@ export function AISearch() {
             </CardHeader>
             <CardContent className="space-y-4">
               <p className="text-sm leading-6 text-slate-600 dark:text-slate-300">{analysis.ai_analysis.summary}</p>
+              <div className="flex flex-wrap gap-2 text-xs">
+                <Badge variant="outline">Intent: {analysis.ai_analysis.search_intent || "checked"}</Badge>
+                {analysis.ai_analysis.topic_cluster && <Badge variant="secondary">Topic: {analysis.ai_analysis.topic_cluster}</Badge>}
+                {analysis.ai_analysis.keyword_plan?.role && <Badge variant="outline">Keyword plan: {analysis.ai_analysis.keyword_plan.role}</Badge>}
+              </div>
               {analysis.ai_analysis.rewrite_reason && <div className="rounded-lg bg-amber-50 dark:bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300"><strong>Why:</strong> {analysis.ai_analysis.rewrite_reason}</div>}
               <div className="grid grid-cols-2 gap-3">
                 {["answer_engine_readiness", "semantic_coverage"].map((key) => {
@@ -854,6 +852,28 @@ export function AISearch() {
               <MetaField label="Internal links" value={String(rewrite.internal_links_applied ?? 0)} />
             </div>
             <div><p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Meta description</p><div className="rounded-lg border border-slate-200 dark:border-slate-800 p-3 text-sm">{showOriginal ? analysis?.measured.meta_description : rewrite.meta_description}</div></div>
+            {!showOriginal && (
+              <Card className="border-indigo-200 dark:border-indigo-900/50 bg-indigo-50/40 dark:bg-indigo-500/5">
+                <CardContent className="p-4 space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-sm font-semibold">SEO topic & intent differentiation</p>
+                    <Badge variant="outline">{rewrite.search_intent || "intent checked"}</Badge>
+                    {rewrite.topic_cluster && <Badge variant="secondary">{rewrite.topic_cluster}</Badge>}
+                    {rewrite.intent_collision_risk && <Badge variant={rewrite.intent_collision_risk === "low" ? "default" : "outline"}>collision risk: {rewrite.intent_collision_risk}</Badge>}
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
+                    <div className="rounded-md border p-3 bg-white/60 dark:bg-slate-950/30"><strong>Focus keyword</strong><br />Unique assigned phrase</div>
+                    <div className="rounded-md border p-3 bg-white/60 dark:bg-slate-950/30"><strong>H1 / Title</strong><br />Article topic + intent</div>
+                    <div className="rounded-md border p-3 bg-white/60 dark:bg-slate-950/30"><strong>SEO title + description</strong><br />Distinct search-result copy</div>
+                  </div>
+                  {rewrite.intent_collision_with?.length ? (
+                    <div className="text-xs text-amber-700 dark:text-amber-300">
+                      Related existing topics were detected for review; shared words alone are not treated as duplicate focus-keyword ownership.
+                    </div>
+                  ) : null}
+                </CardContent>
+              </Card>
+            )}
             {selectedTargetPage && !showOriginal && (
               <div className="rounded-lg border border-indigo-200 dark:border-indigo-900/50 bg-indigo-50/50 dark:bg-indigo-500/5 p-3 text-sm">
                 <span className="font-semibold">Verified target page:</span> {selectedTargetPage.title}

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import difflib
 import ipaddress
 import json
 import logging
@@ -57,6 +58,7 @@ class AnalyzeRequest(BaseModel):
     url: HttpUrl
     focus_keyword: str = Field(default="", max_length=500)
     used_focus_keywords: list[str] = Field(default_factory=list, max_length=500)
+    site_content_inventory: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
 
 
 class RewriteRequest(BaseModel):
@@ -69,6 +71,7 @@ class RewriteRequest(BaseModel):
     analysis: dict[str, Any] = Field(default_factory=dict)
     used_focus_keywords: list[str] = Field(default_factory=list, max_length=500)
     internal_link_candidates: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
+    site_content_inventory: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
 
 
 class WordPressCredentialsRequest(BaseModel):
@@ -260,10 +263,200 @@ def _extract_focus_keyword(payload: Any) -> str:
     return ""
 
 
+def _extract_seo_metadata(payload: Any) -> dict[str, str]:
+    """Extract explicit SEO title/description fields from common WP SEO bridges."""
+    result = {"meta_title": "", "meta_description": ""}
+    title_keys = {
+        "seo_title", "meta_title", "seo_title_tag", "_yoast_wpseo_title",
+        "yoast_wpseo_title", "rank_math_title", "aioseo_title", "seopress_titles_title",
+    }
+    description_keys = {
+        "meta_description", "seo_description", "_yoast_wpseo_metadesc",
+        "yoast_wpseo_metadesc", "rank_math_description", "aioseo_description",
+        "seopress_titles_desc",
+    }
+
+    def walk(value: Any) -> None:
+        if result["meta_title"] and result["meta_description"]:
+            return
+        if isinstance(value, dict):
+            for key, raw in value.items():
+                normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+                if isinstance(raw, str) and raw.strip():
+                    if normalized_key in title_keys and not result["meta_title"]:
+                        result["meta_title"] = " ".join(raw.split())
+                    elif normalized_key in description_keys and not result["meta_description"]:
+                        result["meta_description"] = " ".join(raw.split())
+                if isinstance(raw, (dict, list)):
+                    walk(raw)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(payload)
+    return result
+
+
+def _intent_profile(title: str, content: str, focus_keyword: str = "") -> str:
+    """Classify page intent conservatively for topic-map guidance, not ranking claims."""
+    text = _normalize_phrase(" ".join([title, focus_keyword, content[:10000]]))
+    commercial = {
+        "hire", "hiring", "book", "booking", "quote", "quotes", "pricing", "price", "cost",
+        "service", "services", "company", "cleaner", "cleaners", "provider", "providers",
+        "commercial", "professional", "request", "appointment", "near me",
+    }
+    informational = {
+        "how", "what", "why", "when", "where", "guide", "guides", "tips", "checklist",
+        "explained", "steps", "ideas", "mistakes", "benefits", "difference", "compare",
+        "comparison", "faq", "questions", "maintenance", "advice", "things", "included",
+    }
+    tokens = set(text.split())
+    c = len(tokens & commercial)
+    i = len(tokens & informational)
+    if i >= c + 2:
+        return "informational"
+    if c >= i + 2:
+        return "commercial"
+    return "mixed"
+
+
+def _inventory_for_source(inventory: list[dict[str, Any]], source_url: str) -> list[dict[str, str]]:
+    source_key = _canonical_url(source_url)
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in inventory[:5000]:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        key = _canonical_url(url, source_url)
+        if key == source_key or key in seen:
+            continue
+        seen.add(key)
+        result.append({
+            "id": str(item.get("id") or ""),
+            "type": str(item.get("type") or ""),
+            "status": str(item.get("status") or ""),
+            "title": str(item.get("title") or "").strip(),
+            "url": url,
+            "focus_keyword": str(item.get("focus_keyword") or "").strip(),
+            "meta_title": str(item.get("meta_title") or "").strip(),
+            "meta_description": str(item.get("meta_description") or "").strip(),
+        })
+    return result
+
+
+def _metadata_similarity(left: str, right: str) -> float:
+    a = _normalize_phrase(left)
+    b = _normalize_phrase(right)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    a_tokens, b_tokens = set(a.split()), set(b.split())
+    jaccard = len(a_tokens & b_tokens) / max(1, len(a_tokens | b_tokens))
+    sequence = difflib.SequenceMatcher(None, a, b).ratio()
+    return max(jaccard, sequence)
+
+
+def _metadata_collision(value: str, inventory: list[dict[str, str]], field: str, threshold: float = 0.90) -> dict[str, Any] | None:
+    normalized = _normalize_phrase(value)
+    if not normalized:
+        return None
+    for item in inventory:
+        existing = str(item.get(field) or "").strip()
+        if not existing:
+            continue
+        similarity = _metadata_similarity(value, existing)
+        if normalized == _normalize_phrase(existing) or similarity >= threshold:
+            return {
+                "id": item.get("id", ""),
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "field": field,
+                "existing": existing,
+                "similarity": round(similarity, 3),
+            }
+    return None
+
+
+def _topic_intent_collisions(source_title: str, source_focus: str, source_content: str, inventory: list[dict[str, str]]) -> list[dict[str, Any]]:
+    source_intent = _intent_profile(source_title, source_content)
+    source_terms = _link_terms(" ".join([source_title, source_focus, source_content[:6000]]))
+    collisions: list[dict[str, Any]] = []
+    for item in inventory:
+        existing_title = str(item.get("title") or "")
+        existing_focus = str(item.get("focus_keyword") or "")
+        if not existing_title and not existing_focus:
+            continue
+        existing_intent = _intent_profile(existing_title, "", existing_focus)
+        existing_terms = _link_terms(" ".join([existing_title, existing_focus]))
+        overlap = len(source_terms & existing_terms) / max(1, len(source_terms | existing_terms))
+        if source_intent == existing_intent and overlap >= 0.55:
+            collisions.append({
+                "title": existing_title,
+                "url": item.get("url", ""),
+                "focus_keyword": existing_focus,
+                "intent": existing_intent,
+                "topic_overlap": round(overlap, 3),
+            })
+    return sorted(collisions, key=lambda x: -x["topic_overlap"])[:5]
+
+
+def _fallback_distinct_meta_title(title: str, focus_keyword: str, inventory: list[dict[str, str]], field: str = "meta_title") -> str:
+    base = re.sub(r"\s+", " ", title).strip()
+    variants = [
+        base,
+        f"{base} | Practical Guide",
+        f"{base} | Perth Guide",
+        f"{base} | What to Know",
+        f"{base} | Expert Tips",
+    ]
+    for candidate in variants:
+        if not _metadata_collision(candidate, inventory, field, 0.96):
+            return candidate[:500]
+    return (base + " | Guide")[:500]
+
+
+def _fallback_meta_description(title: str, content: str, focus_keyword: str, inventory: list[dict[str, str]]) -> str:
+    body = _strip_html(content)
+    topic = focus_keyword.strip() or title.strip()
+    candidates = [
+        f"Learn what to consider about {topic}, including practical steps, key questions, and useful guidance before choosing the right approach.",
+        f"Explore practical guidance on {topic}, with key considerations, useful steps, and questions to help you make an informed decision.",
+        _safe_excerpt(body, 155),
+    ]
+    for candidate in candidates:
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        if candidate and not _metadata_collision(candidate, inventory, "meta_description", 0.96):
+            return candidate[:1000]
+    return candidates[0][:1000]
+
+
+def _validate_rewrite_seo(rewrite: dict[str, Any], inventory: list[dict[str, str]], source_title: str, source_content: str) -> dict[str, Any]:
+    title = str(rewrite.get("title") or "").strip()
+    meta_title = str(rewrite.get("meta_title") or "").strip()
+    meta_description = str(rewrite.get("meta_description") or "").strip()
+    focus = str(rewrite.get("focus_keyword") or "").strip()
+    checks: dict[str, Any] = {"title_collision": None, "meta_title_collision": None, "meta_description_collision": None, "title_meta_title_same": False, "description_repeats_title": False, "intent_collisions": []}
+    checks["title_collision"] = _metadata_collision(title, inventory, "title", 0.88)
+    checks["meta_title_collision"] = _metadata_collision(meta_title, inventory, "meta_title", 0.90)
+    checks["meta_description_collision"] = _metadata_collision(meta_description, inventory, "meta_description", 0.92)
+    checks["title_meta_title_same"] = bool(title and meta_title and _normalize_phrase(title) == _normalize_phrase(meta_title))
+    checks["description_repeats_title"] = bool(meta_description and title and _metadata_similarity(meta_description, title) >= 0.72)
+    checks["intent_collisions"] = _topic_intent_collisions(title or source_title, focus, source_content, inventory)
+    checks["needs_repair"] = any([
+        checks["title_collision"], checks["meta_title_collision"], checks["meta_description_collision"],
+        checks["title_meta_title_same"], checks["description_repeats_title"],
+    ])
+    return checks
+
+
 def _focus_candidates(title: str, content: str, used: set[str]) -> list[str]:
     """Build deterministic title/content-derived keyword candidates without inventing topics."""
     stop = {
-        "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from",
+        "the", "a", "an", "and", "or", "for", "to", "in", "on", "with", "from",
         "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
         "guide", "best", "ultimate", "complete", "tips", "checklist",
     }
@@ -318,41 +511,20 @@ def _keyword_tokens(value: str) -> set[str]:
 
 
 def _keyword_conflicts(candidate: str, used_keywords: set[str] | list[str]) -> bool:
-    """Return True for the same assigned focus-keyword intent, not loose word overlap.
+    """Return True only when the exact focus-keyword phrase is already assigned.
 
-    Exact normalized phrases are duplicates.  We also treat grammatical variants
-    and one-word service/connective expansions as the same assignment, e.g.
-    ``end of lease cleaning service Perth`` vs
-    ``End of Lease Cleaning Services in Perth``.
-
-    Short fragments such as ``end of`` must NOT conflict with a longer keyword
-    because their meaningful-token set is too small.  Search-result occurrences
-    are irrelevant; only supplied WordPress focus-keyword assignments are checked.
+    Google search-result occurrences and partial phrase overlap are not ownership
+    conflicts. ``end of`` can therefore coexist with ``end of lease cleaning Perth``.
+    Formatting differences such as punctuation/case/whitespace are normalized.
     """
     candidate_norm = _normalize_phrase(candidate)
     if not candidate_norm:
         return False
-
-    candidate_tokens = _keyword_tokens(candidate_norm)
-    for used in used_keywords:
-        used_norm = _normalize_phrase(str(used))
-        if not used_norm:
-            continue
-        if candidate_norm == used_norm:
-            return True
-
-        used_tokens = _keyword_tokens(used_norm)
-        if not candidate_tokens or not used_tokens:
-            continue
-
-        # Treat grammatical variants as the same assignment only when their
-        # complete meaningful-token sets are identical. This catches
-        # "service" vs "services" and connector-word differences such as
-        # "in", while allowing genuinely different phrases.
-        if len(candidate_tokens) >= 2 and candidate_tokens == used_tokens:
-            return True
-
-    return False
+    return any(
+        candidate_norm == _normalize_phrase(str(used))
+        for used in used_keywords
+        if _normalize_phrase(str(used))
+    )
 
 
 def _dedupe_keywords(values: list[str]) -> list[str]:
@@ -366,15 +538,29 @@ def _dedupe_keywords(values: list[str]) -> list[str]:
             result.append(clean)
     return result
 
+def _focus_keyword_fits_intent(candidate: str, title: str, content: str) -> bool:
+    """Keep informational articles from being assigned an overtly transactional service phrase."""
+    page_intent = _intent_profile(title, content)
+    candidate_tokens = set(_normalize_phrase(candidate).split())
+    transactional = {
+        "hire", "hiring", "book", "booking", "quote", "quotes", "pricing", "price", "cost",
+        "service", "services", "company", "provider", "providers", "appointment", "request",
+        "near",
+    }
+    if page_intent == "informational" and len(candidate_tokens & transactional) >= 1:
+        return False
+    return True
+
+
 def _choose_focus_keyword(title: str, content: str, requested: str, used_keywords: list[str]) -> tuple[str, bool]:
     used = {_normalize_phrase(x) for x in used_keywords if _normalize_phrase(x)}
     requested = re.sub(r"\s+", " ", requested or "").strip()
     requested_conflict = bool(requested and _keyword_conflicts(requested, used))
-    if requested and not requested_conflict:
+    if requested and not requested_conflict and _focus_keyword_fits_intent(requested, title, content):
         return requested, False
 
     for candidate in _focus_candidates(title, content, used):
-        if not _keyword_conflicts(candidate, used):
+        if not _keyword_conflicts(candidate, used) and _focus_keyword_fits_intent(candidate, title, content):
             return candidate, bool(requested)
 
     # If title-derived phrases are exhausted, derive candidates from the body
@@ -394,7 +580,7 @@ def _choose_focus_keyword(title: str, content: str, requested: str, used_keyword
         for i in range(max(0, len(content_words) - n + 1)):
             candidate = " ".join(content_words[i:i + n])
             candidate_norm = _normalize_phrase(candidate)
-            if len(candidate_norm) < 5 or _keyword_conflicts(candidate, used):
+            if len(candidate_norm) < 5 or _keyword_conflicts(candidate, used) or not _focus_keyword_fits_intent(candidate, title, content):
                 continue
             candidate_terms = _keyword_tokens(candidate)
             overlap = len(title_terms & candidate_terms)
@@ -1036,6 +1222,7 @@ async def _ai_unique_focus_keyword(
     requested_keyword: str,
     used_keywords: list[str],
     api_key: str,
+    inventory: list[dict[str, Any]] | None = None,
 ) -> str:
     """Ask Claude for a topic-specific unused focus keyword and validate it locally."""
     fallback, _ = _choose_focus_keyword(title, content, "", used_keywords)
@@ -1048,6 +1235,8 @@ Do not invent services, locations, facts, prices, guarantees, or topics not supp
 Do not use a keyword from the used-keyword list.
 Do not return a sentence, punctuation, quotes, or an explanation.
 Return JSON only: {"focus_keyword": "..."}. The phrase should normally contain 3-7 meaningful words."""
+    inventory = inventory or []
+    source_intent = _intent_profile(title, content)
     prompt = f"""
 Article title:
 {title}
@@ -1058,10 +1247,26 @@ Article content excerpt:
 Requested keyword that is unavailable:
 {requested_keyword or "(none)"}
 
-Existing WordPress focus-keyword assignments. Do NOT reuse these:
+Detected article intent:
+{source_intent}
+
+Existing WordPress focus-keyword assignments. Do NOT reuse these exact assigned phrases:
 {json.dumps(_dedupe_keywords(used_keywords)[:500], ensure_ascii=False)}
 
-Return one replacement focus keyword that is genuinely useful for this exact article.
+Existing site topic/intent map. Avoid selecting a phrase that simply reproduces the same
+commercial service intent for an informational article, or the same informational topic
+for a service page. Shared words are allowed; the goal is distinct search intent, not
+artificial word-level separation:
+{json.dumps([
+    {"title": x.get("title", ""), "focus_keyword": x.get("focus_keyword", ""),
+     "intent": _intent_profile(str(x.get("title", "")), "", str(x.get("focus_keyword", "")))}
+    for x in inventory[:500]
+], ensure_ascii=False)}
+
+Return one replacement focus keyword that is genuinely useful for this exact article,
+reflects its existing intent, and clearly differentiates it from the site's existing
+assignments. Use 3-7 meaningful words when possible. Do not add unsupported services,
+locations, facts, or claims.
 """
     try:
         result = await _claude_json(system, prompt, api_key=api_key, max_tokens=800)
@@ -1079,6 +1284,70 @@ Return one replacement focus keyword that is genuinely useful for this exact art
 
     return fallback
 
+async def _ai_repair_metadata(
+    rewrite: dict[str, Any],
+    source_title: str,
+    source_content: str,
+    inventory: list[dict[str, str]],
+    api_key: str,
+) -> dict[str, str]:
+    """Repair title/SEO metadata when generated fields collide with site inventory."""
+    system = """You are a senior technical SEO editor. Repair only the page title, SEO title, and meta description. Keep the article's existing search intent and facts. Do not turn an informational article into a commercial service page. Do not invent facts. The H1/title, SEO title, and meta description must be distinct but clearly related. The focus keyword is a targeting reference, not a phrase that must appear in every field. Return only JSON."""
+    prompt = f"""
+Original article title:
+{source_title}
+
+Selected focus keyword:
+{str(rewrite.get('focus_keyword') or '').strip()}
+
+Current generated title:
+{str(rewrite.get('title') or '').strip()}
+
+Current generated SEO title:
+{str(rewrite.get('meta_title') or '').strip()}
+
+Current generated meta description:
+{str(rewrite.get('meta_description') or '').strip()}
+
+Existing site title/metadata inventory:
+{json.dumps(inventory[:500], ensure_ascii=False, indent=2)}
+
+Collision checks:
+{json.dumps(_validate_rewrite_seo(rewrite, inventory, source_title, source_content), ensure_ascii=False, indent=2)}
+
+Article excerpt:
+{_safe_excerpt(source_content, 10000)}
+
+Return exactly:
+{{
+  "title": "",
+  "meta_title": "",
+  "meta_description": ""
+}}
+
+Rules:
+- Preserve the article's real topic and current search intent.
+- If the article is informational, keep the title informational; do not make it a service landing page.
+- If the article is commercial, keep the commercial intent accurate.
+- Do not copy or closely paraphrase an existing site title or metadata field.
+- The SEO title must be a distinct search-result candidate, not a copy of the H1/title.
+- The meta description must summarize the actual article, not restate the title.
+- The exact focus keyword may be used where natural, but it is NOT mandatory in title, SEO title, or description.
+- Avoid keyword stuffing, repetitive brand/service phrasing, clickbait, and unsupported claims.
+- Keep the SEO title concise; keep the description useful and natural rather than chasing an artificial fixed character count.
+"""
+    try:
+        result = await _claude_json(system, prompt, api_key=api_key, max_tokens=1800)
+        return {
+            "title": str(result.get("title") or "").strip(),
+            "meta_title": str(result.get("meta_title") or "").strip(),
+            "meta_description": str(result.get("meta_description") or "").strip(),
+        }
+    except Exception:
+        logger.exception("AI metadata repair failed; using deterministic fallback")
+        return {}
+
+
 @router.post("/analyze")
 async def analyze_post(
     data: AnalyzeRequest,
@@ -1091,7 +1360,12 @@ async def analyze_post(
     html = await _fetch_public_page(url)
     measured = _extract_page(html, url, data.focus_keyword)
     used_keywords = [str(x).strip() for x in data.used_focus_keywords if str(x).strip()]
-    used_for_prompt = used_keywords[:250]
+    inventory = _inventory_for_source(data.site_content_inventory, url)
+    inventory_focus_keywords = [str(x.get("focus_keyword") or "").strip() for x in inventory if str(x.get("focus_keyword") or "").strip()]
+    used_keywords = _dedupe_keywords(used_keywords + inventory_focus_keywords)
+    used_for_prompt = used_keywords[:500]
+    source_intent = _intent_profile(measured["title"], measured["content_text_excerpt"])
+    intent_collisions = _topic_intent_collisions(measured["title"], data.focus_keyword, measured["content_text_excerpt"], inventory)
     requested_keyword = data.focus_keyword.strip()
     used_keyword_set = {_normalize_phrase(x) for x in used_keywords if _normalize_phrase(x)}
     if requested_keyword and _keyword_conflicts(requested_keyword, used_keyword_set):
@@ -1101,6 +1375,7 @@ async def analyze_post(
             requested_keyword,
             used_keywords,
             api_key,
+            inventory,
         )
         raise HTTPException(
             status_code=409,
@@ -1112,11 +1387,23 @@ async def analyze_post(
                 "suggestion_source": "ai",
             },
         )
-    system = """You are a senior SEO and answer-engine optimization consultant. Analyze only supplied page evidence. Never claim that a page is cited by ChatGPT, Perplexity, Gemini, Google AI Overviews, or another AI engine unless evidence proves it. Never invent traffic, rankings, citations, entities, schema, competitor data, or search-volume data. Separate measured HTML facts from recommendations. If no focus keyword is supplied, recommend one concise topic phrase derived only from the page title/content. It must not duplicate any focus keyword in the supplied used-keyword list. Also suggest a compelling, accurate title that improves click appeal without clickbait. Return only JSON."""
+    system = """You are a senior SEO and answer-engine optimization consultant. Analyze only supplied page evidence. Never claim that a page is cited by ChatGPT, Perplexity, Gemini, Google AI Overviews, or another AI engine unless evidence proves it. Never invent traffic, rankings, citations, entities, schema, competitor data, or search-volume data. Separate measured HTML facts from recommendations. Build a site-level topic/intent map from the supplied WordPress inventory. Distinguish commercial service intent from informational article intent. If no focus keyword is supplied, recommend one concise topic phrase derived only from the page title/content and existing intent. It must not duplicate any assigned focus keyword. Do not mechanically force the keyword into every SEO field. Return only JSON."""
     prompt = f"""
 Page: {url}
 Focus keyword: {data.focus_keyword or '(automatic selection required)'}
-Already-used focus keywords (do not reuse): {json.dumps(used_for_prompt, ensure_ascii=False)}
+Already-used focus keywords (do not reuse exactly): {json.dumps(used_for_prompt, ensure_ascii=False)}
+
+Detected source intent: {source_intent}
+
+Existing site topic / intent map:
+{json.dumps([{
+    "title": x.get("title", ""), "focus_keyword": x.get("focus_keyword", ""),
+    "meta_title": x.get("meta_title", ""),
+    "intent": _intent_profile(str(x.get("title", "")), "", str(x.get("focus_keyword", "")))
+} for x in inventory[:500]], ensure_ascii=False)}
+
+Potential same-intent topic collisions (warning only; do not infer ranking impact):
+{json.dumps(intent_collisions, ensure_ascii=False)}
 
 Measured evidence:
 {json.dumps({k: v for k, v in measured.items() if k not in {'content_html'}}, indent=2)}
@@ -1156,6 +1443,11 @@ Scores are 0-100 and must be grounded in the evidence.
     ai["suggested_focus_keyword"] = chosen_keyword
     ai["focus_keyword_auto_selected"] = not bool(requested_keyword) or conflict
     ai["focus_keyword_conflict"] = conflict
+    ai["search_intent"] = str(ai.get("search_intent") or source_intent).strip().lower() or source_intent
+    ai["topic_cluster"] = str(ai.get("topic_cluster") or "").strip()
+    ai["intent_collision_risk"] = str(ai.get("intent_collision_risk") or ("medium" if intent_collisions else "low")).strip().lower()
+    ai["intent_collision_with"] = ai.get("intent_collision_with") if isinstance(ai.get("intent_collision_with"), list) else intent_collisions
+    ai["keyword_plan"] = ai.get("keyword_plan") if isinstance(ai.get("keyword_plan"), dict) else {"role": "", "reason": ""}
     if conflict:
         ai.setdefault("quick_wins", []).insert(0, f"The requested focus keyword was already used elsewhere, so an unused title-derived keyword was selected automatically: {chosen_keyword}.")
     for key in ("ai_search_score", "content_quality", "answer_engine_readiness", "entity_readiness", "semantic_coverage"):
@@ -1352,7 +1644,11 @@ async def rewrite_post(
     if source_word_count < 100:
         raise HTTPException(status_code=400, detail="The post needs at least 100 readable words before AI rewriting.")
 
-    rewrite_used_keywords = [str(x).strip() for x in data.used_focus_keywords if str(x).strip()]
+    inventory = _inventory_for_source(data.site_content_inventory, str(data.url))
+    inventory_focus_keywords = [str(x.get("focus_keyword") or "").strip() for x in inventory if str(x.get("focus_keyword") or "").strip()]
+    rewrite_used_keywords = _dedupe_keywords(
+        [str(x).strip() for x in data.used_focus_keywords if str(x).strip()] + inventory_focus_keywords
+    )
     if data.focus_keyword.strip() and _keyword_conflicts(
         data.focus_keyword.strip(),
         rewrite_used_keywords,
@@ -1363,6 +1659,7 @@ async def rewrite_post(
             data.focus_keyword.strip(),
             rewrite_used_keywords,
             api_key,
+            inventory,
         )
         raise HTTPException(
             status_code=409,
@@ -1404,16 +1701,31 @@ async def rewrite_post(
         for item in target_candidates
     ]
 
-    system = """You are a senior SEO content editor specializing in helpful content and AI search / answer-engine optimization. Rewrite the supplied article without inventing business facts, statistics, credentials, locations, prices, awards, reviews, or guarantees. Preserve supported facts and the article's real subject. Improve clarity, topical completeness, passage-level answers, entity clarity, headings, internal coherence, and natural focus-keyword usage. Do not keyword-stuff. The rewritten article must remain about the same existing blog topic, not become a new page or a different service. Return only valid JSON."""
+    source_intent = _intent_profile(data.title, source_text)
+    topic_collisions = _topic_intent_collisions(data.title, chosen_keyword, source_text, inventory)
+
+    system = """You are a senior SEO content editor specializing in helpful content and AI search / answer-engine optimization. Rewrite the supplied article without inventing business facts, statistics, credentials, locations, prices, awards, reviews, or guarantees. Preserve supported facts and the article's real subject. Improve clarity, topical completeness, passage-level answers, entity clarity, headings, internal coherence, and natural semantic keyword usage. Do not keyword-stuff. The rewritten article must remain about the same existing topic. Use the supplied site topic/intent map to differentiate informational articles from commercial service pages. Return only valid JSON."""
 
     prompt = f"""
 Original URL: {data.url}
 Current title: {data.title}
+Current page intent: {source_intent}
 Focus keyword selected for this rewrite: {chosen_keyword}
-Focus keyword conflict detected: {keyword_conflict}
 Current meta title: {data.meta_title}
 Current meta description: {data.meta_description}
 Source word count: {source_word_count}
+
+Existing site topic / intent map:
+{json.dumps([{
+    "id": x.get("id", ""), "type": x.get("type", ""), "status": x.get("status", ""),
+    "title": x.get("title", ""), "url": x.get("url", ""),
+    "focus_keyword": x.get("focus_keyword", ""), "meta_title": x.get("meta_title", ""),
+    "meta_description": x.get("meta_description", ""),
+    "intent": _intent_profile(str(x.get("title", "")), "", str(x.get("focus_keyword", "")))
+} for x in inventory[:500]], ensure_ascii=False, indent=2)}
+
+Potential same-intent topic collisions:
+{json.dumps(topic_collisions, ensure_ascii=False, indent=2)}
 
 Existing analysis:
 {json.dumps(data.analysis, indent=2)}
@@ -1432,27 +1744,36 @@ Return ONLY:
   "meta_description": "",
   "article_html": "",
   "change_summary": [],
+  "search_intent": "{source_intent}",
+  "topic_cluster": "",
+  "intent_collision_risk": "",
+  "intent_collision_with": [],
+  "keyword_plan": {{"role": "", "reason": ""}},
   "focus_keyword_usage": {{"title": true, "first_paragraph": true, "headings": true, "body": true, "natural_usage": true}},
   "internal_links_applied": 0
 }}
 
 Rules:
-- Use exactly this focus keyword: {chosen_keyword}. Do not switch to a different keyword.
-- This focus keyword must not duplicate any keyword in the supplied used-focus-keyword list.
-- Use the focus keyword naturally in the title/H1, opening section, one relevant subheading where natural, and body. Never force it into every heading or sentence.
-- Preserve the existing blog's search intent, subject, supported facts, service/topic scope, and useful details. Do not turn the article into a landing page or a different article.
-- Improve the title with a specific, benefit-led angle without clickbait.
-- Meta title should be concise, accurate, and contain the exact focus keyword naturally.
-- Meta description should be approximately 140-160 characters, accurate, and contain the exact focus keyword naturally.
+- Use exactly this focus keyword as the targeting reference: {chosen_keyword}. Do not switch to a different focus keyword.
+- The focus keyword is NOT a phrase that must be mechanically repeated in every SEO field.
+- Preserve the existing article's search intent. If the source is informational, keep it informational; do not convert it into a service landing page merely because a service keyword exists elsewhere on the site.
+- If the source is commercial, keep the commercial service intent accurate and specific.
+- H1/title, SEO title, and meta description must be distinct but related. Do not make them copies of one another.
+- The H1/title should clearly communicate the article's actual topic and intent.
+- The SEO title is a concise search-result candidate. It may include the focus keyword when natural, but it does not have to.
+- The meta description should accurately summarize the article and entice a relevant click without clickbait. It may include the focus keyword when natural, but it does not have to.
+- Do not use a fixed keyword-placement formula. Use the focus keyword and semantically related terms where they improve clarity. Never keyword-stuff or repeat a phrase unnaturally.
+- Do not copy or closely paraphrase existing site titles, SEO titles, or meta descriptions shown in the inventory.
+- Avoid creating the same commercial service intent as an existing service page when this article is informational. Prefer an informational long-tail angle such as a checklist, explanation, process, comparison, mistakes, or decision guidance only when the article actually supports it.
+- Do not invent search volume, rankings, competitor data, or unsupported facts.
 - Produce complete WordPress-compatible HTML using h2/h3, p, ul/ol, and strong where useful.
 - Do not shorten the article. Target at least {max(source_word_count, 1200)} readable words when the source supports expansion; preserve all useful existing information while adding genuinely useful explanations, examples, steps, FAQs, or decision guidance relevant to the existing topic.
-- Do not pad with generic filler. Every added section must answer a real user need related to the existing article.
-- Use between {MIN_INTERNAL_LINKS} and {MAX_INTERNAL_LINKS} contextual internal links when that many verified targets are supplied. Prefer the supplied service/solution target when it is genuinely relevant to the article, and use different relevant targets rather than linking the same URL repeatedly.
-- Only link to the verified targets supplied above. Never invent URLs, never link to the current page, and never link to an unrelated service merely to reach the minimum.
+- Do not pad with generic filler.
+- Use between {MIN_INTERNAL_LINKS} and {MAX_INTERNAL_LINKS} contextual internal links when that many verified targets are supplied. Prefer genuinely relevant targets and use different URLs rather than repeating one URL.
+- Only link to verified targets supplied above. Never invent URLs, never link to the current page, and never link to an unrelated service merely to reach the minimum.
 - Use natural descriptive anchors based on the target title/focus keyword. Never use generic anchors such as "click here", "read more", or "learn more".
 - Place internal links in relevant body paragraphs or lists, never inside headings, existing links, code, pre, scripts, or styles.
 - Do not output markdown.
-- Do not invent unsupported facts.
 """
 
     rewrite = await _claude_json(system, prompt, api_key=api_key, max_tokens=14000)
@@ -1509,14 +1830,68 @@ Add useful, specific sections, explanations, steps, FAQs, comparisons, or practi
     rewrite["focus_keyword"] = chosen_keyword
     rewrite["internal_links_applied"] = final_link_count
     rewrite["internal_link_targets"] = final_targets
-    rewrite["meta_title"] = str(
-        rewrite.get("meta_title") or rewrite.get("title") or data.title
-    ).strip()[:500]
 
-    meta_description = str(rewrite.get("meta_description") or "").strip()
-    if not meta_description:
-        meta_description = _safe_excerpt(_strip_html(article_html), 160)
-    rewrite["meta_description"] = meta_description[:1000]
+    # Validate generated metadata against the complete WordPress inventory. Exact
+    # focus-keyword ownership is a hard uniqueness rule; title/meta collisions are
+    # repaired so the blog does not inherit a service page's search-result language.
+    rewrite["meta_title"] = str(rewrite.get("meta_title") or "").strip()[:500]
+    rewrite["meta_description"] = str(rewrite.get("meta_description") or "").strip()[:1000]
+    seo_checks = _validate_rewrite_seo(rewrite, inventory, data.title, source_text)
+    if seo_checks["needs_repair"]:
+        repaired = await _ai_repair_metadata(
+            rewrite,
+            data.title,
+            source_text,
+            inventory,
+            api_key,
+        )
+        if repaired.get("title"):
+            rewrite["title"] = repaired["title"][:500]
+        if repaired.get("meta_title"):
+            rewrite["meta_title"] = repaired["meta_title"][:500]
+        if repaired.get("meta_description"):
+            rewrite["meta_description"] = repaired["meta_description"][:1000]
+
+        # Final deterministic guard. This runs even if the AI repair is unavailable.
+        rewrite["title"] = str(rewrite.get("title") or data.title).strip()[:500]
+        if not rewrite["meta_title"] or _normalize_phrase(rewrite["meta_title"]) == _normalize_phrase(rewrite["title"]):
+            rewrite["meta_title"] = _fallback_distinct_meta_title(rewrite["title"], chosen_keyword, inventory)
+        if not rewrite["meta_description"] or _metadata_similarity(rewrite["meta_description"], rewrite["title"]) >= 0.72:
+            rewrite["meta_description"] = _fallback_meta_description(
+                rewrite["title"], article_html, chosen_keyword, inventory
+            )
+
+        # Re-check against the inventory after repair. If an AI-generated repair is
+        # still too close to an existing field, use a deterministic distinct variant.
+        final_checks = _validate_rewrite_seo(rewrite, inventory, data.title, source_text)
+        if final_checks["title_collision"]:
+            rewrite["title"] = _fallback_distinct_meta_title(rewrite["title"], chosen_keyword, inventory, "title")
+        if final_checks["meta_title_collision"]:
+            rewrite["meta_title"] = _fallback_distinct_meta_title(rewrite["title"], chosen_keyword, inventory)
+        if final_checks["meta_description_collision"]:
+            rewrite["meta_description"] = _fallback_meta_description(
+                rewrite["title"], article_html, chosen_keyword, inventory
+            )
+        rewrite.setdefault("change_summary", []).append(
+            "Validated title and SEO metadata against the WordPress topic/intent inventory and repaired overlapping metadata."
+        )
+
+    if not rewrite["meta_title"]:
+        rewrite["meta_title"] = _fallback_distinct_meta_title(
+            rewrite["title"] or data.title, chosen_keyword, inventory
+        )
+    if not rewrite["meta_description"]:
+        rewrite["meta_description"] = _fallback_meta_description(
+            rewrite["title"] or data.title, article_html, chosen_keyword, inventory
+        )
+
+    rewrite["meta_title"] = str(rewrite["meta_title"]).strip()[:500]
+    rewrite["meta_description"] = str(rewrite["meta_description"]).strip()[:1000]
+    rewrite["search_intent"] = str(rewrite.get("search_intent") or source_intent).strip().lower()
+    rewrite["topic_cluster"] = str(rewrite.get("topic_cluster") or "").strip()
+    rewrite["intent_collision_risk"] = str(rewrite.get("intent_collision_risk") or ("medium" if topic_collisions else "low")).strip().lower()
+    rewrite["intent_collision_with"] = rewrite.get("intent_collision_with") if isinstance(rewrite.get("intent_collision_with"), list) else topic_collisions
+    rewrite["keyword_plan"] = rewrite.get("keyword_plan") if isinstance(rewrite.get("keyword_plan"), dict) else {"role": "", "reason": ""}
 
     if keyword_conflict:
         rewrite.setdefault("change_summary", []).append(
@@ -1601,6 +1976,8 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                     title = str((row.get("title") or {}).get("rendered") or "").strip()
                     if not title:
                         continue
+                    row_meta = row.get("meta") or {}
+                    row_seo = _extract_seo_metadata(row_meta)
                     items.append(
                         {
                             "id": int(row["id"]),
@@ -1611,7 +1988,9 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                             "modified": str(row.get("modified") or ""),
                             "content_html": str((row.get("content") or {}).get("rendered") or ""),
                             "excerpt": str((row.get("excerpt") or {}).get("rendered") or ""),
-                            "focus_keyword": _extract_focus_keyword(row.get("meta")),
+                            "focus_keyword": _extract_focus_keyword(row_meta),
+                            "meta_title": row_seo["meta_title"],
+                            "meta_description": row_seo["meta_description"],
                         }
                     )
                     if len(items) >= max_items:
@@ -1656,11 +2035,16 @@ async def wordpress_content(data: WordPressCredentialsRequest, current_user: Use
                             return
                         payload = meta.json()
                         value = _extract_focus_keyword(payload)
+                        seo_values = _extract_seo_metadata(payload)
                         # Empty is valid: it means this item has no assigned focus
                         # keyword. A failed lookup is different and must not be
                         # treated as "unused".
                         if value:
                             item["focus_keyword"] = value
+                        if seo_values["meta_title"]:
+                            item["meta_title"] = seo_values["meta_title"]
+                        if seo_values["meta_description"]:
+                            item["meta_description"] = seo_values["meta_description"]
                     except Exception as exc:
                         focus_inventory_verified = False
                         focus_inventory_error = (
