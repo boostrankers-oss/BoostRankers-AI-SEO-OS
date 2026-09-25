@@ -72,11 +72,6 @@ interface AIAnalysis {
   suggested_title: string;
   suggested_meta_title: string;
   suggested_meta_description: string;
-  search_intent?: string;
-  topic_cluster?: string;
-  intent_collision_risk?: string;
-  intent_collision_with?: Array<{ title?: string; url?: string; focus_keyword?: string; intent?: string; topic_overlap?: number }>;
-  keyword_plan?: { role?: string; reason?: string };
 }
 
 interface RewriteResult {
@@ -89,11 +84,6 @@ interface RewriteResult {
   focus_keyword_usage: Record<string, boolean>;
   internal_links_applied?: number;
   internal_link_targets?: string[];
-  search_intent?: string;
-  topic_cluster?: string;
-  intent_collision_risk?: string;
-  intent_collision_with?: Array<{ title?: string; url?: string; focus_keyword?: string; intent?: string; topic_overlap?: number }>;
-  keyword_plan?: { role?: string; reason?: string };
 }
 
 interface WPItem {
@@ -106,9 +96,6 @@ interface WPItem {
   content_html: string;
   excerpt: string;
   focus_keyword?: string;
-  focus_keyword_source?: string;
-  meta_title?: string;
-  meta_description?: string;
 }
 
 function scoreClass(score: number) {
@@ -124,7 +111,25 @@ function scoreBarClass(score: number) {
 }
 
 function getErrorMessage(error: any, fallback: string) {
-  return error?.data?.detail || error?.response?.data?.detail || error?.message || fallback;
+  const detail = error?.data?.detail || error?.response?.data?.detail;
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object") {
+    const message = String(detail.message || "").trim();
+    if (message) return message;
+  }
+  return error?.message || fallback;
+}
+
+function getFocusKeywordError(error: any) {
+  const detail = error?.data?.detail || error?.response?.data?.detail;
+  if (!detail || typeof detail !== "object") return null;
+  return {
+    message: String(detail.message || "Focus keyword is already in use.").trim(),
+    suggestion: String(detail.suggested_focus_keyword || "").trim(),
+    alternatives: Array.isArray(detail.alternatives)
+      ? detail.alternatives.map((value: unknown) => String(value).trim()).filter(Boolean)
+      : [],
+  };
 }
 
 function normalizePhrase(value: string) {
@@ -132,12 +137,15 @@ function normalizePhrase(value: string) {
 }
 
 function focusKeywordConflicts(candidate: string, usedKeywords: string[]) {
+  // Hard uniqueness rule: compare only the actual focus-keyword assignment
+  // stored on another WordPress post/page. Search-result occurrences, shared
+  // words, partial phrases, connector differences, and singular/plural variants
+  // must not block a different assigned phrase.
   const candidateNorm = normalizePhrase(candidate);
   if (!candidateNorm) return false;
-  // Focus-keyword ownership is exact after normalization. Shared words,
-  // partial phrases, and Google result occurrences are not duplicates.
   return usedKeywords.some((used) => normalizePhrase(used) === candidateNorm);
 }
+
 
 function getUsedFocusKeywords(items: WPItem[], sourceId: string) {
   return items
@@ -146,41 +154,61 @@ function getUsedFocusKeywords(items: WPItem[], sourceId: string) {
     .filter(Boolean);
 }
 
-function buildSiteContentInventory(items: WPItem[], sourceId: string) {
-  return items
-    .filter((item) => String(item.id) !== String(sourceId))
-    .map((item) => ({
-      id: String(item.id),
-      type: item.type,
-      status: item.status,
-      title: item.title,
-      url: item.url,
-      focus_keyword: item.focus_keyword || "",
-      meta_title: item.meta_title || "",
-      meta_description: item.meta_description || "",
-    }));
-}
-
 function suggestUniqueFocusKeyword(item: WPItem | undefined, usedKeywords: string[]) {
   if (!item) return "";
-  const stop = new Set([
-    "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from",
-    "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
-    "guide", "best", "ultimate", "complete", "tips", "checklist",
+
+  // Generate a useful topical phrase from the actual post rather than a
+  // fragment such as "need pick end lease". Keep real phrase wording such as
+  // "of" because it is part of the article's topic. Only an exact assigned
+  // phrase is considered unavailable.
+  const generic = new Set([
+    "the", "a", "an", "and", "or", "for", "to", "in", "on", "with", "from",
+    "how", "what", "why", "when", "where", "who", "which", "your", "our",
+    "this", "that", "guide", "best", "ultimate", "complete", "tips",
+    "checklist", "need", "pick", "choose", "does", "do", "we",
   ]);
   const text = `${item.title} ${item.content_html || ""}`.replace(/<[^>]*>/g, " ");
-  const words = normalizePhrase(text).split(" ").filter((word) => word.length > 2 && !stop.has(word));
-  const titleWords = normalizePhrase(item.title).split(" ").filter((word) => word.length > 2 && !stop.has(word));
-  const candidates: string[] = [];
-  for (const source of [titleWords, words]) {
-    for (const size of [4, 3, 2]) {
+  const titleWords = normalizePhrase(item.title).split(" ").filter(Boolean);
+  const bodyWords = normalizePhrase(text).split(" ").filter(Boolean);
+  const candidates: Array<{ phrase: string; score: number }> = [];
+
+  const addCandidates = (source: string[], sourceWeight: number) => {
+    for (const size of [5, 4, 3]) {
       for (let index = 0; index <= source.length - size; index += 1) {
-        const phrase = source.slice(index, index + size).join(" ");
-        if (phrase.length >= 5 && !focusKeywordConflicts(phrase, usedKeywords)) candidates.push(phrase);
+        const phrase = source.slice(index, index + size).join(" ").trim();
+        if (phrase.length < 8 || focusKeywordConflicts(phrase, usedKeywords)) continue;
+
+        const tokens = phrase.split(" ");
+        const meaningful = tokens.filter((token) => !generic.has(token) && token.length >= 3);
+        if (meaningful.length < 2) continue;
+
+        const exactBodyCount = normalizePhrase(item.content_html || "").split(phrase).length - 1;
+        const serviceTerms = new Set([
+          "cleaning", "service", "services", "commercial", "office", "house",
+          "end", "lease", "bond", "vacate", "vacate", "perth", "school",
+          "warehouse", "carpet", "industrial",
+        ]);
+        const topicalCount = meaningful.filter((token) => serviceTerms.has(token)).length;
+
+        // Prefer phrases from the title, 3-5 words, containing multiple
+        // topical terms and, when present, actually repeated in the article.
+        const score =
+          sourceWeight +
+          (meaningful.length * 10) +
+          (topicalCount * 18) +
+          Math.min(exactBodyCount, 3) * 8 -
+          Math.max(0, size - 4) * 2;
+
+        candidates.push({ phrase, score });
       }
     }
-  }
-  return candidates[0] || "";
+  };
+
+  addCandidates(titleWords, 100);
+  addCandidates(bodyWords, 40);
+
+  candidates.sort((a, b) => b.score - a.score || a.phrase.length - b.phrase.length);
+  return candidates[0]?.phrase || "";
 }
 
 function canonicalUrl(value: string) {
@@ -220,19 +248,16 @@ export function AISearch() {
   const [wpUsername, setWpUsername] = useState("");
   const [wpPassword, setWpPassword] = useState("");
   const [wpItems, setWpItems] = useState<WPItem[]>([]);
+  const [focusKeywordInventoryVerified, setFocusKeywordInventoryVerified] = useState(false);
+  const [focusKeywordInventoryError, setFocusKeywordInventoryError] = useState("");
   const [selectedPostId, setSelectedPostId] = useState("");
   const [selectedTargetPage, setSelectedTargetPage] = useState<WPItem | null>(null);
   const [loadingWp, setLoadingWp] = useState(false);
   const [applying, setApplying] = useState(false);
   const [wpStatus, setWpStatus] = useState<"draft" | "publish">("draft");
-  const [wpFocusInventoryVerified, setWpFocusInventoryVerified] = useState(false);
-  const [, setWpFocusInventoryError] = useState("");
   const [aiSuggestedFocusKeyword, setAiSuggestedFocusKeyword] = useState("");
   const [aiKeywordAlternatives, setAiKeywordAlternatives] = useState<string[]>([]);
   const [suggestingFocusKeyword, setSuggestingFocusKeyword] = useState(false);
-  const [focusInventoryCount, setFocusInventoryCount] = useState(0);
-  const [focusInventoryTotal, setFocusInventoryTotal] = useState(0);
-
 
   const activeTitle = rewrite?.title || analysis?.measured.title || "";
   const activeKeyword = rewrite?.focus_keyword || focusKeyword;
@@ -252,21 +277,16 @@ export function AISearch() {
     () => focusKeyword.trim() ? focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords) : false,
     [focusKeyword, usedFocusKeywords],
   );
-  const conflictingWpItem = useMemo(() => {
-    const candidate = normalizePhrase(focusKeyword);
-    if (!candidate) return undefined;
-    return wpItems.find((item) =>
-      String(item.id) !== sourceWpId &&
-      normalizePhrase(item.focus_keyword || "") === candidate,
-    );
-  }, [focusKeyword, wpItems, sourceWpId]);
   const suggestedUniqueFocusKeyword = useMemo(
     () => focusKeywordIsUsed ? suggestUniqueFocusKeyword(matchedWpItem, usedFocusKeywords) : "",
     [focusKeywordIsUsed, matchedWpItem, usedFocusKeywords],
   );
 
+  // Ask Claude for a topic-specific unused keyword only when a duplicate is
+  // actually detected. This avoids an AI request on every keystroke while
+  // ensuring the replacement is based on the real article.
   useEffect(() => {
-    if (!focusKeywordIsUsed || !matchedWpItem || !wpSite.trim() || !wpUsername.trim() || !wpPassword.trim()) {
+    if (!focusKeywordIsUsed || !matchedWpItem || !wpSite || !wpUsername || !wpPassword) {
       if (!focusKeywordIsUsed) {
         setAiSuggestedFocusKeyword("");
         setAiKeywordAlternatives([]);
@@ -280,19 +300,21 @@ export function AISearch() {
       try {
         const result = await api.post<{
           success: boolean;
-          suggested_focus_keyword?: string;
+          suggested_focus_keyword: string;
           alternatives?: string[];
         }>("/api/ai-search-optimization/suggest-focus-keyword", {
           title: analysis?.measured.title || matchedWpItem.title,
-          content: analysis?.measured.content_html || matchedWpItem.content_html || matchedWpItem.excerpt || "",
+          content: analysis?.measured.content_html || matchedWpItem.content_html || matchedWpItem.excerpt,
           current_focus_keyword: focusKeyword.trim(),
           used_focus_keywords: usedFocusKeywords,
         });
         if (!cancelled) {
-          setAiSuggestedFocusKeyword(result.suggested_focus_keyword || suggestedUniqueFocusKeyword || "");
-          setAiKeywordAlternatives((result.alternatives || []).filter((x) => !focusKeywordConflicts(x, usedFocusKeywords)));
+          setAiSuggestedFocusKeyword(result.suggested_focus_keyword || "");
+          setAiKeywordAlternatives(result.alternatives || []);
         }
       } catch {
+        // Keep the local evidence-based suggestion visible if Claude is
+        // unavailable; the duplicate must still remain blocked.
         if (!cancelled) {
           setAiSuggestedFocusKeyword(suggestedUniqueFocusKeyword || "");
           setAiKeywordAlternatives([]);
@@ -301,9 +323,34 @@ export function AISearch() {
         if (!cancelled) setSuggestingFocusKeyword(false);
       }
     };
+
     void requestSuggestion();
-    return () => { cancelled = true; };
-  }, [focusKeywordIsUsed, matchedWpItem, wpSite, wpUsername, wpPassword, focusKeyword, usedFocusKeywords, suggestedUniqueFocusKeyword, analysis?.measured.title, analysis?.measured.content_html]);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    focusKeywordIsUsed,
+    focusKeyword,
+    matchedWpItem,
+    wpSite,
+    wpUsername,
+    wpPassword,
+    analysis?.measured.title,
+    analysis?.measured.content_html,
+    usedFocusKeywords,
+    suggestedUniqueFocusKeyword,
+  ]);
+
+  const applySuggestedFocusKeyword = (keyword: string) => {
+    const value = keyword.trim();
+    if (!value) return;
+    setFocusKeyword(value);
+    setAiSuggestedFocusKeyword(value);
+    setError("");
+    setAnalysis(null);
+    setRewrite(null);
+    toast.success(`AI-selected unused focus keyword: ${value}`);
+  };
 
   const readinessCards = useMemo(() => {
     if (!analysis) {
@@ -322,83 +369,48 @@ export function AISearch() {
     ];
   }, [analysis]);
 
-  const refreshWordPressInventory = async () => {
-    if (!wpSite.trim() || !wpUsername.trim() || !wpPassword.trim()) {
-      return { items: wpItems, verified: false, error: "" };
-    }
-
-    const result = await api.post<{
-      success: boolean;
-      items: WPItem[];
-      focus_keyword_inventory_verified?: boolean;
-      focus_keyword_inventory_error?: string;
-      focus_keyword_count?: number;
-      focus_keyword_total_items?: number;
-    }>("/api/ai-search-optimization/wordpress/content", {
-      wordpress_site: wpSite.trim(),
-      wordpress_username: wpUsername.trim(),
-      wordpress_application_password: wpPassword.trim(),
-    });
-
-    const items = result.items || [];
-    const verified = result.focus_keyword_inventory_verified === true;
-    const inventoryError = result.focus_keyword_inventory_error || "";
-
-    setWpItems(items);
-    setWpFocusInventoryVerified(verified);
-    setWpFocusInventoryError(inventoryError);
-    setFocusInventoryCount(Number(result.focus_keyword_count || items.filter((item) => item.focus_keyword?.trim()).length));
-    setFocusInventoryTotal(Number(result.focus_keyword_total_items || items.length));
-
-    return { items, verified, error: inventoryError };
-  };
-
-  const applyDuplicateError = (error: any, fallback = "Focus keyword already in use. Choose an unused keyword.") => {
-    const detail = error?.data?.detail ?? error?.response?.data?.detail;
-    const structured = detail && typeof detail === "object" ? detail : null;
-    const message = structured?.message || (typeof detail === "string" ? detail : fallback);
-    const suggestion = structured?.suggested_keyword || "";
-
-    if (suggestion) {
-      setAiSuggestedFocusKeyword(String(suggestion));
-    }
-    setError(message);
-    toast.error(
-      suggestion
-        ? `${message} AI suggestion: ${suggestion}`
-        : message,
-    );
-    return { message, suggestion };
-  };
-
   const analyze = async () => {
     if (!url.trim()) {
       toast.error("Enter the post URL first.");
       return;
     }
-
     setLoading(true);
     setError("");
     setAnalysis(null);
     setRewrite(null);
-
     try {
+      // Keyword uniqueness must be checked against the current WordPress
+      // inventory, not only against whatever was previously loaded in React
+      // state. If the user has supplied WordPress credentials, automatically
+      // refresh the inventory before analysis so a newly entered duplicate
+      // cannot slip through because the list is stale/empty.
       let validationItems = wpItems;
-      let inventoryVerified = wpFocusInventoryVerified;
+      let validationInventoryVerified = focusKeywordInventoryVerified;
+      let validationInventoryError = focusKeywordInventoryError;
 
       if (wpSite.trim() && wpUsername.trim() && wpPassword.trim()) {
-        const inventory = await refreshWordPressInventory();
-        validationItems = inventory.items;
-        inventoryVerified = inventory.verified;
-
-        if (!inventoryVerified) {
-          const message =
-            inventory.error ||
-            "WordPress focus-keyword assignments could not be verified. Refresh Posts & Pages and make sure the Boost Rankers SEO Bridge is available before analyzing.";
-          setError(message);
-          toast.error(message);
-          return;
-        }
+        // Always refresh the authoritative WordPress inventory immediately before
+        // analysis. Cached/partial React state must never allow an assigned
+        // keyword to pass the duplicate check.
+        const wpResult = await api.post<{
+          success: boolean;
+          items: WPItem[];
+          focus_keyword_inventory_verified?: boolean;
+          focus_keyword_inventory_error?: string;
+        }>(
+          "/api/ai-search-optimization/wordpress/content",
+          {
+            wordpress_site: wpSite.trim(),
+            wordpress_username: wpUsername.trim(),
+            wordpress_application_password: wpPassword.trim(),
+          },
+        );
+        validationItems = wpResult.items || [];
+        validationInventoryVerified = Boolean(wpResult.focus_keyword_inventory_verified);
+        validationInventoryError = wpResult.focus_keyword_inventory_error || "";
+        setWpItems(validationItems);
+        setFocusKeywordInventoryVerified(validationInventoryVerified);
+        setFocusKeywordInventoryError(validationInventoryError);
       }
 
       const matchedForValidation = validationItems.find(
@@ -412,56 +424,64 @@ export function AISearch() {
         wpSite.trim() &&
         wpUsername.trim() &&
         wpPassword.trim() &&
-        !validationItems.length
+        !validationInventoryVerified
       ) {
-        const message = "WordPress Posts & Pages could not be loaded, so this focus keyword cannot be verified as unique.";
-        setError(message);
+        const message =
+          validationInventoryError ||
+          "WordPress focus-keyword inventory could not be verified. Refresh Posts & Pages successfully before analyzing so Boost Rankers can prevent duplicate focus-keyword assignments.";
         toast.error(message);
+        setError(message);
+        setLoading(false);
         return;
       }
 
-      const result = await api.post<{
-        success: boolean;
-        measured: MeasuredPage;
-        ai_analysis: AIAnalysis;
-      }>("/api/ai-search-optimization/analyze", {
-        url: url.trim(),
-        focus_keyword: focusKeyword.trim(),
-        used_focus_keywords: validationUsedKeywords,
-        site_content_inventory: buildSiteContentInventory(validationItems, validationSourceId),
-      });
+      if (focusKeyword.trim() && focusKeywordConflicts(focusKeyword.trim(), validationUsedKeywords)) {
+        const suggestion = suggestUniqueFocusKeyword(matchedForValidation, validationUsedKeywords);
+        const message = suggestion
+          ? `Focus keyword already in use. Choose an unused keyword. Suggested: ${suggestion}`
+          : "Focus keyword already in use. Choose an unused keyword for this post.";
+        toast.error(message);
+        setError(message);
+        setLoading(false);
+        return;
+      }
 
-      setAnalysis({ measured: result.measured, ai_analysis: result.ai_analysis });
-      setFocusKeyword(
-        result.measured.focus_keyword ||
-        result.ai_analysis.suggested_focus_keyword ||
-        focusKeyword.trim(),
+      // If WordPress credentials were supplied but no keyword inventory could
+      // be loaded, do not claim that uniqueness was verified. The public-page
+      // analyzer can still be used when no WordPress connection is configured.
+      if (focusKeyword.trim() && wpSite.trim() && wpUsername.trim() && wpPassword.trim() && !validationItems.length) {
+        const message = "WordPress Posts & Pages could not be loaded, so this focus keyword cannot be verified as unique. Load Posts & Pages successfully before analyzing.";
+        toast.error(message);
+        setError(message);
+        setLoading(false);
+        return;
+      }
+
+      const result = await api.post<{ success: boolean; measured: MeasuredPage; ai_analysis: AIAnalysis }>(
+        "/api/ai-search-optimization/analyze",
+        {
+          url: url.trim(),
+          focus_keyword: focusKeyword.trim(),
+          used_focus_keywords: validationUsedKeywords,
+        },
       );
-
+      setAnalysis({ measured: result.measured, ai_analysis: result.ai_analysis });
+      setFocusKeyword(result.measured.focus_keyword || result.ai_analysis.suggested_focus_keyword || focusKeyword.trim());
       if (result.ai_analysis.focus_keyword_conflict) {
-        const selected = result.measured.focus_keyword;
-        setAiSuggestedFocusKeyword(selected);
-        toast.warning(`An unused focus keyword was selected: ${selected}`);
+        toast.warning(`That focus keyword was already used. Boost Rankers selected an unused keyword: ${result.measured.focus_keyword}`);
       } else if (result.ai_analysis.focus_keyword_auto_selected) {
-        setAiSuggestedFocusKeyword(result.measured.focus_keyword);
         toast.success(`Focus keyword selected automatically: ${result.measured.focus_keyword}`);
       } else {
-        setAiSuggestedFocusKeyword("");
         toast.success("Post analyzed using real page evidence.");
       }
     } catch (err: any) {
-      const detail = err?.data?.detail ?? err?.response?.data?.detail;
-      if (
-        detail &&
-        typeof detail === "object" &&
-        detail.code === "FOCUS_KEYWORD_DUPLICATE"
-      ) {
-        applyDuplicateError(err);
-      } else {
-        const message = getErrorMessage(err, "Could not analyze the post.");
-        setError(message);
-        toast.error(message);
+      const message = getErrorMessage(err, "Could not analyze the post.");
+      const suggestedMatch = String(message).match(/(?:AI suggestion|Suggested for this post):\s*([^\.]+?)(?:\.|$)/i);
+      if (suggestedMatch?.[1]) {
+        setAiSuggestedFocusKeyword(suggestedMatch[1].trim());
       }
+      setError(message);
+      toast.error(message);
     } finally {
       setLoading(false);
     }
@@ -472,7 +492,6 @@ export function AISearch() {
       toast.error("Analyze the post and provide a focus keyword first.");
       return;
     }
-
     if (!wpSite || !wpUsername || !wpPassword) {
       toast.error("Enter the WordPress site, username and Application Password first.");
       return;
@@ -482,28 +501,45 @@ export function AISearch() {
     setError("");
 
     try {
-      // Always refresh the authoritative WordPress focus-keyword inventory before
-      // rewriting. This prevents stale React state from allowing a duplicate.
-      const inventory = await refreshWordPressInventory();
-      if (!inventory.verified) {
-        const message =
-          inventory.error ||
-          "WordPress focus-keyword assignments could not be verified. Reconnect the SEO Bridge before rewriting.";
-        setError(message);
-        toast.error(message);
-        return;
-      }
+      // Refresh the authoritative WordPress inventory before rewrite as well.
+      // This prevents stale React state from bypassing duplicate-keyword protection.
+      const inventoryResult = await api.post<{
+        success: boolean;
+        items: WPItem[];
+        focus_keyword_inventory_verified?: boolean;
+        focus_keyword_inventory_error?: string;
+      }>(
+        "/api/ai-search-optimization/wordpress/content",
+        {
+          wordpress_site: wpSite.trim(),
+          wordpress_username: wpUsername.trim(),
+          wordpress_application_password: wpPassword.trim(),
+        },
+      );
+      const items = inventoryResult.items || [];
+      const rewriteInventoryVerified = Boolean(inventoryResult.focus_keyword_inventory_verified);
+      setWpItems(items);
+      setFocusKeywordInventoryVerified(rewriteInventoryVerified);
+      setFocusKeywordInventoryError(inventoryResult.focus_keyword_inventory_error || "");
 
-      const items = inventory.items;
       const current = items.find(
         (item) => canonicalUrl(item.url) === canonicalUrl(analysis.measured.url),
       );
-
       if (current && String(current.id) !== String(selectedPostId)) {
         setSelectedPostId(String(current.id));
       }
 
       const sourceId = String(current?.id || selectedPostId);
+      if (!rewriteInventoryVerified) {
+        const message =
+          inventoryResult.focus_keyword_inventory_error ||
+          "WordPress focus-keyword inventory could not be verified. Refresh Posts & Pages successfully before rewriting.";
+        setError(message);
+        toast.error(message);
+        setRewriting(false);
+        return;
+      }
+
       const targetCandidates = items
         .filter((item) =>
           String(item.id) !== sourceId &&
@@ -521,7 +557,6 @@ export function AISearch() {
           excerpt: item.excerpt || "",
           content_html: item.content_html || "",
         }));
-
       const target = chooseTargetPage(
         items,
         sourceId,
@@ -532,19 +567,14 @@ export function AISearch() {
       setSelectedTargetPage(target);
 
       const usedFocusKeywords = getUsedFocusKeywords(items, sourceId);
-
-      // Frontend check gives an immediate response; the backend performs the
-      // authoritative duplicate check and AI suggestion as a second barrier.
       if (focusKeyword.trim() && focusKeywordConflicts(focusKeyword.trim(), usedFocusKeywords)) {
-        const localSuggestion = suggestUniqueFocusKeyword(current, usedFocusKeywords);
-        setAiSuggestedFocusKeyword(localSuggestion);
-        const message = "Focus keyword already in use. Rewrite & Optimize is blocked until you choose an unused keyword.";
+        const suggestion = aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword;
+        const message = suggestion
+          ? `Rewrite blocked: focus keyword already in use. Select an unused keyword. AI suggestion: ${suggestion}`
+          : "Rewrite blocked: focus keyword already in use. Select an unused keyword before rewriting.";
         setError(message);
-        toast.error(
-          localSuggestion
-            ? `${message} Suggested unused keyword: ${localSuggestion}`
-            : message,
-        );
+        toast.error(message);
+        setRewriting(false);
         return;
       }
 
@@ -560,14 +590,11 @@ export function AISearch() {
           meta_description: analysis.measured.meta_description,
           analysis: analysis.ai_analysis,
           internal_link_candidates: targetCandidates,
-          site_content_inventory: buildSiteContentInventory(items, sourceId),
         },
       );
 
       setFocusKeyword(result.rewrite.focus_keyword || focusKeyword.trim());
-      setAiSuggestedFocusKeyword("");
       setRewrite(result.rewrite);
-
       const appliedLinks = result.rewrite.internal_links_applied || 0;
       toast.success(
         appliedLinks >= 3
@@ -577,15 +604,20 @@ export function AISearch() {
             : "Article optimized. No unrelated internal link was forced.",
       );
     } catch (err: any) {
-      const detail = err?.data?.detail ?? err?.response?.data?.detail;
-      if (
-        detail &&
-        typeof detail === "object" &&
-        detail.code === "FOCUS_KEYWORD_DUPLICATE"
-      ) {
-        applyDuplicateError(err, "Focus keyword already in use. Rewrite & Optimize is blocked.");
+      const keywordError = getFocusKeywordError(err);
+      if (keywordError) {
+        if (keywordError.suggestion) setAiSuggestedFocusKeyword(keywordError.suggestion);
+        if (keywordError.alternatives.length) setAiKeywordAlternatives(keywordError.alternatives);
+        setError(keywordError.message);
+        toast.error(
+          keywordError.suggestion
+            ? `${keywordError.message} AI suggestion: ${keywordError.suggestion}`
+            : keywordError.message,
+        );
       } else {
         const message = getErrorMessage(err, "Could not rewrite the post.");
+        const suggestedMatch = String(message).match(/AI suggestion:\s*([^\.]+?)(?:\.|$)/i);
+        if (suggestedMatch?.[1]) setAiSuggestedFocusKeyword(suggestedMatch[1].trim());
         setError(message);
         toast.error(message);
       }
@@ -606,8 +638,6 @@ export function AISearch() {
         items: WPItem[];
         focus_keyword_inventory_verified?: boolean;
         focus_keyword_inventory_error?: string;
-        focus_keyword_count?: number;
-        focus_keyword_total_items?: number;
       }>(
         "/api/ai-search-optimization/wordpress/content",
         {
@@ -617,14 +647,10 @@ export function AISearch() {
         },
       );
       const items = result.items || [];
+      const inventoryVerified = Boolean(result.focus_keyword_inventory_verified);
       setWpItems(items);
-      setWpFocusInventoryVerified(result.focus_keyword_inventory_verified === true);
-      setWpFocusInventoryError(result.focus_keyword_inventory_error || "");
-      setFocusInventoryCount(Number(result.focus_keyword_count || items.filter((item) => item.focus_keyword?.trim()).length));
-      setFocusInventoryTotal(Number(result.focus_keyword_total_items || items.length));
-      setAiSuggestedFocusKeyword("");
-      setAiKeywordAlternatives([]);
-
+      setFocusKeywordInventoryVerified(inventoryVerified);
+      setFocusKeywordInventoryError(result.focus_keyword_inventory_error || "");
       const matched = url.trim()
         ? items.find((item) => canonicalUrl(item.url) === canonicalUrl(url.trim()))
         : undefined;
@@ -647,9 +673,17 @@ export function AISearch() {
             matched.title,
           ),
         );
-        toast.success(`Loaded ${items.length} WordPress items and matched the current post automatically.`);
+        toast.success(
+          inventoryVerified
+            ? `Loaded ${items.length} WordPress items and verified their focus-keyword assignments.`
+            : `Loaded ${items.length} WordPress items, but focus-keyword uniqueness could not be verified.`,
+        );
       } else {
-        toast.success(`${items.length} WordPress items loaded.`);
+        toast.success(
+          inventoryVerified
+            ? `${items.length} WordPress items loaded and focus-keyword assignments verified.`
+            : `${items.length} WordPress items loaded, but focus-keyword uniqueness could not be verified.`,
+        );
       }
     } catch (err: any) {
       toast.error(getErrorMessage(err, "Could not load WordPress content."));
@@ -670,7 +704,6 @@ export function AISearch() {
     setUrl(item.url);
     setRewrite(null);
     setAnalysis(null);
-    setAiSuggestedFocusKeyword("");
     const otherUsed = getUsedFocusKeywords(wpItems, id);
     const existingKeyword = item.focus_keyword?.trim() || "";
     setFocusKeyword(
@@ -774,50 +807,60 @@ export function AISearch() {
                 <Input
                   id="ai-focus"
                   value={focusKeyword}
-                  onChange={(e) => {
-                    setFocusKeyword(e.target.value);
-                    setAiSuggestedFocusKeyword("");
-                  }}
+                  onChange={(e) => setFocusKeyword(e.target.value)}
                   placeholder="Leave blank for automatic unused keyword selection"
                   className={focusKeywordIsUsed ? "border-rose-500 focus-visible:ring-rose-500" : ""}
                 />
                 {focusKeywordIsUsed ? (
-                  <div className="space-y-1">
-                    <p className="text-xs text-rose-600 dark:text-rose-400">
-                      Focus keyword already in use by another WordPress post/page. Analyze and Rewrite are blocked until you choose an unused keyword.
+                  <div className="space-y-2 text-xs text-rose-600 dark:text-rose-400">
+                    <p>
+                      <strong>Focus keyword already in use.</strong> This exact focus-keyword assignment is already used by another WordPress post/page, so Analyze and Rewrite are blocked until you select an unused keyword.
                     </p>
-                    <p className="text-xs text-rose-600 dark:text-rose-400">
-                      {conflictingWpItem?.title ? `Conflicting assignment found on: ${conflictingWpItem.title}` : "The entered phrase matches an assigned WordPress focus keyword."}
-                    </p>
-                    {(aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword) && (
-                      <button
-                        type="button"
-                        className="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline"
-                        onClick={() => setFocusKeyword(aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword)}
-                      >
-                        {aiSuggestedFocusKeyword ? "AI suggestion" : "Suggested unused keyword"}: {aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword} · Use this
-                      </button>
-                    )}
+                    {(() => {
+                      const owner = wpItems.find(
+                        (item) =>
+                          String(item.id) !== sourceWpId &&
+                          normalizePhrase(item.focus_keyword || "") === normalizePhrase(focusKeyword.trim()),
+                      );
+                      return owner ? (
+                        <p className="text-slate-600 dark:text-slate-300">
+                          Already assigned to: <strong>{owner.title}</strong>
+                        </p>
+                      ) : null;
+                    })()}
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-slate-600 dark:text-slate-300">
+                        {suggestingFocusKeyword
+                          ? "Claude is generating a topic-specific unused keyword..."
+                          : `AI suggestion: ${aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword || "No suggestion available yet."}`}
+                      </span>
+                      {(aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword) && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => applySuggestedFocusKeyword(aiSuggestedFocusKeyword || suggestedUniqueFocusKeyword)}
+                          disabled={suggestingFocusKeyword}
+                          className="h-7"
+                        >
+                          <Sparkles className="size-3.5 mr-1" />
+                          Use AI suggestion
+                        </Button>
+                      )}
+                    </div>
                     {aiKeywordAlternatives.length > 0 && (
-                      <div className="flex flex-wrap gap-2 pt-1">
-                        {aiKeywordAlternatives.map((keyword) => (
-                          <button key={keyword} type="button" className="rounded-full border px-2 py-1 text-[11px] hover:bg-slate-50 dark:hover:bg-slate-800" onClick={() => setFocusKeyword(keyword)}>
-                            {keyword}
-                          </button>
-                        ))}
-                      </div>
+                      <p className="text-slate-500 dark:text-slate-400">
+                        Alternatives: {aiKeywordAlternatives.join(" • ")}
+                      </p>
                     )}
-                    {suggestingFocusKeyword && <p className="text-xs text-indigo-600">Generating a topic-specific unused suggestion…</p>}
                   </div>
                 ) : (
-                  <p className="text-xs text-slate-500">
-                    Focus-keyword uniqueness is checked against assigned WordPress focus keywords, not Google search-result occurrences. {wpFocusInventoryVerified ? `${focusInventoryCount} of ${focusInventoryTotal} WordPress items have mapped focus keywords.` : "Inventory not verified."}
-                  </p>
+                  <p className="text-xs text-slate-500">Focus keywords are unique by the exact assigned phrase. Only case, punctuation, whitespace, and URL-style separators are normalized; partial phrases, shared words, connector differences, singular/plural variants, and search-result occurrences do not block a keyword.</p>
                 )}
               </div>
             </div>
             <div className="flex flex-wrap gap-3">
-              <Button onClick={analyze} disabled={loading || !url.trim() || focusKeywordIsUsed || (!!wpSite.trim() && !!wpUsername.trim() && !!wpPassword.trim() && !wpFocusInventoryVerified)} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+              <Button onClick={analyze} disabled={loading || !url.trim() || focusKeywordIsUsed} className="bg-emerald-600 hover:bg-emerald-700 text-white">
                 {loading ? <Loader2 className="size-4 animate-spin" /> : <FileSearch className="size-4" />}
                 {loading ? "Analyzing..." : "Analyze Post"}
               </Button>
@@ -886,11 +929,6 @@ export function AISearch() {
             </CardHeader>
             <CardContent className="space-y-4">
               <p className="text-sm leading-6 text-slate-600 dark:text-slate-300">{analysis.ai_analysis.summary}</p>
-              <div className="flex flex-wrap gap-2 text-xs">
-                <Badge variant="outline">Intent: {analysis.ai_analysis.search_intent || "checked"}</Badge>
-                {analysis.ai_analysis.topic_cluster && <Badge variant="secondary">Topic: {analysis.ai_analysis.topic_cluster}</Badge>}
-                {analysis.ai_analysis.keyword_plan?.role && <Badge variant="outline">Keyword plan: {analysis.ai_analysis.keyword_plan.role}</Badge>}
-              </div>
               {analysis.ai_analysis.rewrite_reason && <div className="rounded-lg bg-amber-50 dark:bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300"><strong>Why:</strong> {analysis.ai_analysis.rewrite_reason}</div>}
               <div className="grid grid-cols-2 gap-3">
                 {["answer_engine_readiness", "semantic_coverage"].map((key) => {
@@ -928,28 +966,6 @@ export function AISearch() {
               <MetaField label="Internal links" value={String(rewrite.internal_links_applied ?? 0)} />
             </div>
             <div><p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Meta description</p><div className="rounded-lg border border-slate-200 dark:border-slate-800 p-3 text-sm">{showOriginal ? analysis?.measured.meta_description : rewrite.meta_description}</div></div>
-            {!showOriginal && (
-              <Card className="border-indigo-200 dark:border-indigo-900/50 bg-indigo-50/40 dark:bg-indigo-500/5">
-                <CardContent className="p-4 space-y-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <p className="text-sm font-semibold">SEO topic & intent differentiation</p>
-                    <Badge variant="outline">{rewrite.search_intent || "intent checked"}</Badge>
-                    {rewrite.topic_cluster && <Badge variant="secondary">{rewrite.topic_cluster}</Badge>}
-                    {rewrite.intent_collision_risk && <Badge variant={rewrite.intent_collision_risk === "low" ? "default" : "outline"}>collision risk: {rewrite.intent_collision_risk}</Badge>}
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
-                    <div className="rounded-md border p-3 bg-white/60 dark:bg-slate-950/30"><strong>Focus keyword</strong><br />Unique assigned phrase</div>
-                    <div className="rounded-md border p-3 bg-white/60 dark:bg-slate-950/30"><strong>H1 / Title</strong><br />Article topic + intent</div>
-                    <div className="rounded-md border p-3 bg-white/60 dark:bg-slate-950/30"><strong>SEO title + description</strong><br />Distinct search-result copy</div>
-                  </div>
-                  {rewrite.intent_collision_with?.length ? (
-                    <div className="text-xs text-amber-700 dark:text-amber-300">
-                      Related existing topics were detected for review; shared words alone are not treated as duplicate focus-keyword ownership.
-                    </div>
-                  ) : null}
-                </CardContent>
-              </Card>
-            )}
             {selectedTargetPage && !showOriginal && (
               <div className="rounded-lg border border-indigo-200 dark:border-indigo-900/50 bg-indigo-50/50 dark:bg-indigo-500/5 p-3 text-sm">
                 <span className="font-semibold">Verified target page:</span> {selectedTargetPage.title}

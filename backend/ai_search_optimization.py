@@ -1453,7 +1453,7 @@ async def analyze_post(
                 "code": "FOCUS_KEYWORD_DUPLICATE",
                 "message": "Focus keyword already in use by another WordPress post or page. Choose an unused keyword before analyzing or rewriting.",
                 "conflicting_keyword": requested_keyword,
-                "suggested_keyword": suggested_keyword,
+                "suggested_focus_keyword": suggested_keyword,
                 "suggestion_source": "ai",
             },
         )
@@ -1737,7 +1737,7 @@ async def rewrite_post(
                 "code": "FOCUS_KEYWORD_DUPLICATE",
                 "message": "Focus keyword already in use by another WordPress post or page. Choose an unused keyword before rewriting.",
                 "conflicting_keyword": data.focus_keyword.strip(),
-                "suggested_keyword": suggested_keyword,
+                "suggested_focus_keyword": suggested_keyword,
                 "suggestion_source": "ai",
             },
         )
