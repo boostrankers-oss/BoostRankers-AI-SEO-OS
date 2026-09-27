@@ -153,6 +153,7 @@ export function RankTracker() {
   const [customCompareStart, setCustomCompareStart] = useState("");
   const [customCompareEnd, setCustomCompareEnd] = useState("");
   const [latestGscDate, setLatestGscDate] = useState<string | null>(null);
+  const [activeKpi, setActiveKpi] = useState<"tracked" | "top_3" | "top_10" | "top_20" | "improved" | "declined" | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -190,9 +191,20 @@ export function RankTracker() {
     return keywords.filter((item) => {
       const matchesSearch = !q || item.keyword.toLowerCase().includes(q) || (item.target_url || "").toLowerCase().includes(q);
       const matchesClient = clientFilter === "all" || item.client_id === clientFilter;
-      return matchesSearch && matchesClient;
+
+      const position = item.current_position;
+      const matchesKpi =
+        activeKpi === null ||
+        activeKpi === "tracked" ||
+        (activeKpi === "top_3" && position != null && position >= 1 && position <= 3) ||
+        (activeKpi === "top_10" && position != null && position >= 1 && position <= 10) ||
+        (activeKpi === "top_20" && position != null && position >= 1 && position <= 20) ||
+        (activeKpi === "improved" && item.change != null && item.change > 0) ||
+        (activeKpi === "declined" && item.change != null && item.change < 0);
+
+      return matchesSearch && matchesClient && matchesKpi;
     });
-  }, [keywords, search, clientFilter]);
+  }, [keywords, search, clientFilter, activeKpi]);
 
   const loadHistory = useCallback(async (id: string) => {
     setSelectedId(id);
@@ -389,6 +401,23 @@ export function RankTracker() {
     chartMax + chartPadding,
   ];
 
+  const kpiCards = [
+    ["tracked", "Tracked", overview?.tracked_keywords ?? 0],
+    ["top_3", "Top 3", overview?.top_3 ?? 0],
+    ["top_10", "Top 10", overview?.top_10 ?? 0],
+    ["top_20", "Top 20", overview?.top_20 ?? 0],
+    ["improved", "Improved", overview?.improved ?? 0],
+    ["declined", "Declined", overview?.declined ?? 0],
+    ["average", "Avg. Position", overview?.average_position ?? "—"],
+  ] as const;
+
+  const handleKpiClick = (key: typeof kpiCards[number][0]) => {
+    if (key === "average") return;
+    setActiveKpi((current) => current === key ? null : key);
+  };
+
+  const activeKpiLabel = kpiCards.find(([key]) => key === activeKpi)?.[1];
+
   if (loading) {
     return <div className="p-8 flex items-center gap-2 text-slate-500"><Loader2 className="size-4 animate-spin" /> Loading Rank Tracker...</div>;
   }
@@ -444,23 +473,55 @@ export function RankTracker() {
       )}
 
       <div className="grid grid-cols-2 xl:grid-cols-7 gap-3">
-        {[
-          ["Tracked", overview?.tracked_keywords ?? 0],
-          ["Top 3", overview?.top_3 ?? 0],
-          ["Top 10", overview?.top_10 ?? 0],
-          ["Top 20", overview?.top_20 ?? 0],
-          ["Improved", overview?.improved ?? 0],
-          ["Declined", overview?.declined ?? 0],
-          ["Avg. Position", overview?.average_position ?? "—"],
-        ].map(([label, value]) => (
-          <Card key={String(label)} className="shadow-sm">
-            <CardContent className="p-4">
-              <p className="text-xs text-slate-500">{label}</p>
-              <p className="text-2xl font-semibold mt-1">{typeof value === "number" && label === "Avg. Position" ? value.toFixed(1) : value}</p>
-            </CardContent>
-          </Card>
-        ))}
+        {kpiCards.map(([key, label, value]) => {
+          const clickable = key !== "average";
+          const active = activeKpi === key;
+
+          return (
+            <Card
+              key={key}
+              role={clickable ? "button" : undefined}
+              tabIndex={clickable ? 0 : undefined}
+              aria-pressed={clickable ? active : undefined}
+              onClick={clickable ? () => handleKpiClick(key) : undefined}
+              onKeyDown={clickable ? (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  handleKpiClick(key);
+                }
+              } : undefined}
+              className={`shadow-sm transition-all ${
+                clickable
+                  ? "cursor-pointer hover:-translate-y-0.5 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+                  : ""
+              } ${active ? "ring-2 ring-emerald-500 bg-emerald-50/60 dark:bg-emerald-500/10" : ""}`}
+              title={clickable ? `Show ${label.toLowerCase()} keywords` : "Overall average position"}
+            >
+              <CardContent className="p-4">
+                <p className="text-xs text-slate-500">{label}</p>
+                <p className="text-2xl font-semibold mt-1">
+                  {typeof value === "number" && label === "Avg. Position" ? value.toFixed(1) : value}
+                </p>
+                {clickable && (
+                  <p className={`text-[10px] mt-1 ${active ? "text-emerald-600 font-medium" : "text-slate-400"}`}>
+                    {active ? "Showing keywords" : "Click to filter"}
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+          );
+        })}
       </div>
+
+      {activeKpi && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-emerald-200 bg-emerald-50/70 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-500/10 dark:text-emerald-300">
+          <span>Showing <strong>{activeKpiLabel}</strong> keywords · {filtered.length} result{filtered.length === 1 ? "" : "s"}</span>
+          <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setActiveKpi(null)}>
+            Clear filter
+            <X className="size-3.5" />
+          </Button>
+        </div>
+      )}
 
       <div className="flex flex-col md:flex-row gap-3">
         <div className="relative flex-1"><Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-slate-400" /><Input className="pl-9" placeholder="Search keywords or URLs..." value={search} onChange={(e) => setSearch(e.target.value)} /></div>
@@ -512,7 +573,10 @@ export function RankTracker() {
 
       <div className="grid xl:grid-cols-[1fr_420px] gap-6">
         <Card className="shadow-sm overflow-hidden">
-          <CardHeader><CardTitle>Tracked Keywords</CardTitle><CardDescription>{period.charAt(0).toUpperCase() + period.slice(1)} GSC average position compared with the selected comparison period.</CardDescription></CardHeader>
+          <CardHeader>
+            <CardTitle>{activeKpiLabel ? `${activeKpiLabel} Keywords` : "Tracked Keywords"}</CardTitle>
+            <CardDescription>{period.charAt(0).toUpperCase() + period.slice(1)} GSC average position compared with the selected comparison period.</CardDescription>
+          </CardHeader>
           <CardContent className="p-0">
             {filtered.length === 0 ? (
               <div className="p-10 text-center text-slate-500">No tracked keywords match your filters.</div>
