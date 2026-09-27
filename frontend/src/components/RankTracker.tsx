@@ -69,6 +69,14 @@ interface RankKeyword {
   measurement_property?: string;
   measurement_message?: string;
   date_range?: { start: string; end: string };
+  comparison_date_range?: { start: string; end: string };
+  latest_gsc_date?: string | null;
+  clicks?: number;
+  impressions?: number;
+  ctr?: number;
+  measurement_start_date?: string | null;
+  measurement_end_date?: string | null;
+  snapshot_period?: string | null;
 }
 
 interface Overview {
@@ -86,6 +94,9 @@ interface HistoryPoint {
   checked_at: string;
   position: number | null;
   ranking_url: string | null;
+  clicks?: number;
+  impressions?: number;
+  ctr?: number;
   measurement_start_date?: string | null;
   measurement_end_date?: string | null;
   comparison_start_date?: string | null;
@@ -104,7 +115,7 @@ const emptyForm = {
 };
 
 function positionLabel(position: number | null): string {
-  if (position == null) return "â€”";
+  if (position == null) return "—";
   return position.toFixed(1);
 }
 
@@ -137,13 +148,18 @@ export function RankTracker() {
   const [history, setHistory] = useState<HistoryPoint[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [measurementMessage, setMeasurementMessage] = useState("");
+  const [period, setPeriod] = useState<"daily" | "weekly" | "monthly" | "yearly">("daily");
+  const [compare, setCompare] = useState<"previous_period" | "previous_week" | "previous_month" | "previous_year" | "custom">("previous_period");
+  const [customCompareStart, setCustomCompareStart] = useState("");
+  const [customCompareEnd, setCustomCompareEnd] = useState("");
+  const [latestGscDate, setLatestGscDate] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const [keywordData, overviewData, statusData, clientData] = await Promise.all([
-        api.get<RankKeyword[]>("/api/rank-tracking/keywords"),
-        api.get<Overview>("/api/rank-tracking/overview"),
+        api.get<RankKeyword[]>(`/api/rank-tracking/keywords?period=${period}`),
+        api.get<Overview>(`/api/rank-tracking/overview?period=${period}`),
         api.get<{ google_search_console_connected: boolean; selected_property: string | null }>("/api/rank-tracking/status"),
         api.get<ClientOption[]>("/api/clients/"),
       ]);
@@ -152,13 +168,18 @@ export function RankTracker() {
       setGscConnected(Boolean(statusData.google_search_console_connected));
       setProperty(statusData.selected_property || null);
       setClients(clientData || []);
+      const availableDates = (keywordData || [])
+        .map((item) => item.latest_gsc_date || item.measurement_end_date)
+        .filter(Boolean)
+        .sort();
+      setLatestGscDate(availableDates.length ? availableDates[availableDates.length - 1] as string : null);
     } catch (error: any) {
       console.error("Rank tracker load failed", error);
       toast.error(error?.data?.detail || "Unable to load Rank Tracker.");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [period]);
 
   useEffect(() => {
     void load();
@@ -188,65 +209,88 @@ export function RankTracker() {
   }, []);
 
   const handleAdd = async () => {
-    if (!form.keyword.trim()) {
-      toast.error("Enter a keyword first.");
+    const entries = Array.from(
+      new Set(
+        form.keyword
+          .split(/\r?\n/)
+          .map((value) => value.replace(/\s+/g, " ").trim())
+          .filter(Boolean),
+      ),
+    );
+    if (!entries.length) {
+      toast.error("Enter at least one keyword.");
       return;
     }
+
+    if (compare === "custom" && (!customCompareStart || !customCompareEnd)) {
+      toast.error("Select both custom comparison dates.");
+      return;
+    }
+    if (compare === "custom" && customCompareEnd < customCompareStart) {
+      toast.error("Custom comparison end date must be on or after the start date.");
+      return;
+    }
+
     setSaving(true);
+    const addPeriod = form.frequency as "daily" | "weekly" | "monthly" | "yearly";
+    const createdIds: string[] = [];
+    const errors: string[] = [];
     try {
-      const created = await api.post<RankKeyword>("/api/rank-tracking/keywords", {
-        keyword: form.keyword,
-        client_id: form.client_id === "none" ? null : form.client_id,
-        target_url: form.target_url.trim() || null,
-        search_engine: "google",
-        country: form.country,
-        location: form.location.trim() || null,
-        language: form.language,
-        device: form.device,
-        frequency: form.frequency,
-      });
-      setKeywords((current) => [created, ...current]);
-      setForm(emptyForm);
-      setShowAdd(false);
-      toast.success("Keyword added to Rank Tracker. Checking Google Search Console nowâ€¦");
-
-      // A newly tracked keyword has no snapshot until it is checked.
-      // Run the first measurement immediately so the table does not remain
-      // empty until the next manual refresh.
-      if (gscConnected && property) {
+      for (const keyword of entries) {
         try {
-          const firstCheck = await api.post<{
-            updated: number;
-            items: RankKeyword[];
-            errors?: Array<{ keyword: string; error: string }>;
-          }>("/api/rank-tracking/refresh", { keyword_ids: [created.id] });
-
-          if (firstCheck.items?.length) {
-            const checked = firstCheck.items[0];
-            setKeywords((current) =>
-              current.map((item) => item.id === checked.id ? checked : item),
-            );
-            if (checked.measurement_message) {
-              toast.info(checked.measurement_message);
-            }
-            await loadHistory(created.id);
-          }
-
-          if (firstCheck.errors?.length) {
-            toast.warning(firstCheck.errors[0].error);
-          } else if (!firstCheck.items?.length) {
-            toast.info("Google Search Console returned no data for this keyword yet. Rankings can appear after GSC records the query.");
-          }
-        } catch (checkError: any) {
-          toast.warning(checkError?.data?.detail || "Keyword was saved, but its first ranking check could not be completed.");
+          const created = await api.post<RankKeyword>("/api/rank-tracking/keywords", {
+            keyword,
+            client_id: form.client_id === "none" ? null : form.client_id,
+            target_url: null,
+            search_engine: "google",
+            country: "global",
+            location: null,
+            language: "en",
+            device: "all",
+            frequency: form.frequency,
+          });
+          createdIds.push(created.id);
+          setKeywords((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+        } catch (error: any) {
+          const message = error?.data?.detail || `Unable to add "${keyword}".`;
+          errors.push(`${keyword}: ${message}`);
         }
-      } else {
-        toast.info("Keyword saved. Connect Google Search Console and select a property to measure its position.");
       }
 
-      await load();
+      setForm(emptyForm);
+      setShowAdd(false);
+
+      if (createdIds.length) {
+        toast.success(`${createdIds.length} keyword${createdIds.length === 1 ? "" : "s"} added. Syncing latest GSC data...`);
+        if (gscConnected && property) {
+          const result = await api.post<{ updated: number; items: RankKeyword[]; errors?: Array<{ keyword: string; error: string }> }>(
+            "/api/rank-tracking/refresh",
+            { keyword_ids: createdIds, period: addPeriod, compare, custom_compare_start: compare === "custom" ? customCompareStart || null : null, custom_compare_end: compare === "custom" ? customCompareEnd || null : null },
+          );
+          if (result.items?.length) {
+            setKeywords((current) => {
+              const map = new Map(result.items.map((item) => [item.id, item]));
+              return current.map((item) => map.get(item.id) || item);
+            });
+          }
+          if (result.errors?.length) {
+            errors.push(...result.errors.map((item) => `${item.keyword}: ${item.error}`));
+          }
+        }
+      }
+
+      if (errors.length) {
+        toast.warning(errors.slice(0, 2).join(" • "));
+      }
+      setPeriod(addPeriod);
+      const freshKeywords = await api.get<RankKeyword[]>(`/api/rank-tracking/keywords?period=${addPeriod}`);
+      setKeywords(freshKeywords || []);
+      const freshOverview = await api.get<Overview>(`/api/rank-tracking/overview?period=${addPeriod}`);
+      setOverview(freshOverview);
+      const freshDates = (freshKeywords || []).map((item) => item.latest_gsc_date || item.measurement_end_date).filter(Boolean).sort();
+      setLatestGscDate(freshDates.length ? freshDates[freshDates.length - 1] as string : null);
     } catch (error: any) {
-      toast.error(error?.data?.detail || "Unable to add keyword.");
+      toast.error(error?.data?.detail || "Unable to add keywords.");
     } finally {
       setSaving(false);
     }
@@ -257,17 +301,27 @@ export function RankTracker() {
       toast.error("Connect Google Search Console and select a property first.");
       return;
     }
+    if (compare === "custom" && (!customCompareStart || !customCompareEnd)) {
+      toast.error("Select both custom comparison dates.");
+      return;
+    }
+    if (compare === "custom" && customCompareEnd < customCompareStart) {
+      toast.error("Custom comparison end date must be on or after the start date.");
+      return;
+    }
     setRefreshing(true);
     try {
       const result = await api.post<{ updated: number; items: RankKeyword[]; errors?: Array<{ keyword: string; error: string }> }>(
         "/api/rank-tracking/refresh",
-        { keyword_ids: ids },
+        { keyword_ids: ids, period, compare, custom_compare_start: compare === "custom" ? customCompareStart || null : null, custom_compare_end: compare === "custom" ? customCompareEnd || null : null },
       );
       if (result.items?.length) {
         setKeywords((current) => {
           const map = new Map(result.items.map((item) => [item.id, item]));
           return current.map((item) => map.get(item.id) || item);
         });
+        const dates = result.items.map((item) => item.latest_gsc_date || item.measurement_end_date).filter(Boolean).sort();
+        if (dates.length) setLatestGscDate(dates[dates.length - 1] as string);
         const first = result.items[0];
         if (first?.measurement_message) setMeasurementMessage(first.measurement_message);
         if (ids.length === 1) await loadHistory(ids[0]);
@@ -275,12 +329,13 @@ export function RankTracker() {
       if (result.errors?.length) {
         toast.warning(`${result.updated} updated; ${result.errors.length} could not be checked.`);
       } else {
-        toast.success(`${result.updated} keyword${result.updated === 1 ? "" : "s"} updated.`);
+        toast.success(`${result.updated} keyword${result.updated === 1 ? "" : "s"} synced from Google Search Console.`);
       }
-      const nextOverview = await api.get<Overview>("/api/rank-tracking/overview");
+      const nextOverview = await api.get<Overview>(`/api/rank-tracking/overview?period=${period}`);
       setOverview(nextOverview);
+      await load();
     } catch (error: any) {
-      toast.error(error?.data?.detail || "Ranking refresh failed.");
+      toast.error(error?.data?.detail || "Google Search Console sync failed.");
     } finally {
       setRefreshing(false);
     }
@@ -344,7 +399,7 @@ export function RankTracker() {
         <div>
           <div className="flex items-center gap-2 text-emerald-600 text-sm font-medium mb-1"><Target className="size-4" /> Organic Visibility</div>
           <h1 className="font-serif text-3xl font-bold tracking-tight">Rank Tracker</h1>
-          <p className="text-slate-500 dark:text-slate-400 mt-1">Track real Google Search Console average positions for your target keywords.</p>
+          <p className="text-slate-500 dark:text-slate-400 mt-1">Track the latest available Google Search Console average position with flexible period comparison.</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" onClick={() => void load()} disabled={loading}>
@@ -355,7 +410,7 @@ export function RankTracker() {
           </Button>
           <Button onClick={() => void handleRefresh()} disabled={refreshing || keywords.length === 0} className="bg-slate-900 hover:bg-slate-800 text-white dark:bg-white dark:text-slate-900">
             {refreshing ? <Loader2 className="size-4 animate-spin" /> : <Activity className="size-4" />}
-            {refreshing ? "Checking..." : "Check Rankings"}
+            {refreshing ? "Syncing..." : "Sync GSC Data"}
           </Button>
         </div>
       </div>
@@ -374,7 +429,12 @@ export function RankTracker() {
         </Card>
       ) : (
         <div className="space-y-2">
-          <div className="flex items-center gap-2 text-xs text-slate-500"><CheckCircle2 className="size-4 text-emerald-600" /> Measuring from <span className="font-medium text-slate-700 dark:text-slate-300">{property}</span> Â· GSC average position</div>
+          <div className="flex items-center gap-2 text-xs text-slate-500"><CheckCircle2 className="size-4 text-emerald-600" /> Measuring from <span className="font-medium text-slate-700 dark:text-slate-300">{property}</span> · GSC average position</div>
+          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+            <span className="rounded-full border px-2 py-1">Period: <strong>{period}</strong></span>
+            <span className="rounded-full border px-2 py-1">Compare: <strong>{compare === "previous_period" ? "Previous period" : compare.replace("previous_", "Previous ")}</strong></span>
+            {latestGscDate && <span className="rounded-full border px-2 py-1">Latest GSC data: <strong>{new Date(`${latestGscDate}T00:00:00`).toLocaleDateString()}</strong></span>}
+          </div>
           {measurementMessage && (
             <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-400">
               {measurementMessage}
@@ -391,7 +451,7 @@ export function RankTracker() {
           ["Top 20", overview?.top_20 ?? 0],
           ["Improved", overview?.improved ?? 0],
           ["Declined", overview?.declined ?? 0],
-          ["Avg. Position", overview?.average_position ?? "â€”"],
+          ["Avg. Position", overview?.average_position ?? "—"],
         ].map(([label, value]) => (
           <Card key={String(label)} className="shadow-sm">
             <CardContent className="p-4">
@@ -406,13 +466,53 @@ export function RankTracker() {
         <div className="relative flex-1"><Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-slate-400" /><Input className="pl-9" placeholder="Search keywords or URLs..." value={search} onChange={(e) => setSearch(e.target.value)} /></div>
         <Select value={clientFilter} onValueChange={(value) => setClientFilter(value || "all")}>
           <SelectTrigger className="w-full md:w-56"><SelectValue placeholder="All clients" /></SelectTrigger>
-          <SelectContent><SelectItem value="all">All clients</SelectItem>{clients.map((client) => <SelectItem key={client.id} value={client.id}>{client.business_name || client.name || client.id}</SelectItem>)}</SelectContent>
+          <SelectContent className="bg-white dark:bg-slate-950 border-slate-200 dark:border-slate-800 opacity-100"><SelectItem value="all">All clients</SelectItem>{clients.map((client) => <SelectItem key={client.id} value={client.id}>{client.business_name || client.name || client.id}</SelectItem>)}</SelectContent>
         </Select>
       </div>
 
+      <Card className="shadow-sm">
+        <CardContent className="p-3 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+          <div className="flex items-center gap-2 text-sm font-medium"><Clock3 className="size-4 text-emerald-600" /> Reporting period</div>
+          <div className="flex flex-wrap gap-2">
+            {(["daily", "weekly", "monthly", "yearly"] as const).map((value) => (
+              <Button key={value} variant={period === value ? "default" : "outline"} size="sm"
+                onClick={() => setPeriod(value)} className={period === value ? "bg-emerald-600 hover:bg-emerald-700 text-white" : ""}>
+                {value.charAt(0).toUpperCase() + value.slice(1)}
+              </Button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-slate-500">Compare</span>
+            <Select value={compare} onValueChange={(value) => setCompare(value as typeof compare)}>
+              <SelectTrigger className="w-44 h-9 bg-white dark:bg-slate-950 opacity-100"><SelectValue /></SelectTrigger>
+              <SelectContent className="bg-white dark:bg-slate-950 border-slate-200 dark:border-slate-800 opacity-100">
+                <SelectItem value="previous_period">Previous period</SelectItem>
+                <SelectItem value="previous_week">Previous week</SelectItem>
+                <SelectItem value="previous_month">Previous month</SelectItem>
+                <SelectItem value="previous_year">Previous year</SelectItem>
+                <SelectItem value="custom">Custom dates</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          {compare === "custom" && (
+            <div className="w-full lg:w-auto flex flex-col sm:flex-row items-start sm:items-center gap-2 pt-2 lg:pt-0">
+              <div className="flex items-center gap-2">
+                <Label htmlFor="custom-compare-start" className="text-xs text-slate-500 whitespace-nowrap">From</Label>
+                <Input id="custom-compare-start" type="date" value={customCompareStart} onChange={(e) => setCustomCompareStart(e.target.value)} className="h-9 w-40 bg-white dark:bg-slate-950" />
+              </div>
+              <div className="flex items-center gap-2">
+                <Label htmlFor="custom-compare-end" className="text-xs text-slate-500 whitespace-nowrap">To</Label>
+                <Input id="custom-compare-end" type="date" value={customCompareEnd} onChange={(e) => setCustomCompareEnd(e.target.value)} className="h-9 w-40 bg-white dark:bg-slate-950" />
+              </div>
+              <Button size="sm" onClick={() => void handleRefresh()} disabled={refreshing || !customCompareStart || !customCompareEnd}>Apply</Button>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       <div className="grid xl:grid-cols-[1fr_420px] gap-6">
         <Card className="shadow-sm overflow-hidden">
-          <CardHeader><CardTitle>Tracked Keywords</CardTitle><CardDescription>Current 90-day GSC average position compared with the preceding 90-day period.</CardDescription></CardHeader>
+          <CardHeader><CardTitle>Tracked Keywords</CardTitle><CardDescription>{period.charAt(0).toUpperCase() + period.slice(1)} GSC average position compared with the selected comparison period.</CardDescription></CardHeader>
           <CardContent className="p-0">
             {filtered.length === 0 ? (
               <div className="p-10 text-center text-slate-500">No tracked keywords match your filters.</div>
@@ -421,20 +521,22 @@ export function RankTracker() {
                 <table className="w-full text-sm">
                   <thead className="border-y bg-slate-50/70 dark:bg-slate-900/50 dark:border-slate-800">
                     <tr className="text-left text-xs text-slate-500">
-                      <th className="px-5 py-3">Keyword</th><th className="px-4 py-3">Client</th><th className="px-4 py-3">Current</th><th className="px-4 py-3">Previous</th><th className="px-4 py-3">Change</th><th className="px-4 py-3">Checked</th><th className="px-3 py-3" />
+                      <th className="px-5 py-3">Keyword</th><th className="px-4 py-3">Latest</th><th className="px-4 py-3">Previous</th><th className="px-4 py-3">Change</th><th className="px-4 py-3">Clicks</th><th className="px-4 py-3">Impressions</th><th className="px-4 py-3">CTR</th><th className="px-4 py-3">GSC Date</th><th className="px-3 py-3" />
                     </tr>
                   </thead>
                   <tbody className="divide-y dark:divide-slate-800">
                     {filtered.map((item) => (
                       <tr key={item.id} className="hover:bg-slate-50 dark:hover:bg-slate-900/50 cursor-pointer" onClick={() => void loadHistory(item.id)}>
-                        <td className="px-5 py-4"><div className="font-medium">{item.keyword}</div><div className="text-xs text-slate-500 truncate max-w-[320px]">{item.target_url || "No target URL specified"}</div></td>
-                        <td className="px-4 py-4 text-slate-500">{item.client_name || "â€”"}</td>
+                        <td className="px-5 py-4"><div className="font-medium">{item.keyword}</div><div className="text-xs text-slate-500">{item.status === "ok" ? "Google Search Console" : item.status}</div></td>
                         <td className="px-4 py-4 font-semibold">{positionLabel(item.current_position)}</td>
                         <td className="px-4 py-4 text-slate-500">{positionLabel(item.previous_position)}</td>
                         <td className={`px-4 py-4 font-medium ${movementClass(item.change)}`}>
-                          {item.change == null ? "â€”" : <span className="inline-flex flex-col gap-0.5"><span className="inline-flex items-center gap-1">{item.change > 0 ? <ArrowUp className="size-3.5" /> : item.change < 0 ? <ArrowDown className="size-3.5" /> : null}{Math.abs(item.change).toFixed(1)}</span><span className="text-[10px] font-normal">{movementLabel(item.change)}</span></span>}
+                          {item.change == null ? "—" : <span className="inline-flex flex-col gap-0.5"><span className="inline-flex items-center gap-1">{item.change > 0 ? <ArrowUp className="size-3.5" /> : item.change < 0 ? <ArrowDown className="size-3.5" /> : null}{Math.abs(item.change).toFixed(1)}</span><span className="text-[10px] font-normal">{movementLabel(item.change)}</span></span>}
                         </td>
-                        <td className="px-4 py-4 text-xs text-slate-500">{item.last_checked_at ? new Date(item.last_checked_at).toLocaleDateString() : "Never"}</td>
+                        <td className="px-4 py-4 text-xs">{Math.round(item.clicks || 0).toLocaleString()}</td>
+                        <td className="px-4 py-4 text-xs">{Math.round(item.impressions || 0).toLocaleString()}</td>
+                        <td className="px-4 py-4 text-xs">{((item.ctr || 0) * 100).toFixed(2)}%</td>
+                        <td className="px-4 py-4 text-xs text-slate-500">{item.measurement_end_date ? new Date(`${item.measurement_end_date}T00:00:00`).toLocaleDateString() : "Not synced"}</td>
                         <td className="px-3 py-4">
                           <div className="flex items-center gap-1">
                             <Button variant="ghost" size="sm" title="Check this keyword now" onClick={(e) => { e.stopPropagation(); void handleRefresh([item.id]); }} disabled={refreshing}>
@@ -519,18 +621,29 @@ export function RankTracker() {
       </div>
 
       {showAdd && (
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowAdd(false); }}>
-          <Card className="w-full max-w-2xl shadow-2xl">
-            <CardHeader><div className="flex items-center justify-between"><div><CardTitle>Add Tracked Keyword</CardTitle><CardDescription>Save the keyword first, then run a real GSC measurement.</CardDescription></div><Button variant="ghost" size="icon" onClick={() => setShowAdd(false)}><X className="size-4" /></Button></div></CardHeader>
-            <CardContent className="grid md:grid-cols-2 gap-4">
-              <div className="md:col-span-2 space-y-2"><Label>Keyword *</Label><Input autoFocus value={form.keyword} onChange={(e) => setForm({ ...form, keyword: e.target.value })} placeholder="commercial cleaning perth" /></div>
-              <div className="space-y-2"><Label>Client</Label><Select value={form.client_id} onValueChange={(value) => setForm({ ...form, client_id: value || "none" })}><SelectTrigger><SelectValue placeholder="No client" /></SelectTrigger><SelectContent><SelectItem value="none">No client</SelectItem>{clients.map((client) => <SelectItem key={client.id} value={client.id}>{client.business_name || client.name || client.id}</SelectItem>)}</SelectContent></Select></div>
-              <div className="space-y-2"><Label>Target URL</Label><Input value={form.target_url} onChange={(e) => setForm({ ...form, target_url: e.target.value })} placeholder="https://example.com/service/" /></div>
-              <div className="space-y-2"><Label>Country</Label><Input value={form.country} onChange={(e) => setForm({ ...form, country: e.target.value })} placeholder="global / au / us" /></div>
-              <div className="space-y-2"><Label>Location</Label><Input value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} placeholder="Perth, WA" /></div>
-              <div className="space-y-2"><Label>Device</Label><Select value={form.device} onValueChange={(value) => setForm({ ...form, device: value || "all" })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="desktop">Desktop</SelectItem><SelectItem value="mobile">Mobile</SelectItem></SelectContent></Select></div>
-              <div className="space-y-2"><Label>Tracking frequency</Label><Select value={form.frequency} onValueChange={(value) => setForm({ ...form, frequency: value || "daily" })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="daily">Daily</SelectItem><SelectItem value="weekly">Weekly</SelectItem><SelectItem value="manual">Manual</SelectItem></SelectContent></Select></div>
-              <div className="md:col-span-2 flex justify-end gap-2 pt-2"><Button variant="outline" onClick={() => setShowAdd(false)}>Cancel</Button><Button onClick={() => void handleAdd()} disabled={saving} className="bg-emerald-600 hover:bg-emerald-700 text-white">{saving ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />} {saving ? "Saving..." : "Add Keyword"}</Button></div>
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowAdd(false); }}>
+          <Card className="w-full max-w-2xl max-h-[90vh] overflow-y-auto shadow-2xl bg-white dark:bg-slate-950 border-slate-200 dark:border-slate-800 opacity-100">
+            <CardHeader><div className="flex items-center justify-between"><div><CardTitle>Add Keywords</CardTitle><CardDescription>Enter one keyword per line. The connected Google Search Console property supplies the ranking data; no page URL is required.</CardDescription></div><Button variant="ghost" size="icon" onClick={() => setShowAdd(false)}><X className="size-4" /></Button></div></CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label>Keywords *</Label>
+                <textarea autoFocus value={form.keyword} onChange={(e) => setForm({ ...form, keyword: e.target.value })} placeholder={"commercial cleaning perth\noffice cleaning perth\nschool cleaning perth"} className="min-h-40 w-full rounded-md border border-slate-300 bg-white px-3 py-3 text-sm text-slate-900 outline-none focus:ring-2 focus:ring-emerald-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" />
+                <p className="text-xs text-slate-500">One keyword per line. Duplicate lines are automatically removed.</p>
+              </div>
+              <div className="grid md:grid-cols-2 gap-4">
+                <div className="space-y-2"><Label>Reporting frequency</Label><Select value={form.frequency} onValueChange={(value) => setForm({ ...form, frequency: value || "daily" })}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent className="bg-white dark:bg-slate-950 border-slate-200 dark:border-slate-800 opacity-100"><SelectItem value="daily">Daily</SelectItem><SelectItem value="weekly">Weekly</SelectItem><SelectItem value="monthly">Monthly</SelectItem><SelectItem value="yearly">Yearly</SelectItem></SelectContent></Select></div>
+                <div className="space-y-2"><Label>Comparison</Label><Select value={compare} onValueChange={(value) => setCompare(value as typeof compare)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent className="bg-white dark:bg-slate-950 border-slate-200 dark:border-slate-800 opacity-100"><SelectItem value="previous_period">Previous period</SelectItem><SelectItem value="previous_week">Previous week</SelectItem><SelectItem value="previous_month">Previous month</SelectItem><SelectItem value="previous_year">Previous year</SelectItem><SelectItem value="custom">Custom dates</SelectItem></SelectContent></Select></div>
+              </div>
+              {compare === "custom" && (
+                <div className="grid sm:grid-cols-2 gap-4">
+                  <div className="space-y-2"><Label htmlFor="modal-custom-start">Compare from</Label><Input id="modal-custom-start" type="date" value={customCompareStart} onChange={(e) => setCustomCompareStart(e.target.value)} className="bg-white text-slate-900 dark:bg-slate-900 dark:text-slate-100" /></div>
+                  <div className="space-y-2"><Label htmlFor="modal-custom-end">Compare to</Label><Input id="modal-custom-end" type="date" value={customCompareEnd} onChange={(e) => setCustomCompareEnd(e.target.value)} className="bg-white text-slate-900 dark:bg-slate-900 dark:text-slate-100" /></div>
+                </div>
+              )}
+              <div className="rounded-lg border border-slate-200 bg-slate-100 p-3 text-xs text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                <strong>GSC property:</strong> {property || "Connect Google Search Console first."}
+              </div>
+              <div className="flex justify-end gap-2 pt-2"><Button variant="outline" onClick={() => setShowAdd(false)}>Cancel</Button><Button onClick={() => void handleAdd()} disabled={saving} className="bg-emerald-600 hover:bg-emerald-700 text-white">{saving ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />} {saving ? "Adding..." : "Add Keywords"}</Button></div>
             </CardContent>
           </Card>
         </div>

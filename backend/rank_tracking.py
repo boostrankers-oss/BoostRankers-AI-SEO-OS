@@ -59,6 +59,7 @@ class RankTrackingSnapshot(ORMBaseModel):
     comparison_start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     comparison_end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     comparison_position: Mapped[float | None] = mapped_column(Float, nullable=True)
+    period: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     source: Mapped[str] = mapped_column(String(50), nullable=False, default="google_search_console")
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="ok")
     error_message: Mapped[str | None] = mapped_column(String(1000), nullable=True)
@@ -101,6 +102,26 @@ class KeywordUpdate(BaseModel):
 
 class RefreshRequest(BaseModel):
     keyword_ids: list[str] = Field(default_factory=list, max_length=100)
+    period: str = Field(default="daily", max_length=20)
+    compare: str = Field(default="previous_period", max_length=30)
+    custom_compare_start: date | None = None
+    custom_compare_end: date | None = None
+
+    @field_validator("period")
+    @classmethod
+    def validate_period(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"daily", "weekly", "monthly", "yearly"}:
+            raise ValueError("Period must be daily, weekly, monthly, or yearly.")
+        return value
+
+    @field_validator("compare")
+    @classmethod
+    def validate_compare(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"previous_period", "previous_week", "previous_month", "previous_year", "custom"}:
+            raise ValueError("Invalid comparison period.")
+        return value
 
 
 def _company_id(current_user: User) -> str:
@@ -109,13 +130,14 @@ def _company_id(current_user: User) -> str:
     return str(current_user.company_id)
 
 
-def _serialize_keyword(db: Session, row: RankTrackingKeyword) -> dict[str, Any]:
-    latest = (
-        db.query(RankTrackingSnapshot)
-        .filter(RankTrackingSnapshot.keyword_id == row.id, RankTrackingSnapshot.status == "ok")
-        .order_by(RankTrackingSnapshot.checked_at.desc())
-        .first()
+def _serialize_keyword(db: Session, row: RankTrackingKeyword, period: str | None = None) -> dict[str, Any]:
+    snapshot_query = db.query(RankTrackingSnapshot).filter(
+        RankTrackingSnapshot.keyword_id == row.id,
+        RankTrackingSnapshot.status == "ok",
     )
+    if period:
+        snapshot_query = snapshot_query.filter(RankTrackingSnapshot.period == period)
+    latest = snapshot_query.order_by(RankTrackingSnapshot.checked_at.desc()).first()
     position = latest.position if latest else None
     # Only use an explicitly measured preceding GSC period. Legacy snapshots
     # have no period metadata, so movement remains null until the next refresh.
@@ -143,6 +165,15 @@ def _serialize_keyword(db: Session, row: RankTrackingKeyword) -> dict[str, Any]:
         "last_checked_at": latest.checked_at.isoformat() if latest else None,
         "status": latest.status if latest else "not_checked",
         "last_error": latest.error_message if latest and latest.error_message else None,
+        "clicks": latest.clicks if latest else 0,
+        "impressions": latest.impressions if latest else 0,
+        "ctr": latest.ctr if latest else 0,
+        "measurement_start_date": latest.measurement_start_date.isoformat() if latest and latest.measurement_start_date else None,
+        "measurement_end_date": latest.measurement_end_date.isoformat() if latest and latest.measurement_end_date else None,
+        "comparison_start_date": latest.comparison_start_date.isoformat() if latest and latest.comparison_start_date else None,
+        "comparison_end_date": latest.comparison_end_date.isoformat() if latest and latest.comparison_end_date else None,
+        "snapshot_period": latest.period if latest else None,
+        "latest_gsc_date": latest.measurement_end_date.isoformat() if latest and latest.measurement_end_date else None,
     }
 
 
@@ -157,19 +188,46 @@ def _get_keyword(db: Session, company_id: str, keyword_id: str) -> RankTrackingK
     return row
 
 
-def _period_windows(days: int = 90) -> tuple[date, date, date, date]:
-    """Return non-overlapping current and previous GSC comparison periods."""
-    current_end = date.today() - timedelta(days=3)
+def _period_days(period: str) -> int:
+    return {"daily": 1, "weekly": 7, "monthly": 30, "yearly": 365}.get(period, 1)
+
+
+def _period_windows(
+    period: str = "daily",
+    latest_end: date | None = None,
+    compare: str = "previous_period",
+    custom_compare_start: date | None = None,
+    custom_compare_end: date | None = None,
+) -> tuple[date, date, date, date]:
+    """Build the selected GSC period and its comparison period."""
+    days = _period_days(period)
+    current_end = latest_end or (date.today() - timedelta(days=3))
     current_start = current_end - timedelta(days=days - 1)
-    previous_end = current_start - timedelta(days=1)
-    previous_start = previous_end - timedelta(days=days - 1)
+
+    if compare == "custom":
+        if not custom_compare_start or not custom_compare_end:
+            raise HTTPException(status_code=422, detail="Custom comparison requires a start and end date.")
+        if custom_compare_end < custom_compare_start:
+            raise HTTPException(status_code=422, detail="Custom comparison end date must be on or after the start date.")
+        previous_start = custom_compare_start
+        previous_end = custom_compare_end
+    else:
+        shifts = {
+            "previous_period": days,
+            "previous_week": 7,
+            "previous_month": 30,
+            "previous_year": 365,
+        }
+        shift = shifts.get(compare, days)
+        previous_end = current_end - timedelta(days=shift)
+        previous_start = previous_end - timedelta(days=days - 1)
     return current_start, current_end, previous_start, previous_end
 
 
 def _date_window(days: int = 90) -> tuple[str, str]:
-    start, end, _, _ = _period_windows(days)
+    end = date.today() - timedelta(days=3)
+    start = end - timedelta(days=days - 1)
     return start.isoformat(), end.isoformat()
-
 
 def _property_from_connection(connection: GoogleIntegration) -> str | None:
     names = (
@@ -259,6 +317,46 @@ async def _gsc_request(connection: GoogleIntegration, db: Session, site_url: str
             detail = "Google Search Console request failed."
         raise HTTPException(status_code=response.status_code, detail=detail)
     return response.json().get("rows", [])
+
+
+async def _latest_gsc_date(
+    connection: GoogleIntegration,
+    db: Session,
+    *,
+    site_url: str,
+    keyword: str,
+    country: str = "global",
+    device: str = "all",
+) -> date | None:
+    """Return the newest date for which GSC has data for this exact query."""
+    base = {
+        "startDate": (date.today() - timedelta(days=14)).isoformat(),
+        "endDate": date.today().isoformat(),
+        "dimensions": ["date"],
+        "rowLimit": 30,
+        "dataState": "all",
+    }
+    filters = [{"dimension": "query", "operator": "equals", "expression": keyword}]
+    country_values = _normalize_country(country)
+    device_value = _normalize_device(device)
+    if country_values:
+        filters.append({"dimension": "country", "operator": "equals", "expression": country_values[0]})
+    if device_value:
+        filters.append({"dimension": "device", "operator": "equals", "expression": device_value})
+    try:
+        rows = await _gsc_request(
+            connection, db, site_url, {**base, "dimensionFilterGroups": [{"filters": filters}]}
+        )
+    except HTTPException:
+        rows = []
+    dates = []
+    for row in rows:
+        raw = str((row.get("keys") or [""])[0] or "")
+        try:
+            dates.append(date.fromisoformat(raw))
+        except ValueError:
+            pass
+    return max(dates) if dates else None
 
 
 async def _query_gsc_keyword(
@@ -351,13 +449,26 @@ async def _query_gsc_keyword(
     }
 
 
-async def _refresh_keyword(db: Session, row: RankTrackingKeyword, company_id: str) -> dict[str, Any]:
+async def _refresh_keyword(
+    db: Session,
+    row: RankTrackingKeyword,
+    company_id: str,
+    period: str = "daily",
+    compare: str = "previous_period",
+    custom_compare_start: date | None = None,
+    custom_compare_end: date | None = None,
+) -> dict[str, Any]:
     connection = get_connection(db, company_id, "search_console")
     if connection is None:
         raise HTTPException(status_code=400, detail="Google Search Console is not connected. Connect it in Google Integration first.")
 
     site_url, available_sites = await _resolve_gsc_property(connection, db)
-    current_start, current_end, previous_start, previous_end = _period_windows(90)
+    latest_gsc_date = await _latest_gsc_date(
+        connection, db, site_url=site_url, keyword=row.keyword, country=row.country, device=row.device
+    )
+    current_start, current_end, previous_start, previous_end = _period_windows(
+        period, latest_gsc_date, compare, custom_compare_start, custom_compare_end
+    )
     current_start_text, current_end_text = current_start.isoformat(), current_end.isoformat()
     previous_start_text, previous_end_text = previous_start.isoformat(), previous_end.isoformat()
     try:
@@ -377,6 +488,9 @@ async def _refresh_keyword(db: Session, row: RankTrackingKeyword, company_id: st
                 RankTrackingSnapshot.keyword_id == row.id,
                 RankTrackingSnapshot.measurement_start_date == current_start,
                 RankTrackingSnapshot.measurement_end_date == current_end,
+                RankTrackingSnapshot.period == period,
+                RankTrackingSnapshot.comparison_start_date == previous_start,
+                RankTrackingSnapshot.comparison_end_date == previous_end,
             )
             .order_by(RankTrackingSnapshot.checked_at.desc())
             .first()
@@ -397,6 +511,7 @@ async def _refresh_keyword(db: Session, row: RankTrackingKeyword, company_id: st
         snapshot.impressions = current_data["impressions"]
         snapshot.ctr = current_data["ctr"]
         snapshot.comparison_position = previous_data["position"]
+        snapshot.period = period
         snapshot.source = "google_search_console"
         snapshot.status = "ok"
         if current_data["position"] is None:
@@ -412,6 +527,9 @@ async def _refresh_keyword(db: Session, row: RankTrackingKeyword, company_id: st
         result["available_properties"] = available_sites
         result["date_range"] = {"start": current_start_text, "end": current_end_text}
         result["comparison_date_range"] = {"start": previous_start_text, "end": previous_end_text}
+        result["period"] = period
+        result["compare"] = compare
+        result["latest_gsc_date"] = latest_gsc_date.isoformat() if latest_gsc_date else None
         result["measurement_message"] = current_data["message"]
         result["comparison_message"] = previous_data["message"]
         return result
@@ -454,14 +572,25 @@ async def rank_tracking_status(db: Session = Depends(get_db), current_user: User
 
 
 @router.get("/keywords")
-def list_keywords(active_only: bool = Query(False), client_id: str | None = Query(None), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> list[dict[str, Any]]:
+def list_keywords(
+    active_only: bool = Query(False),
+    client_id: str | None = Query(None),
+    period: str = Query("daily"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    if period not in {"daily", "weekly", "monthly", "yearly"}:
+        raise HTTPException(status_code=422, detail="Invalid period.")
     company_id = _company_id(current_user)
-    query = db.query(RankTrackingKeyword).filter(RankTrackingKeyword.company_id == company_id, RankTrackingKeyword.deleted_at.is_(None))
+    query = db.query(RankTrackingKeyword).filter(
+        RankTrackingKeyword.company_id == company_id,
+        RankTrackingKeyword.deleted_at.is_(None),
+    )
     if active_only:
         query = query.filter(RankTrackingKeyword.is_active.is_(True))
     if client_id:
         query = query.filter(RankTrackingKeyword.client_id == client_id)
-    return [_serialize_keyword(db, row) for row in query.order_by(RankTrackingKeyword.created_at.desc()).all()]
+    return [_serialize_keyword(db, row, period) for row in query.order_by(RankTrackingKeyword.created_at.desc()).all()]
 
 
 @router.post("/keywords", status_code=status.HTTP_201_CREATED)
@@ -514,7 +643,14 @@ def delete_keyword(keyword_id: str, db: Session = Depends(get_db), current_user:
 
 
 @router.get("/overview")
-def overview(client_id: str | None = Query(None), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> dict[str, Any]:
+def overview(
+    client_id: str | None = Query(None),
+    period: str = Query("daily"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    if period not in {"daily", "weekly", "monthly", "yearly"}:
+        raise HTTPException(status_code=422, detail="Invalid period.")
     company_id = _company_id(current_user)
     query = db.query(RankTrackingKeyword).filter(
         RankTrackingKeyword.company_id == company_id,
@@ -523,7 +659,7 @@ def overview(client_id: str | None = Query(None), db: Session = Depends(get_db),
     )
     if client_id:
         query = query.filter(RankTrackingKeyword.client_id == client_id)
-    items = [_serialize_keyword(db, row) for row in query.all()]
+    items = [_serialize_keyword(db, row, period) for row in query.all()]
     positions = [float(item["current_position"]) for item in items if item["current_position"] is not None]
     changes = [float(item["change"]) for item in items if item["change"] is not None]
     return {
@@ -549,16 +685,29 @@ async def refresh_keywords(payload: RefreshRequest, db: Session = Depends(get_db
     results: list[dict[str, Any]] = []; errors: list[dict[str, str]] = []
     for row in rows:
         try:
-            results.append(await _refresh_keyword(db, row, company_id))
+            results.append(await _refresh_keyword(db, row, company_id, payload.period, payload.compare, payload.custom_compare_start, payload.custom_compare_end))
         except HTTPException as exc:
             errors.append({"keyword_id": row.id, "keyword": row.keyword, "error": str(exc.detail)})
     return {"updated": len(results), "items": results, "errors": errors}
 
 
 @router.post("/keywords/{keyword_id}/refresh")
-async def refresh_one_keyword(keyword_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> dict[str, Any]:
-    company_id = _company_id(current_user); row = _get_keyword(db, company_id, keyword_id)
-    return await _refresh_keyword(db, row, company_id)
+async def refresh_one_keyword(
+    keyword_id: str,
+    period: str = Query("daily"),
+    compare: str = Query("previous_period"),
+    custom_compare_start: date | None = Query(None),
+    custom_compare_end: date | None = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    if period not in {"daily", "weekly", "monthly", "yearly"}:
+        raise HTTPException(status_code=422, detail="Invalid period.")
+    if compare not in {"previous_period", "previous_week", "previous_month", "previous_year", "custom"}:
+        raise HTTPException(status_code=422, detail="Invalid comparison period.")
+    company_id = _company_id(current_user)
+    row = _get_keyword(db, company_id, keyword_id)
+    return await _refresh_keyword(db, row, company_id, period, compare, custom_compare_start, custom_compare_end)
 
 
 @router.get("/keywords/{keyword_id}/history")
@@ -591,7 +740,9 @@ def ensure_rank_tracking_tables() -> None:
             "ALTER TABLE rank_tracking_snapshots ADD COLUMN IF NOT EXISTS comparison_start_date DATE",
             "ALTER TABLE rank_tracking_snapshots ADD COLUMN IF NOT EXISTS comparison_end_date DATE",
             "ALTER TABLE rank_tracking_snapshots ADD COLUMN IF NOT EXISTS comparison_position DOUBLE PRECISION",
+            "ALTER TABLE rank_tracking_snapshots ADD COLUMN IF NOT EXISTS period VARCHAR(20)",
             "CREATE INDEX IF NOT EXISTS ix_rank_tracking_snapshots_keyword_measurement_period ON rank_tracking_snapshots (keyword_id, measurement_start_date, measurement_end_date)",
+            "CREATE INDEX IF NOT EXISTS ix_rank_tracking_snapshots_keyword_period ON rank_tracking_snapshots (keyword_id, period, checked_at)",
         ):
             connection.execute(text(statement))
 
