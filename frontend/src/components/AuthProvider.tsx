@@ -21,6 +21,8 @@ export interface User {
   last_name: string;
   role: UserRole;
   company_id: string | null;
+  client_id?: string | null;
+  account_type?: "client" | "agency";
   is_verified: boolean;
 }
 
@@ -44,7 +46,10 @@ interface AuthContextType {
     confirm_password: string;
     first_name: string;
     last_name: string;
+    account_type: "client" | "agency";
     company_name?: string;
+    website?: string;
+    industry?: string;
   }) => Promise<void>;
   logout: () => Promise<void>;
   loading: boolean;
@@ -79,9 +84,7 @@ export function AuthProvider({
     }
   });
 
-  // Cached session hydration is synchronous. Do not block the auth UI
-  // while the background /api/auth/me validation is running.
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let mounted = true;
@@ -154,9 +157,8 @@ export function AuthProvider({
     email: string,
     password: string
   ): Promise<void> => {
-    // `loading` is reserved for initial session restoration.
-    // Do not toggle it during login, otherwise App.tsx can show
-    // "Restoring session..." while the user is actively logging in.
+    setLoading(true);
+
     try {
       const response = await api.post<AuthResponse>(
         "/api/auth/login",
@@ -176,6 +178,8 @@ export function AuthProvider({
     } catch (error) {
       console.error("Login failed:", error);
       throw error;
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -185,10 +189,13 @@ export function AuthProvider({
     confirm_password: string;
     first_name: string;
     last_name: string;
+    account_type: "client" | "agency";
     company_name?: string;
+    website?: string;
+    industry?: string;
   }): Promise<void> => {
-    // `loading` is reserved for initial session restoration.
-    // Do not toggle it during signup for the same reason as login.
+    setLoading(true);
+
     try {
       const payload = {
         ...data,
@@ -214,6 +221,8 @@ export function AuthProvider({
     } catch (error) {
       console.error("Signup failed:", error);
       throw error;
+    } finally {
+      setLoading(false);
     }
   };
 

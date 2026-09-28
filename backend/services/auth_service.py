@@ -2,11 +2,11 @@ from __future__ import annotations
 from jose import JWTError
 
 from datetime import UTC, datetime, timedelta
+import uuid
 from typing import Optional
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from models.company import Company
@@ -21,6 +21,7 @@ from core.security import (
 )
 
 from models.audit_log import AuditLog
+from models.client import Client
 
 from schemas.auth import (
     LoginRequest,
@@ -37,7 +38,6 @@ from core.security import (
 from core.jwt import (
     create_access_token,
     create_refresh_token,
-    verify_token,
 )
 
 # Default role assigned to new users
@@ -65,48 +65,10 @@ class AuthService:
     # Private Helpers
     # ==========================================================
 
-    @staticmethod
-    def _normalize_email(email: str) -> str:
-        """
-        Canonicalize login/registration email input.
-
-        Registration already stores emails in lowercase. Stripping surrounding
-        whitespace and case-folding here makes login deterministic for values
-        coming from browser autofill, copy/paste, or mixed-case input.
-        """
-        return email.strip().casefold()
-
     def _find_user_by_email(self, email: str) -> Optional[User]:
-        normalized_email = self._normalize_email(email)
         return self.db.scalar(
-            select(User).where(User.email == normalized_email)
+            select(User).where(User.email == email.lower())
         )
-
-    def _find_user_for_login(self, email: str) -> Optional[User]:
-        """
-        Login-specific lookup with a single safe retry for a transient
-        PostgreSQL/SQLAlchemy connection failure.
-
-        The row lock also serializes concurrent attempts for the same user so
-        failed_login_attempts cannot be updated from stale concurrent copies.
-        """
-        normalized_email = self._normalize_email(email)
-
-        statement = (
-            select(User)
-            .where(User.email == normalized_email)
-            .with_for_update()
-        )
-
-        try:
-            return self.db.scalar(statement)
-        except OperationalError:
-            # A pooled PostgreSQL connection can occasionally be dropped by
-            # the server/network. Roll back the failed transaction and retry
-            # once on a fresh connection instead of turning a transient
-            # database event into an apparent authentication failure.
-            self.db.rollback()
-            return self.db.scalar(statement)
 
     def _find_company_by_name(
         self,
@@ -260,172 +222,146 @@ class AuthService:
         self,
         data: RegisterRequest,
     ) -> dict:
+        """Register either a single-client owner or an agency owner.
+
+        Public signup never accepts an arbitrary RBAC role. The selected
+        account_type is mapped server-side to the correct role.
+
+        client: creates a private workspace plus exactly one Client record
+                owned by the signup email.
+        agency: creates an agency workspace with no client limit imposed.
         """
-        Register a new user.
-
-        Flow
-
-        1. Validate password
-        2. Check email uniqueness
-        3. Create company (optional)
-        4. Assign default role
-        5. Hash password
-        6. Create user
-        7. Generate JWT tokens
-        8. Commit transaction
-        """
-
         try:
-
-            # --------------------------------------------
-            # Password Validation
-            # --------------------------------------------
-
             self._validate_password(data.password)
 
-            # --------------------------------------------
-            # Email Already Exists
-            # --------------------------------------------
-
-            existing_user = self._find_user_by_email(
-                data.email
-            )
-
+            existing_user = self._find_user_by_email(data.email)
             if existing_user:
-
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Email already registered.",
                 )
 
-            # --------------------------------------------
-            # Company
-            # --------------------------------------------
-
-            company = None
-
-            if data.company_name:
-
-                company = self._find_company_by_name(
-                    data.company_name
+            account_type = str(data.account_type or "client").strip().lower()
+            if account_type not in {"client", "agency"}:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Account type must be 'client' or 'agency'.",
                 )
 
-                if company is None:
+            email = data.email.lower().strip()
+            display_name = f"{data.first_name} {data.last_name}".strip()
 
-                    company = self._create_company(
-                        data.company_name
+            # ---------------------------------------------------------
+            # Workspace/company
+            # ---------------------------------------------------------
+            requested_name = (data.company_name or "").strip()
+
+            if account_type == "agency":
+                if not requested_name:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="Agency name is required for an agency account.",
                     )
 
-            # --------------------------------------------
-            # Role
-            # --------------------------------------------
+                if self._find_company_by_name(requested_name):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="An agency with this name already exists. Please use a different agency name.",
+                    )
 
-            role = self._find_role(DEFAULT_ROLE)
+                company_name = requested_name
+            else:
+                # A client signup always receives its own tenant. Do not
+                # attach a new client account to an existing company.
+                business_name = requested_name or display_name
+                company_name = f"{business_name} - Workspace"
+                if self._find_company_by_name(company_name):
+                    company_name = f"{business_name} - {email.split('@', 1)[0]} Workspace"
+                if self._find_company_by_name(company_name):
+                    company_name = f"{business_name} - Workspace {str(uuid.uuid4())[:8]}"
 
-            # The roles table exists, but the default "client" seed is
-            # missing in the current database.  User.role is retained as
-            # the backward-compatible RBAC value and role_id is nullable,
-            # so a new client can be registered safely without requiring
-            # a manual database seed just to complete signup.
-            role_name = role.name if role else DEFAULT_ROLE
+            company = self._create_company(company_name)
+
+            # ---------------------------------------------------------
+            # Server-controlled role
+            # ---------------------------------------------------------
+            role_name = "agency_admin" if account_type == "agency" else "client"
+            role = self._find_role(role_name)
             role_id = role.id if role else None
 
-            # --------------------------------------------
-            # Create User
-            # --------------------------------------------
-
             user = User(
-
                 first_name=data.first_name,
-
                 last_name=data.last_name,
-
-                email=self._normalize_email(data.email),
-
-                hashed_password=hash_password(
-                    data.password
-                ),
-
+                email=email,
+                hashed_password=hash_password(data.password),
                 role=role_name,
-
                 role_id=role_id,
-
-                company_id=(
-                    company.id
-                    if company
-                    else None
-                ),
-
+                company_id=company.id,
                 is_active=True,
-
                 is_verified=False,
             )
-
             self.db.add(user)
-
             self.db.flush()
 
-            # --------------------------------------------
-            # JWT
-            # --------------------------------------------
+            client_id = None
 
-            tokens = self._issue_tokens(
-                user
-            )
+            # ---------------------------------------------------------
+            # Single-client owner: exactly one Client record is created.
+            # The Client belongs to the newly created private workspace.
+            # ---------------------------------------------------------
+            if account_type == "client":
+                website = str(data.website or "").strip()
+                if not website:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="Website is required for a single-client account.",
+                    )
 
+                client_record = Client(
+                    company_id=company.id,
+                    business_name=requested_name or display_name,
+                    website=website,
+                    industry=(data.industry or None),
+                    contact_name=display_name,
+                    email=email,
+                )
+                self.db.add(client_record)
+                self.db.flush()
+                client_id = str(client_record.id)
+
+            tokens = self._issue_tokens(user)
             self._commit()
 
             return {
-
                 "success": True,
-
-                "message":
-                    "Registration successful.",
-
+                "message": "Registration successful.",
+                "account_type": account_type,
+                "client_id": client_id,
                 "user": {
-
                     "id": user.id,
-
-                    "first_name":
-                        user.first_name,
-
-                    "last_name":
-                        user.last_name,
-
-                    "email":
-                        user.email,
-
-                    "role":
-                        user.role,
-
-                    "company_id":
-                        user.company_id,
-
-                    "is_verified":
-                        user.is_verified,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "email": user.email,
+                    "role": user.role,
+                    "company_id": user.company_id,
+                    "is_verified": user.is_verified,
+                    "client_id": client_id,
+                    "account_type": account_type,
                 },
-
                 "tokens": tokens,
             }
 
         except HTTPException:
-
             self._rollback()
-
             raise
-
         except Exception as exc:
-
             self._rollback()
-
             raise HTTPException(
-
-                status_code=500,
-
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=str(exc),
             )
-            
-            # ==========================================================
+
+    # ==========================================================
     # Login
     # ==========================================================
 
@@ -442,7 +378,7 @@ class AuthService:
             # Find User
             # -------------------------------------------------
 
-            user = self._find_user_for_login(
+            user = self._find_user_by_email(
                 data.email
             )
 
@@ -472,21 +408,10 @@ class AuthService:
             # Verify Password
             # -------------------------------------------------
 
-            try:
-                password_valid = verify_password(
-                    data.password,
-                    user.hashed_password,
-                )
-            except (ValueError, TypeError) as exc:
-                # A broken/unsupported stored hash is an authentication-system
-                # problem, not an invalid user password. Do not increment the
-                # user's failed-login counter for this condition.
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Authentication service could not verify the account password.",
-                ) from exc
-
-            if not password_valid:
+            if not verify_password(
+                data.password,
+                user.hashed_password,
+            ):
                 self._failed_login(user)
 
                 self._commit()
@@ -508,6 +433,17 @@ class AuthService:
             # Issue JWT Tokens
             # -------------------------------------------------
 
+            client_id = None
+            if str(user.role).lower() == "client" and user.company_id:
+                owned_client = self.db.scalar(
+                    select(Client).where(
+                        Client.company_id == user.company_id,
+                        Client.email == user.email,
+                    ).order_by(Client.created_at.asc())
+                )
+                if owned_client is not None:
+                    client_id = str(owned_client.id)
+
             tokens = self._issue_tokens(user)
 
             self._commit()
@@ -524,6 +460,8 @@ class AuthService:
                     "company_id": user.company_id,
                     "is_verified": user.is_verified,
                     "last_login": user.last_login,
+                    "client_id": client_id,
+                    "account_type": "client" if str(user.role).lower() == "client" else "agency",
                 },
                 "tokens": tokens,
             }
@@ -540,249 +478,198 @@ class AuthService:
                 detail=str(exc),
             )
         
-    # ==========================================================
-    # Logout Current Device
-    # ==========================================================
+        # ==========================================================
+        # Refresh Access Token
+        # ==========================================================
 
-    def logout(
-        self,
-        refresh_token: str,
-    ) -> dict:
-        """
-        Revoke the supplied refresh token for the current device.
+def refresh(
+    self,
+    refresh_token: str,
+) -> dict:
+    """
+    Refresh JWT tokens using refresh token rotation.
 
-        Logout is intentionally idempotent: a missing or already-revoked
-        refresh token is treated as a successful logout. This keeps the
-        endpoint safe for retries and browser/session cleanup.
-        """
-        try:
-            if not refresh_token or not refresh_token.strip():
-                return {
-                    "success": True,
-                    "message": "Already logged out.",
-                }
+    Flow
 
-            db_token = self.db.scalar(
-                select(RefreshToken).where(
-                    RefreshToken.token == refresh_token
-                )
+    1. Verify JWT
+    2. Check DB record
+    3. Check revoked
+    4. Check expired
+    5. Load user
+    6. Create new Access Token
+    7. Rotate Refresh Token
+    8. Revoke previous Refresh Token
+    """
+
+    try:
+
+        # ---------------------------------------------
+        # Verify JWT
+        # ---------------------------------------------
+
+        payload = verify_token(
+            refresh_token,
+            token_type="refresh",
+        )
+
+        user_id = payload["sub"]
+
+        session_id = payload["sid"]
+
+        # ---------------------------------------------
+        # Database Lookup
+        # ---------------------------------------------
+
+        db_token = self.db.scalar(
+            select(RefreshToken).where(
+                RefreshToken.token == refresh_token
             )
+        )
 
-            if db_token is None:
-                return {
-                    "success": True,
-                    "message": "Already logged out.",
-                }
-
-            if not db_token.is_revoked:
-                db_token.revoke("user_logout")
-
-            self._commit()
-
-            return {
-                "success": True,
-                "message": "Logout successful.",
-            }
-
-        except HTTPException:
-            self._rollback()
-            raise
-        except Exception as exc:
-            self._rollback()
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Unable to complete logout.",
-            ) from exc
-
-    def refresh(
-        self,
-        refresh_token: str,
-    ) -> dict:
-        """
-        Refresh JWT tokens using refresh token rotation.
-
-        Flow
-
-        1. Verify JWT
-        2. Check DB record
-        3. Check revoked
-        4. Check expired
-        5. Load user
-        6. Create new Access Token
-        7. Rotate Refresh Token
-        8. Revoke previous Refresh Token
-        """
-
-        try:
-
-            # ---------------------------------------------
-            # Verify JWT
-            # ---------------------------------------------
-
-            payload = verify_token(
-                refresh_token,
-                token_type="refresh",
-            )
-
-            user_id = payload["sub"]
-
-            session_id = payload["sid"]
-
-            # ---------------------------------------------
-            # Database Lookup
-            # ---------------------------------------------
-
-            db_token = self.db.scalar(
-                select(RefreshToken).where(
-                    RefreshToken.token == refresh_token
-                )
-            )
-
-            if db_token is None:
-
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Refresh token not found.",
-                )
-
-            # ---------------------------------------------
-            # Revoked
-            # ---------------------------------------------
-
-            if db_token.is_revoked:
-
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Refresh token revoked.",
-                )
-
-            # ---------------------------------------------
-            # Expired
-            # ---------------------------------------------
-
-            if db_token.is_expired:
-
-                db_token.revoke("expired")
-
-                self._commit()
-
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Refresh token expired.",
-                )
-
-            # ---------------------------------------------
-            # User
-            # ---------------------------------------------
-
-            user = self.db.get(
-                User,
-                user_id,
-            )
-
-            if user is None:
-
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found.",
-                )
-
-            if not user.is_active:
-
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Account disabled.",
-                )
-
-            # ---------------------------------------------
-            # Rotate Token
-            # ---------------------------------------------
-
-            db_token.revoke(
-                reason="rotation"
-            )
-
-            new_access = create_access_token(
-                user_id=user.id,
-                email=user.email,
-                company_id=user.company_id,
-                role=user.role,
-                permissions=[],
-            )
-
-            new_refresh = create_refresh_token(
-                user_id=user.id,
-                session_id=session_id,
-            )
-
-            self.db.add(
-                RefreshToken(
-                    user_id=user.id,
-                    token=new_refresh,
-                    token_family=db_token.token_family,
-                    device_name=db_token.device_name,
-                    device_type=db_token.device_type,
-                    browser=db_token.browser,
-                    operating_system=db_token.operating_system,
-                    ip_address=db_token.ip_address,
-                    user_agent=db_token.user_agent,
-                    location=db_token.location,
-                    expires_at=datetime.now(UTC)
-                    + timedelta(days=30),
-                )
-            )
-
-            db_token.replaced_by_token = new_refresh
-
-            db_token.last_used_at = datetime.now(UTC)
-
-            self._commit()
-
-            return {
-
-                "success": True,
-
-                "message": "Token refreshed.",
-
-                "tokens": {
-
-                    "access_token": new_access,
-
-                    "refresh_token": new_refresh,
-
-                    "expires_in": 900,
-                },
-            }
-
-        except JWTError:
-
-            self._rollback()
+        if db_token is None:
 
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid refresh token.",
+                detail="Refresh token not found.",
             )
 
-        except HTTPException:
+        # ---------------------------------------------
+        # Revoked
+        # ---------------------------------------------
 
-            self._rollback()
-
-            raise
-
-        except Exception as exc:
-
-            self._rollback()
+        if db_token.is_revoked:
 
             raise HTTPException(
-                status_code=500,
-                detail=str(exc),
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token revoked.",
             )
+
+        # ---------------------------------------------
+        # Expired
+        # ---------------------------------------------
+
+        if db_token.is_expired:
+
+            db_token.revoke("expired")
+
+            self._commit()
+
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token expired.",
+            )
+
+        # ---------------------------------------------
+        # User
+        # ---------------------------------------------
+
+        user = self.db.get(
+            User,
+            user_id,
+        )
+
+        if user is None:
+
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found.",
+            )
+
+        if not user.is_active:
+
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account disabled.",
+            )
+
+        # ---------------------------------------------
+        # Rotate Token
+        # ---------------------------------------------
+
+        db_token.revoke(
+            reason="rotation"
+        )
+
+        new_access = create_access_token(
+            user_id=user.id,
+            email=user.email,
+            company_id=user.company_id,
+            role=user.role,
+            permissions=[],
+        )
+
+        new_refresh = create_refresh_token(
+            user_id=user.id,
+            session_id=session_id,
+        )
+
+        self.db.add(
+            RefreshToken(
+                user_id=user.id,
+                token=new_refresh,
+                token_family=db_token.token_family,
+                device_name=db_token.device_name,
+                device_type=db_token.device_type,
+                browser=db_token.browser,
+                operating_system=db_token.operating_system,
+                ip_address=db_token.ip_address,
+                user_agent=db_token.user_agent,
+                location=db_token.location,
+                expires_at=datetime.now(UTC)
+                + timedelta(days=30),
+            )
+        )
+
+        db_token.replaced_by_token = new_refresh
+
+        db_token.last_used_at = datetime.now(UTC)
+
+        self._commit()
+
+        return {
+
+            "success": True,
+
+            "message": "Token refreshed.",
+
+            "tokens": {
+
+                "access_token": new_access,
+
+                "refresh_token": new_refresh,
+
+                "expires_in": 900,
+            },
+        }
+
+    except JWTError:
+
+        self._rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token.",
+        )
+
+    except HTTPException:
+
+        self._rollback()
+
+        raise
+
+    except Exception as exc:
+
+        self._rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
         
-            # ==========================================================
-    # Logout Current Device
-    # ==========================================================
         # ==========================================================
-        # Refresh Access Token
+# Logout Current Device
+# ==========================================================
+
 def logout(
     self,
     refresh_token: str,

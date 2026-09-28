@@ -5,8 +5,8 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { ShieldCheck, Mail, Lock, Building2, ArrowRight, AlertCircle } from "lucide-react";
-import { useAuth, UserRole } from "@/components/AuthProvider";
+import { ShieldCheck, Mail, Lock, Building2, Globe, ArrowRight, AlertCircle } from "lucide-react";
+import { useAuth } from "@/components/AuthProvider";
 import { toast } from "sonner";
 
 export function AuthScreen() {
@@ -24,7 +24,8 @@ export function AuthScreen() {
   const [signupPassword, setSignupPassword] = useState("");
   const [signupConfirmPassword, setSignupConfirmPassword] = useState("");
   const [signupCompany, setSignupCompany] = useState("");
-  const [signupRole, setSignupRole] = useState<UserRole>("client"); // default to client
+  const [signupWebsite, setSignupWebsite] = useState("");
+  const [signupRole, setSignupRole] = useState<"client" | "agency">("client");
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -55,10 +56,11 @@ export function AuthScreen() {
     if (submitting) return;
 
     setError("");
-    setSubmitting(true);
-    // Validation
+
+    // Validate before locking the submit button so validation failures do
+    // not leave the form stuck in a submitting state.
     if (!signupFirstName || !signupLastName || !signupEmail || !signupPassword || !signupConfirmPassword) {
-      setError("Please fill in all fields.");
+      setError("Please fill in all required fields.");
       return;
     }
     if (signupPassword.length < 12) {
@@ -69,6 +71,16 @@ export function AuthScreen() {
       setError("Passwords do not match.");
       return;
     }
+    if (!signupCompany.trim()) {
+      setError(signupRole === "agency" ? "Agency name is required." : "Business / client name is required.");
+      return;
+    }
+    if (signupRole === "client" && !signupWebsite.trim()) {
+      setError("Website is required for a single-client account.");
+      return;
+    }
+
+    setSubmitting(true);
     try {
       await signup({
         email: signupEmail,
@@ -76,7 +88,9 @@ export function AuthScreen() {
         confirm_password: signupConfirmPassword,
         first_name: signupFirstName,
         last_name: signupLastName,
-        company_name: signupCompany || undefined,
+        account_type: signupRole,
+        company_name: signupCompany.trim() || undefined,
+        website: signupWebsite.trim() || undefined,
       });
       toast.success("Account created successfully!");
     } catch (err: any) {
@@ -214,12 +228,34 @@ export function AuthScreen() {
                       </div>
                     </div>
                     <div className="space-y-2">
-                      <Label htmlFor="company">Company Name</Label>
+                      <Label htmlFor="account-type">Account Type</Label>
+                      <Select value={signupRole} onValueChange={(v) => setSignupRole(v as "client" | "agency")}>
+                        <SelectTrigger id="account-type"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="client">Single Client / Business Owner</SelectItem>
+                          <SelectItem value="agency">Agency</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label htmlFor="company">{signupRole === "agency" ? "Agency Name" : "Business / Client Name"}</Label>
                       <div className="relative">
                         <Building2 className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-slate-400" />
-                        <Input id="company" placeholder="Acme Corp" className="pl-9" value={signupCompany} onChange={(e) => setSignupCompany(e.target.value)} />
+                        <Input id="company" placeholder={signupRole === "agency" ? "Acme SEO Agency" : "My Business"} className="pl-9" value={signupCompany} onChange={(e) => setSignupCompany(e.target.value)} required />
                       </div>
                     </div>
+
+                    {signupRole === "client" && (
+                      <div className="space-y-2">
+                        <Label htmlFor="signup-website">Website</Label>
+                        <div className="relative">
+                          <Globe className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-slate-400" />
+                          <Input type="url" id="signup-website" placeholder="https://example.com" className="pl-9" value={signupWebsite} onChange={(e) => setSignupWebsite(e.target.value)} required />
+                        </div>
+                        <p className="text-xs text-slate-500">Your account will be linked to exactly one client workspace.</p>
+                      </div>
+                    )}
                     <div className="space-y-2">
                       <Label htmlFor="signup-password">Password</Label>
                       <div className="relative">
@@ -234,20 +270,6 @@ export function AuthScreen() {
                         <Input type="password" id="signup-confirm-password" placeholder="••••••••" className="pl-9" value={signupConfirmPassword} onChange={(e) => setSignupConfirmPassword(e.target.value)} required />
                       </div>
                     </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="role">Account Type</Label>
-                      <Select value={signupRole} onValueChange={(v) => setSignupRole(v as UserRole)}>
-                        <SelectTrigger id="role"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="super_admin">Super Admin</SelectItem>
-                          <SelectItem value="agency_admin">Agency Admin</SelectItem>
-                          <SelectItem value="manager">Manager</SelectItem>
-                          <SelectItem value="seo_specialist">SEO Specialist</SelectItem>
-                          <SelectItem value="client">Client</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-
                     {error && (
                       <div className="flex items-center gap-2 p-3 rounded-lg text-sm text-rose-700 bg-rose-50 dark:bg-rose-500/10 dark:text-rose-400">
                         <AlertCircle className="size-4" /> {error}

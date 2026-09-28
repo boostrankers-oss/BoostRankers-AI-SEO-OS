@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
@@ -29,7 +31,11 @@ class RegisterRequest(BaseModel):
     )
 
     confirm_password: str
+    # Public signup supports only these two account modes. Roles are assigned server-side.
+    account_type: Literal["client", "agency"] = "client"
     company_name: str | None = None
+    website: str | None = None
+    industry: str | None = Field(default=None, max_length=150)
 
     @field_validator("password")
     @classmethod

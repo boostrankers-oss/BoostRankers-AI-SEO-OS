@@ -3,7 +3,9 @@ from __future__ import annotations
 from fastapi import (
     APIRouter,
     Depends,
+    HTTPException,
     Query,
+    status,
 )
 from sqlalchemy.orm import Session
 
@@ -20,8 +22,10 @@ from schemas.client import (
 
 from services import client_service
 
-from api.deps.current_user import get_current_company
+from api.deps.current_user import get_current_company, get_current_user
 from models.company import Company
+from models.user import User
+from models.client import Client
 
 router = APIRouter(
     prefix="/clients",
@@ -39,6 +43,28 @@ def get_company_id(
     Resolve the company from the authenticated JWT user.
     """
     return str(company.id)
+
+
+def require_client_management_access(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Allow agency staff to manage multiple clients.
+
+    A single-client owner can use the application and work on their own
+    client record, but cannot create/archive/delete additional clients.
+    """
+    role = str(current_user.role or "").strip().lower()
+    if role == "client":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Single-client accounts can manage only their own client workspace and cannot add another client.",
+        )
+    if role not in {"super_admin", "agency_admin", "manager"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to manage clients.",
+        )
+    return current_user
 
 
 # ============================================================
@@ -61,9 +87,10 @@ def get_clients(
     ),
     db: Session = Depends(get_db),
     company_id: str = Depends(get_company_id),
+    current_user: User = Depends(get_current_user),
 ):
 
-    return client_service.get_clients(
+    clients = client_service.get_clients(
         db=db,
         company_id=company_id,
         skip=skip,
@@ -172,6 +199,7 @@ def create_client(
     client: ClientCreate,
     db: Session = Depends(get_db),
     company_id: str = Depends(get_company_id),
+    _manager: User = Depends(require_client_management_access),
 ):
     """
     Create a new client.
@@ -246,6 +274,7 @@ def archive_client(
     client_id: str,
     db: Session = Depends(get_db),
     company_id: str = Depends(get_company_id),
+    _manager: User = Depends(require_client_management_access),
 ):
     """
     Archive a client (soft delete).
@@ -270,6 +299,7 @@ def restore_client(
     client_id: str,
     db: Session = Depends(get_db),
     company_id: str = Depends(get_company_id),
+    _manager: User = Depends(require_client_management_access),
 ):
     """
     Restore an archived client.
@@ -296,6 +326,7 @@ def delete_client(
     ),
     db: Session = Depends(get_db),
     company_id: str = Depends(get_company_id),
+    _manager: User = Depends(require_client_management_access),
 ):
     """
     Delete a client.
@@ -332,6 +363,7 @@ def bulk_archive_clients(
     client_ids: list[str],
     db: Session = Depends(get_db),
     company_id: str = Depends(get_company_id),
+    _manager: User = Depends(require_client_management_access),
 ):
     """
     Archive multiple clients.
@@ -355,6 +387,7 @@ def bulk_restore_clients(
     client_ids: list[str],
     db: Session = Depends(get_db),
     company_id: str = Depends(get_company_id),
+    _manager: User = Depends(require_client_management_access),
 ):
     """
     Restore multiple archived clients.
