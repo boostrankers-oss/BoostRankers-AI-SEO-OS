@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 
 import { AuthScreen } from "@/components/AuthScreen";
 import { ClientInvitation } from "@/components/ClientInvitation";
@@ -24,6 +24,7 @@ import { AuthProvider, useAuth } from "@/components/AuthProvider";
 import { ClaudeProvider } from "@/components/ClaudeProvider";
 import { AuditProvider } from "@/context/AuditContext";
 import AdminDashboard from "@/components/AdminDashboard";
+import Billing from "@/components/Billing";
 import { RankTracker } from "./components/RankTracker";
 import { KeywordConflicts } from "./components/KeywordConflicts";
 import { PagePostIndexing } from "./components/PagePostIndexing";
@@ -51,6 +52,7 @@ export type ViewKey =
   | "keywordconflicts"
   | "pagepostindexing"
   | "settings"
+  | "billing"
   | "admin";
 
 interface WorkspaceOption {
@@ -249,6 +251,9 @@ function MainApp() {
       case "settings":
         return <Settings />;
 
+      case "billing":
+        return <Billing />;
+
       case "admin":
         return <AdminDashboard />;
 
@@ -309,4 +314,11 @@ function App() {
 }
 
 export default App;
+
+
+
+
+
+
+
 

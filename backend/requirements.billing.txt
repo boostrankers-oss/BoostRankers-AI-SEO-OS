@@ -1,0 +1,2 @@
+# Required by the dynamic UPI QR generator
+qrcode[pil]>=8.2

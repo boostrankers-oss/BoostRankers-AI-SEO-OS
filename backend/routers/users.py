@@ -15,20 +15,7 @@ from models.user import User
 router = APIRouter()
 
 
-# ============================================================
-# Super Admin Authorization
-# ============================================================
-
-def require_super_admin(
-    current_user: User = Depends(get_current_user),
-) -> User:
-    if not current_user.is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Super Admin access required.",
-        )
-
-    return current_user
+from api.deps.current_user import get_current_user, require_super_admin
 
 
 # ============================================================

@@ -16,6 +16,7 @@ from fastapi import (
 from sqlalchemy.orm import Session
 
 from database.session import get_db
+from api.deps.current_user import require_super_admin
 
 from schemas.company import (
     CompanyCreate,
@@ -32,9 +33,10 @@ from services.company_service import CompanyService
 router = APIRouter(
     prefix="/companies",
     tags=["Companies"],
+    dependencies=[Depends(require_super_admin)],
 )
 
-    @router.post(
+@router.post(
     "",
     response_model=CompanyResponse,
     status_code=status.HTTP_201_CREATED,
@@ -57,7 +59,7 @@ def create_company(
         detail=str(exc),
         )
         
-    @router.get(
+@router.get(
     "/{company_id}",
     response_model=CompanyResponse,
 )
@@ -79,7 +81,7 @@ def get_company(
 
     return company
     
-    @router.get(
+@router.get(
     "",
     response_model=CompanyListResponse,
 )
@@ -163,7 +165,7 @@ def list_companies(
 
     )
     
-    @router.put(
+@router.put(
     "/{company_id}",
     response_model=CompanyResponse,
 )
@@ -193,7 +195,7 @@ def update_company(
             detail=str(exc),
         )
         
-    @router.delete(
+@router.delete(
     "/{company_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
@@ -212,7 +214,7 @@ def delete_company(
             detail="Company not found.",
         )
         
-    @router.patch(
+@router.patch(
     "/{company_id}/archive",
     response_model=CompanyResponse,
 )
@@ -233,7 +235,7 @@ def archive_company(
             detail=str(exc),
         )
         
-    @router.patch(
+@router.patch(
     "/{company_id}/restore",
     response_model=CompanyResponse,
 )
@@ -255,7 +257,7 @@ def restore_company(
             detail=str(exc),
         )
         
-    @router.get(
+@router.get(
     "/dashboard",
     response_model=CompanyDashboard,
 )
@@ -269,7 +271,7 @@ def dashboard(
         **service.dashboard_statistics()
     )
     
-    @router.post("/bulk/archive")
+@router.post("/bulk/archive")
 def bulk_archive(
     payload: CompanyBulkAction,
     db: Session = Depends(get_db),
@@ -286,7 +288,7 @@ def bulk_archive(
         "affected": count,
     }
     
-    @router.post("/bulk/restore")
+@router.post("/bulk/restore")
 def bulk_restore(
     payload: CompanyBulkAction,
     db: Session = Depends(get_db),
@@ -303,7 +305,7 @@ def bulk_restore(
         "affected": count,
     }
     
-    @router.post("/bulk/delete")
+@router.post("/bulk/delete")
 def bulk_delete(
     payload: CompanyBulkAction,
     db: Session = Depends(get_db),
@@ -320,7 +322,7 @@ def bulk_delete(
         "affected": count,
     }
     
-    @router.get("/export")
+@router.get("/export")
 def export_companies(
     db: Session = Depends(get_db),
 ):
@@ -329,7 +331,7 @@ def export_companies(
 
     return service.export_companies()
     
-    @router.get("/health")
+@router.get("/health")
 def health(
     db: Session = Depends(get_db),
 ):

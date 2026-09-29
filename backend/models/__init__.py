@@ -1,4 +1,5 @@
-from .base import Base, BaseModel
+﻿from .base import Base, BaseModel
+
 from .company import Company
 from .user import User
 from .role import Role
@@ -8,9 +9,11 @@ from .refresh_token import RefreshToken
 from .audit_log import AuditLog
 from .client import Client
 from .audit import Audit
-from .report import Report  # <-- add this line
+from .report import Report
 from .competitor import Competitor
 from .content_plan import ContentPlan
+from .internal_linking import InternalLinkingSuggestion
+from .backlink import Backlink
 
 __all__ = [
     "Base",
@@ -24,6 +27,9 @@ __all__ = [
     "AuditLog",
     "Client",
     "Audit",
-    "Report",  # <-- add this
+    "Report",
+    "Competitor",
     "ContentPlan",
+    "InternalLinkingSuggestion",
+    "Backlink",
 ]

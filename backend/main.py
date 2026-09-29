@@ -1,4 +1,4 @@
-import os
+﻿import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,6 +19,11 @@ load_dotenv(ENV_FILE)
 # ============================================================
 
 from routers import admin_account_management
+from routers.billing import (
+    router as billing_router,
+    admin_router as billing_admin_router,
+)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database.database import engine
@@ -30,7 +35,6 @@ from page_post_indexing import (
     ensure_page_post_indexing_tables,
     page_post_indexing_automation_loop,
 )
-
 
 from routers import (
     users,
@@ -51,6 +55,8 @@ from routers.ai_settings import router as ai_settings_router
 from routers.google_integration import router as google_integration
 from content_automation import router as content_automation_router
 from ai_search_optimization import router as ai_search_optimization_router
+from routers.companies import router as companies_router
+
 
 # ============================================================
 # Validate required environment
@@ -68,8 +74,6 @@ if not DATABASE_URL:
 # ============================================================
 # Create database tables
 # ============================================================
-
-
 
 
 # ============================================================
@@ -122,6 +126,12 @@ app.include_router(
     users,
     prefix="/api/users",
     tags=["Users"],
+)
+
+app.include_router(
+    companies_router,
+    prefix="/api",
+    tags=["Companies"],
 )
 
 app.include_router(
@@ -206,24 +216,48 @@ app.include_router(
     ai_search_optimization_router,
     tags=["AI Search Optimization"],
 )
+
 app.include_router(
     rank_tracking_router,
     tags=["Rank Tracking"],
 )
+
 app.include_router(
     keyword_conflicts_router,
     tags=["Keyword Conflicts"],
 )
+
 app.include_router(
     page_post_indexing_router,
     tags=["Page & Post Indexing"],
 )
+
 app.include_router(
     admin_account_management.router,
     prefix="/api",
     tags=["Super Admin Account Management"],
 )
 
+# ============================================================
+# Billing
+# ============================================================
+
+app.include_router(
+    billing_router,
+    prefix="/api",
+    tags=["Billing"],
+)
+
+app.include_router(
+    billing_admin_router,
+    prefix="/api",
+    tags=["Super Admin Billing"],
+)
+
+
+# ============================================================
+# Startup
+# ============================================================
 
 @app.on_event("startup")
 def ensure_content_plan_table():
@@ -240,6 +274,7 @@ def ensure_content_plan_table():
         "on",
     }:
         import asyncio
+
         app.state.page_post_indexing_task = asyncio.create_task(
             page_post_indexing_automation_loop()
         )
