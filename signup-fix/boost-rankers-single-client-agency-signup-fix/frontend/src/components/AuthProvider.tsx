@@ -21,9 +21,9 @@ export interface User {
   last_name: string;
   role: UserRole;
   company_id: string | null;
-  is_verified: boolean;
   client_id?: string | null;
   account_type?: "client" | "agency";
+  is_verified: boolean;
 }
 
 interface AuthTokens {
@@ -46,8 +46,8 @@ interface AuthContextType {
     confirm_password: string;
     first_name: string;
     last_name: string;
+    account_type: "client" | "agency";
     company_name?: string;
-    account_type?: "client" | "agency";
     website?: string;
     industry?: string;
   }) => Promise<void>;
@@ -58,7 +58,6 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 function saveSession(user: User, tokens: AuthTokens): void {
-  localStorage.removeItem("boost_workspace_client_id");
   localStorage.setItem("access_token", tokens.access_token);
   localStorage.setItem("refresh_token", tokens.refresh_token);
   localStorage.setItem("boost_user", JSON.stringify(user));
@@ -104,35 +103,27 @@ export function AuthProvider({
 
       try {
         const currentUser = await api.get<User>("/api/auth/me");
-        const cached = localStorage.getItem("boost_user");
-        const cachedUser = cached ? (JSON.parse(cached) as User) : null;
-
-        const hydratedUser: User = {
-          ...currentUser,
-          client_id: currentUser.client_id ?? cachedUser?.client_id ?? null,
-          account_type:
-            currentUser.account_type ??
-            cachedUser?.account_type ??
-            (currentUser.role === "client" ? "client" : "agency"),
-        };
 
         if (mounted) {
-          setUser(hydratedUser);
+          setUser(currentUser);
           localStorage.setItem(
             "boost_user",
-            JSON.stringify(hydratedUser)
+            JSON.stringify(currentUser)
           );
         }
-      } catch (error) {
-        console.warn(
-          "Session restoration failed. Clearing local session.",
-          error
-        );
+      } catch (error: any) {
+        const status = error?.status;
 
-        clearSession();
+        console.warn("Session restoration request failed:", error);
 
-        if (mounted) {
-          setUser(null);
+        // Keep the locally restored session during temporary network/server
+        // failures. The API client clears it only when the refresh token is
+        // genuinely rejected/expired.
+        if (status === 401 || status === 403) {
+          clearSession();
+          if (mounted) {
+            setUser(null);
+          }
         }
       } finally {
         if (mounted) {
@@ -198,8 +189,8 @@ export function AuthProvider({
     confirm_password: string;
     first_name: string;
     last_name: string;
+    account_type: "client" | "agency";
     company_name?: string;
-    account_type?: "client" | "agency";
     website?: string;
     industry?: string;
   }): Promise<void> => {

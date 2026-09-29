@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
@@ -22,13 +24,18 @@ class RegisterRequest(BaseModel):
     last_name: str = Field(..., min_length=2, max_length=100)
     email: EmailStr
 
-    password: str = Field(..., min_length=12, max_length=72)
+    password: str = Field(
+        ...,
+        min_length=12,
+        max_length=72,
+    )
 
     confirm_password: str
-    account_type: str = Field(default="client", pattern="^(client|agency)$")
+    # Public signup supports only these two account modes. Roles are assigned server-side.
+    account_type: Literal["client", "agency"] = "client"
     company_name: str | None = None
     website: str | None = None
-    industry: str | None = None
+    industry: str | None = Field(default=None, max_length=150)
 
     @field_validator("password")
     @classmethod
@@ -39,16 +46,18 @@ class RegisterRequest(BaseModel):
                 "Password must be 72 bytes or fewer. "
                 "Please choose a shorter password."
             )
+
         return value
 
     @field_validator("confirm_password")
     @classmethod
     def passwords_match(cls, value: str, info):
         password = info.data.get("password")
+
         if password and value != password:
             raise ValueError("Passwords do not match.")
-        return value
 
+        return value
 
 # ==========================================================
 # Forgot Password

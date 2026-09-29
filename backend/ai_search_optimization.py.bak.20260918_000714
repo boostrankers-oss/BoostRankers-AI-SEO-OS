@@ -1,0 +1,1035 @@
+﻿from __future__ import annotations
+
+import asyncio
+import ipaddress
+import json
+import logging
+import os
+import re
+import socket
+from html import unescape
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
+import httpx
+from anthropic import AsyncAnthropic
+from bs4 import BeautifulSoup
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field, HttpUrl
+
+from api.deps.current_user import get_current_user
+from config import settings
+from database.database import get_db
+from models.company import Company
+from models.user import User
+from services.secret_service import decrypt_secret
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/api/ai-search-optimization",
+    tags=["AI Search Optimization"],
+)
+
+HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=25.0, write=15.0, pool=10.0)
+WP_TIMEOUT = httpx.Timeout(45.0, connect=15.0, read=35.0, write=15.0, pool=10.0)
+USER_AGENT = "BoostRankers-AISearchOptimizer/1.0"
+MAX_CONTENT_CHARS = 30000
+MAX_INTERNAL_LINKS = 6
+GENERIC_ANCHORS = {"click here", "read more", "learn more", "here", "more", "this article"}
+
+
+class AnalyzeRequest(BaseModel):
+    url: HttpUrl
+    focus_keyword: str = Field(default="", max_length=500)
+    used_focus_keywords: list[str] = Field(default_factory=list, max_length=500)
+
+
+class RewriteRequest(BaseModel):
+    url: HttpUrl
+    focus_keyword: str = Field(min_length=1, max_length=500)
+    title: str = Field(min_length=3, max_length=500)
+    content_html: str = Field(min_length=100, max_length=120000)
+    meta_title: str = Field(default="", max_length=500)
+    meta_description: str = Field(default="", max_length=1000)
+    analysis: dict[str, Any] = Field(default_factory=dict)
+    internal_link_candidates: list[dict[str, str]] = Field(default_factory=list, max_length=100)
+
+
+class WordPressCredentialsRequest(BaseModel):
+    wordpress_site: HttpUrl
+    wordpress_username: str = Field(min_length=1, max_length=255)
+    wordpress_application_password: str = Field(min_length=1, max_length=255)
+
+
+class WordPressApplyRequest(WordPressCredentialsRequest):
+    post_id: int = Field(ge=1)
+    title: str = Field(min_length=3, max_length=500)
+    content_html: str = Field(min_length=100, max_length=120000)
+    meta_title: str = Field(min_length=1, max_length=500)
+    meta_description: str = Field(min_length=1, max_length=1000)
+    focus_keyphrase: str = Field(min_length=1, max_length=500)
+    status: str = Field(default="draft", pattern="^(draft|publish)$")
+
+
+def _require_company(user: User) -> str:
+    company_id = getattr(user, "company_id", None)
+    if not company_id:
+        raise HTTPException(status_code=403, detail="Your account is not attached to a company.")
+    return str(company_id)
+
+
+def _clean_url(value: str) -> str:
+    parsed = urlparse(str(value).strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Enter a valid HTTP/HTTPS URL.")
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}{('?' + parsed.query) if parsed.query else ''}"
+
+
+def _reject_private_target(url: str) -> None:
+    """Prevent the public-page analyzer from becoming an SSRF primitive."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").strip().lower()
+    if host in {"localhost", "localhost.localdomain"} or not host:
+        raise HTTPException(status_code=400, detail="The analyzer accepts public website URLs only.")
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+    except socket.gaierror as exc:
+        raise HTTPException(status_code=400, detail="The website hostname could not be resolved.") from exc
+    for raw in addresses:
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            raise HTTPException(status_code=400, detail="The analyzer accepts public website URLs only.")
+
+
+def _strip_html(value: str | None) -> str:
+    if not value:
+        return ""
+    soup = BeautifulSoup(value, "html.parser")
+    for tag in soup(["script", "style", "noscript", "template", "svg"]):
+        tag.decompose()
+    return re.sub(r"\s+", " ", unescape(soup.get_text(" ", strip=True))).strip()
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w'-]+\b", text or ""))
+
+
+def _keyword_count(text: str, keyword: str) -> int:
+    if not keyword.strip():
+        return 0
+    return len(re.findall(re.escape(keyword.strip()), text or "", flags=re.IGNORECASE))
+
+
+def _safe_excerpt(text: str, max_chars: int = 7000) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()[:max_chars]
+
+
+def _normalize_phrase(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (value or "").lower())).strip()
+
+
+def _focus_candidates(title: str, content: str, used: set[str]) -> list[str]:
+    """Build deterministic title/content-derived keyword candidates without inventing topics."""
+    stop = {
+        "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "from",
+        "how", "what", "why", "when", "where", "who", "which", "your", "our", "this", "that",
+        "guide", "best", "ultimate", "complete", "tips", "checklist", "services", "service",
+    }
+    words = re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?", title.lower())
+    meaningful = [w for w in words if len(w) > 2 and w not in stop]
+    content_norm = _normalize_phrase(content)
+    candidates: list[tuple[float, str]] = []
+    for n in (4, 3, 2):
+        for i in range(max(0, len(meaningful) - n + 1)):
+            phrase = " ".join(meaningful[i:i+n])
+            norm = _normalize_phrase(phrase)
+            if not norm or norm in used or len(norm) < 5:
+                continue
+            count = content_norm.count(norm)
+            score = (count * 10) + n + (2 if i == 0 else 0)
+            candidates.append((score, phrase))
+    for n in (3, 2, 1):
+        for i in range(max(0, len(meaningful) - n + 1)):
+            phrase = " ".join(meaningful[i:i+n])
+            norm = _normalize_phrase(phrase)
+            if norm and norm not in used and len(norm) >= 5:
+                candidates.append((content_norm.count(norm) * 10 + n, phrase))
+    candidates.sort(key=lambda item: (-item[0], len(item[1])))
+    return [phrase for _, phrase in candidates]
+
+
+def _choose_focus_keyword(title: str, content: str, requested: str, used_keywords: list[str]) -> tuple[str, bool]:
+    used = {_normalize_phrase(x) for x in used_keywords if _normalize_phrase(x)}
+    requested = re.sub(r"\s+", " ", requested or "").strip()
+    if requested and _normalize_phrase(requested) not in used:
+        return requested, False
+    for candidate in _focus_candidates(title, content, used):
+        return candidate, bool(requested)
+    fallback = " ".join(re.findall(r"[A-Za-z0-9]+", title)[:4]).strip() or "primary topic"
+    return fallback, bool(requested and _normalize_phrase(requested) in used)
+
+
+def _canonical_url(value: str, base: str | None = None) -> str:
+    absolute = urljoin(base or "", str(value or "").strip())
+    parsed = urlparse(absolute)
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path.rstrip('/') or '/'}"
+
+
+def _sanitize_internal_links(html: str, source_url: str, candidates: list[dict[str, str]]) -> tuple[str, int, list[str]]:
+    """Keep only links to verified WordPress candidates on the same site."""
+    if not html or not candidates:
+        return html, 0, []
+    source_key = _canonical_url(source_url)
+    allowed: dict[str, dict[str, str]] = {}
+    for candidate in candidates:
+        target = str(candidate.get("url") or "").strip()
+        title = str(candidate.get("title") or "").strip()
+        if not target or not title:
+            continue
+        key = _canonical_url(target, source_url)
+        if key != source_key:
+            allowed[key] = {"url": urljoin(source_url, target), "title": title}
+    soup = BeautifulSoup(html, "html.parser")
+    applied = 0
+    targets: list[str] = []
+    for anchor in list(soup.find_all("a", href=True)):
+        href = str(anchor.get("href") or "").strip()
+        key = _canonical_url(href, source_url)
+        target = allowed.get(key)
+        anchor_text = _strip_html(anchor.get_text(" ", strip=True))
+        parsed_href = urlparse(urljoin(source_url, href))
+        source_host = urlparse(source_url).netloc.lower().lstrip("www.")
+        href_host = parsed_href.netloc.lower().lstrip("www.")
+        # Preserve external links; only sanitize AI-generated same-site links.
+        if href_host and href_host != source_host:
+            continue
+        if not target or not anchor_text or _normalize_phrase(anchor_text) in GENERIC_ANCHORS:
+            if not target:
+                anchor.unwrap()
+            else:
+                anchor.unwrap()
+            continue
+        if applied >= MAX_INTERNAL_LINKS:
+            anchor.unwrap()
+            continue
+        anchor["href"] = target["url"]
+        applied += 1
+        targets.append(target["title"])
+    return str(soup), applied, targets
+
+
+def _insert_contextual_links(html: str, source_url: str, candidates: list[dict[str, str]], already_linked: int) -> tuple[str, int, list[str]]:
+    """Safely add missing contextual links only when candidate wording occurs in a paragraph."""
+    if already_linked >= MAX_INTERNAL_LINKS or not candidates:
+        return html, 0, []
+    soup = BeautifulSoup(html, "html.parser")
+    source_key = _canonical_url(source_url)
+    added = 0
+    targets: list[str] = []
+    used_targets: set[str] = set()
+    paragraphs = [p for p in soup.find_all(["p", "li"]) if p.find_parent(["a", "h1", "h2", "h3", "h4", "h5", "h6", "code", "pre", "script", "style"]) is None]
+    for candidate in candidates:
+        if already_linked + added >= MAX_INTERNAL_LINKS:
+            break
+        url = str(candidate.get("url") or "").strip()
+        title = str(candidate.get("title") or "").strip()
+        if not url or not title:
+            continue
+        target_key = _canonical_url(url, source_url)
+        if target_key == source_key or target_key in used_targets:
+            continue
+        title_words = [w for w in re.findall(r"[A-Za-z0-9]+", title) if len(w) > 2]
+        phrases = [" ".join(title_words[:4]), " ".join(title_words[:3]), " ".join(title_words[:2])]
+        found = False
+        for para in paragraphs:
+            text = para.get_text(" ", strip=True)
+            phrase = next((x for x in phrases if x and re.search(r"\b" + re.escape(x) + r"\b", text, re.I)), None)
+            if not phrase:
+                continue
+            for node in list(para.find_all(string=re.compile(re.escape(phrase), re.I))):
+                parent = node.parent
+                if parent and parent.name in {"a", "strong", "em"}:
+                    continue
+                match = re.search(re.escape(phrase), str(node), re.I)
+                if not match:
+                    continue
+                before, matched, after = str(node)[:match.start()], str(node)[match.start():match.end()], str(node)[match.end():]
+                link = soup.new_tag("a", href=urljoin(source_url, url))
+                link.string = matched
+                replacement = []
+                if before:
+                    replacement.append(BeautifulSoup(before, "html.parser"))
+                replacement.append(link)
+                if after:
+                    replacement.append(BeautifulSoup(after, "html.parser"))
+                node.replace_with(*replacement)
+                added += 1
+                used_targets.add(target_key)
+                targets.append(title)
+                found = True
+                break
+            if found:
+                break
+    return str(soup), added, targets
+
+
+def _schema_type_names(value: Any) -> set[str]:
+    """Normalize JSON-LD @type values, including schema.org URLs and arrays."""
+    values = value if isinstance(value, list) else [value]
+    result: set[str] = set()
+    for item in values:
+        if not item:
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        # Handles:
+        #   LocalBusiness
+        #   https://schema.org/LocalBusiness
+        #   http://schema.org/LocalBusiness
+        normalized = text.rstrip("/").rsplit("/", 1)[-1].split(":", 1)[-1]
+        result.add(normalized)
+    return result
+
+
+def _extract_page(html: str, url: str, focus_keyword: str) -> dict[str, Any]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # JSON-LD MUST be extracted before script tags are removed.
+    schema_types: set[str] = set()
+    json_ld_detected = False
+    schema_parse_errors = 0
+    faq_schema_question_count = 0
+    local_business_schema_present = False
+
+    def visit_schema(item: Any) -> None:
+        nonlocal faq_schema_question_count, local_business_schema_present
+
+        if isinstance(item, list):
+            for child in item:
+                visit_schema(child)
+            return
+
+        if not isinstance(item, dict):
+            return
+
+        types = _schema_type_names(item.get("@type"))
+        schema_types.update(types)
+
+        if "LocalBusiness" in types or any(
+            name.endswith("LocalBusiness") for name in types
+        ):
+            local_business_schema_present = True
+
+        if "FAQPage" in types:
+            main_entity = item.get("mainEntity")
+            questions = main_entity if isinstance(main_entity, list) else [main_entity]
+            for question in questions:
+                if not isinstance(question, dict):
+                    continue
+                q_types = _schema_type_names(question.get("@type"))
+                if "Question" in q_types or question.get("name") or question.get("acceptedAnswer"):
+                    faq_schema_question_count += 1
+
+        graph = item.get("@graph")
+        if isinstance(graph, list):
+            for child in graph:
+                visit_schema(child)
+
+        # Some implementations nest structured entities under other object
+        # properties. Walk dict/list children without relying on a fixed graph shape.
+        for key, value in item.items():
+            if key in {"@context", "@type", "@id", "@graph", "mainEntity"}:
+                continue
+            if isinstance(value, (dict, list)):
+                visit_schema(value)
+
+    schema_scripts = soup.find_all(
+        "script",
+        attrs={"type": re.compile(r"^\s*application/ld\+json\s*$", re.I)},
+    )
+
+    for script in schema_scripts:
+        json_ld_detected = True
+        raw = script.string if script.string is not None else script.get_text()
+        raw = (raw or "").strip()
+
+        # Be tolerant of HTML comments occasionally wrapped around JSON-LD.
+        raw = re.sub(r"^\s*<!--\s*", "", raw)
+        raw = re.sub(r"\s*-->\s*$", "", raw)
+
+        if not raw:
+            schema_parse_errors += 1
+            continue
+
+        try:
+            visit_schema(json.loads(raw))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            schema_parse_errors += 1
+
+            # Do not pretend malformed JSON-LD is valid. However, preserve
+            # obvious @type evidence so the UI can explain a parser problem
+            # instead of incorrectly saying that no schema exists.
+            raw_types = re.findall(
+                r'"@type"\s*:\s*(?:"([^"]+)"|\[\s*([^\]]+)\])',
+                raw,
+                flags=re.I | re.S,
+            )
+            for single, array_body in raw_types:
+                if single:
+                    schema_types.update(_schema_type_names(single))
+                elif array_body:
+                    for value in re.findall(r'"([^"]+)"', array_body):
+                        schema_types.update(_schema_type_names(value))
+
+    # Remove executable/presentation-only elements only AFTER schema extraction.
+    for tag in soup(["script", "style", "noscript", "template", "svg"]):
+        tag.decompose()
+
+    title = soup.title.get_text(" ", strip=True).strip() if soup.title else ""
+    meta_tag = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
+    meta_description = str(meta_tag.get("content") or "").strip() if meta_tag else ""
+    canonical = ""
+    canonical_tag = soup.find("link", rel=lambda value: value and "canonical" in value)
+    if canonical_tag:
+        canonical = str(canonical_tag.get("href") or "").strip()
+
+    h1s = [
+        re.sub(r"\s+", " ", x.get_text(" ", strip=True)).strip()
+        for x in soup.find_all("h1")
+    ]
+    headings = [
+        {
+            "level": int(tag.name[1]),
+            "text": re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).strip(),
+        }
+        for tag in soup.find_all(["h2", "h3", "h4"])
+        if tag.get_text(" ", strip=True)
+    ]
+
+    main = soup.find("main") or soup.find("article") or soup.body or soup
+    content_html = str(main)[:120000]
+    text = _strip_html(content_html)
+    word_count = _word_count(text)
+    first_200 = " ".join(text.split()[:200])
+
+    host = urlparse(url).netloc.lower().lstrip("www.")
+    internal_links = 0
+    external_links = 0
+    for anchor in main.find_all("a", href=True):
+        href = str(anchor.get("href") or "").strip()
+        if href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        parsed = urlparse(href)
+        if parsed.netloc and parsed.netloc.lower().lstrip("www.") != host:
+            external_links += 1
+        else:
+            internal_links += 1
+
+    answer_headings = [
+        h["text"]
+        for h in headings
+        if re.search(r"\b(what|why|how|when|where|who|which|can|does|is|are)\b", h["text"], re.I)
+    ]
+
+    # Visible author/date signals plus JSON-LD author/date signals.
+    author_present = bool(
+        soup.find("meta", attrs={"name": re.compile("^author$", re.I)})
+        or soup.find(attrs={"rel": "author"})
+        or soup.find(class_=re.compile("author", re.I))
+    )
+    date_present = bool(
+        soup.find("time")
+        or soup.find("meta", attrs={"property": re.compile("article:(published|modified)_time", re.I)})
+    )
+
+    kw = focus_keyword.strip()
+    schema_type_count = len(schema_types)
+    title_score = 100 if 30 <= len(title) <= 65 else 70 if title else 0
+    meta_score = 100 if 120 <= len(meta_description) <= 165 else 70 if meta_description else 0
+    h1_score = 100 if len(h1s) == 1 else 50 if h1s else 0
+    content_score = min(100, round(word_count / 18))
+    answer_score = min(
+        100,
+        len(answer_headings) * 20
+        + (20 if re.search(r"\b(is|are|means|refers to|typically)\b", first_200, re.I) else 0),
+    )
+
+    # A valid LocalBusiness/FAQPage is stronger entity evidence than merely
+    # counting arbitrary JSON-LD types.
+    entity_score = min(
+        100,
+        schema_type_count * 15
+        + (25 if local_business_schema_present else 0)
+        + (15 if "FAQPage" in schema_types else 0)
+        + (15 if author_present else 0)
+        + (10 if date_present else 0),
+    )
+
+    checks = [
+        {"key": "title", "label": "Title tag", "score": title_score, "detail": f"{len(title)} characters" if title else "Missing title tag"},
+        {"key": "meta_description", "label": "Meta description", "score": meta_score, "detail": f"{len(meta_description)} characters" if meta_description else "Missing meta description"},
+        {"key": "h1", "label": "H1 structure", "score": h1_score, "detail": f"{len(h1s)} H1 tag(s) detected"},
+        {"key": "content_depth", "label": "Content depth", "score": content_score, "detail": f"{word_count:,} words"},
+        {"key": "answer_engine", "label": "Answer-engine structure", "score": answer_score, "detail": f"{len(answer_headings)} question-style heading(s)"},
+        {
+            "key": "entity",
+            "label": "Entity/trust signals",
+            "score": entity_score,
+            "detail": (
+                f"{schema_type_count} JSON-LD type(s), "
+                f"LocalBusiness={'yes' if local_business_schema_present else 'no'}, "
+                f"FAQPage={'yes' if 'FAQPage' in schema_types else 'no'}, "
+                f"author={'yes' if author_present else 'no'}, "
+                f"date={'yes' if date_present else 'no'}"
+            ),
+        },
+        {"key": "internal_links", "label": "Internal linking", "score": min(100, internal_links * 15), "detail": f"{internal_links} internal link(s)"},
+    ]
+
+    if kw:
+        checks.extend([
+            {
+                "key": "keyword_title",
+                "label": "Focus keyword in title",
+                "score": 100 if _keyword_count(title, kw) else 0,
+                "detail": "Present" if _keyword_count(title, kw) else "Missing",
+            },
+            {
+                "key": "keyword_h1",
+                "label": "Focus keyword in H1",
+                "score": 100 if any(_keyword_count(h, kw) for h in h1s) else 0,
+                "detail": "Present" if any(_keyword_count(h, kw) for h in h1s) else "Missing",
+            },
+            {
+                "key": "keyword_intro",
+                "label": "Focus keyword in introduction",
+                "score": 100 if _keyword_count(first_200, kw) else 0,
+                "detail": "Present" if _keyword_count(first_200, kw) else "Missing",
+            },
+        ])
+
+    overall = round(sum(int(x["score"]) for x in checks) / len(checks)) if checks else 0
+
+    return {
+        "url": url,
+        "title": title,
+        "meta_title": title,
+        "meta_description": meta_description,
+        "canonical": canonical,
+        "h1s": h1s,
+        "headings": headings[:80],
+        "word_count": word_count,
+        "schema_types": sorted(schema_types),
+        "json_ld_detected": json_ld_detected,
+        "schema_parse_errors": schema_parse_errors,
+        "faq_schema_present": "FAQPage" in schema_types,
+        "faq_schema_question_count": faq_schema_question_count,
+        "local_business_schema_present": local_business_schema_present,
+        "internal_links": internal_links,
+        "external_links": external_links,
+        "focus_keyword": kw,
+        "focus_keyword_occurrences": _keyword_count(text, kw),
+        "checks": checks,
+        "measured_score": overall,
+        "content_html": content_html,
+        "content_text_excerpt": _safe_excerpt(text),
+        "answer_headings": answer_headings[:20],
+        "author_present": author_present,
+        "date_present": date_present,
+    }
+
+async def _fetch_public_page(url: str) -> str:
+    _reject_private_target(url)
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}) as client:
+            response = await client.get(url)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch the post URL: {exc}") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"The post returned HTTP {response.status_code}.")
+    if "html" not in response.headers.get("content-type", "").lower():
+        raise HTTPException(status_code=415, detail="The supplied URL did not return an HTML page.")
+    return response.text[:300000]
+
+
+def _resolve_anthropic_api_key(db: Session, company_id: str) -> str:
+    """Resolve the Claude key using the existing AI Settings architecture.
+
+    Priority:
+    1. The current company's encrypted Anthropic key saved in Settings → AI.
+    2. The global ANTHROPIC_API_KEY configuration fallback.
+    """
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if company is not None:
+        encrypted_key = getattr(company, "anthropic_api_key_encrypted", None)
+        if encrypted_key:
+            try:
+                api_key = str(decrypt_secret(str(encrypted_key).strip()) or "").strip()
+            except Exception as exc:
+                logger.exception("Could not decrypt the company's Anthropic API key")
+                raise HTTPException(
+                    status_code=503,
+                    detail="The stored Claude API key could not be decrypted. Open Settings → AI and save the Anthropic API key again.",
+                ) from exc
+            if api_key:
+                return api_key
+
+    global_key = getattr(settings, "ANTHROPIC_API_KEY", None) or os.getenv("ANTHROPIC_API_KEY", "")
+    global_key = str(global_key or "").strip()
+    if global_key:
+        return global_key
+
+    raise HTTPException(
+        status_code=503,
+        detail="Claude API key is not configured. Open Settings → AI and configure your Anthropic API key.",
+    )
+
+
+def _anthropic_model() -> str:
+    """Use the same configured Anthropic model setting used by other AI modules."""
+    model = getattr(settings, "ANTHROPIC_MODEL", None) or os.getenv("AI_SEARCH_OPTIMIZATION_MODEL", "")
+    model = str(model or "").strip()
+    return model or "claude-sonnet-4-6"
+
+
+def _parse_json(text: str) -> dict[str, Any]:
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(cleaned[start:end + 1])
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=502, detail="Claude returned an invalid optimization response.") from exc
+        else:
+            raise HTTPException(status_code=502, detail="Claude returned an invalid optimization response.") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=502, detail="Claude returned an invalid optimization response.")
+    return parsed
+
+
+async def _claude_json(
+    system: str,
+    prompt: str,
+    api_key: str,
+    max_tokens: int = 7000,
+) -> dict[str, Any]:
+    client = AsyncAnthropic(api_key=api_key)
+    try:
+        response = await client.messages.create(
+            model=_anthropic_model(),
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as exc:
+        logger.exception("AI Search Optimization Claude request failed")
+        message = str(exc)
+        if "credit" in message.lower() or "billing" in message.lower():
+            raise HTTPException(status_code=402, detail="Anthropic billing is required for AI Search Optimization.") from exc
+        raise HTTPException(status_code=502, detail="Claude AI is currently unavailable. Please check the backend AI configuration.") from exc
+    return _parse_json("".join(block.text for block in response.content if hasattr(block, "text")))
+
+
+@router.post("/analyze")
+async def analyze_post(
+    data: AnalyzeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    company_id = _require_company(current_user)
+    api_key = _resolve_anthropic_api_key(db, company_id)
+    url = _clean_url(str(data.url))
+    html = await _fetch_public_page(url)
+    measured = _extract_page(html, url, data.focus_keyword)
+    used_keywords = [str(x).strip() for x in data.used_focus_keywords if str(x).strip()]
+    used_for_prompt = used_keywords[:250]
+    system = """You are a senior SEO and answer-engine optimization consultant. Analyze only supplied page evidence. Never claim that a page is cited by ChatGPT, Perplexity, Gemini, Google AI Overviews, or another AI engine unless evidence proves it. Never invent traffic, rankings, citations, entities, schema, competitor data, or search-volume data. Separate measured HTML facts from recommendations. If no focus keyword is supplied, recommend one concise topic phrase derived only from the page title/content. It must not duplicate any focus keyword in the supplied used-keyword list. Also suggest a compelling, accurate title that improves click appeal without clickbait. Return only JSON."""
+    prompt = f"""
+Page: {url}
+Focus keyword: {data.focus_keyword or '(automatic selection required)'}
+Already-used focus keywords (do not reuse): {json.dumps(used_for_prompt, ensure_ascii=False)}
+
+Measured evidence:
+{json.dumps({k: v for k, v in measured.items() if k not in {'content_html'}}, indent=2)}
+
+Content excerpt:
+{measured['content_text_excerpt']}
+
+Return exactly:
+{{
+  "ai_search_score": 0,
+  "content_quality": 0,
+  "answer_engine_readiness": 0,
+  "entity_readiness": 0,
+  "semantic_coverage": 0,
+  "summary": "",
+  "critical_issues": [],
+  "high_priority_actions": [],
+  "quick_wins": [],
+  "rewrite_recommended": false,
+  "rewrite_reason": "",
+  "suggested_focus_keyword": "",
+  "suggested_title": "",
+  "suggested_meta_title": "",
+  "suggested_meta_description": ""
+}}
+Scores are 0-100 and must be grounded in the evidence.
+"""
+    ai = await _claude_json(system, prompt, api_key=api_key, max_tokens=5000)
+    requested_keyword = data.focus_keyword.strip()
+    suggested_keyword = str(ai.get("suggested_focus_keyword") or "").strip()
+    chosen_keyword, conflict = _choose_focus_keyword(
+        measured["title"],
+        measured["content_text_excerpt"],
+        requested_keyword or suggested_keyword,
+        used_keywords,
+    )
+    measured = _extract_page(html, url, chosen_keyword)
+    ai["suggested_focus_keyword"] = chosen_keyword
+    ai["focus_keyword_auto_selected"] = not bool(requested_keyword) or conflict
+    ai["focus_keyword_conflict"] = conflict
+    if conflict:
+        ai.setdefault("quick_wins", []).insert(0, f"The requested focus keyword was already used elsewhere, so an unused title-derived keyword was selected automatically: {chosen_keyword}.")
+    for key in ("ai_search_score", "content_quality", "answer_engine_readiness", "entity_readiness", "semantic_coverage"):
+        try:
+            ai[key] = max(0, min(100, int(ai.get(key, measured["measured_score"]))))
+        except (TypeError, ValueError):
+            ai[key] = measured["measured_score"]
+    return {"success": True, "measured": measured, "ai_analysis": ai}
+
+
+def _select_single_internal_link_candidate(
+    source_url: str,
+    title: str,
+    content: str,
+    focus_keyword: str,
+    candidates: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Select at most one verified, non-self WordPress target for the rewritten article."""
+    source_key = _canonical_url(source_url)
+    source_terms = set(re.findall(r"[a-z0-9]+", _normalize_phrase(f"{title} {focus_keyword}")))
+    scored: list[tuple[int, dict[str, str]]] = []
+    for candidate in candidates:
+        url = str(candidate.get("url") or "").strip()
+        target_title = str(candidate.get("title") or "").strip()
+        if not url or not target_title:
+            continue
+        if _canonical_url(url, source_url) == source_key:
+            continue
+        target_terms = set(re.findall(r"[a-z0-9]+", _normalize_phrase(target_title)))
+        overlap = len(source_terms & target_terms)
+        score = overlap * 10
+        if str(candidate.get("type") or "").lower() == "page":
+            score += 3
+        if _normalize_phrase(focus_keyword) and _normalize_phrase(focus_keyword) in _normalize_phrase(target_title):
+            score += 8
+        scored.append((
+            score,
+            {
+                "id": str(candidate.get("id") or ""),
+                "type": str(candidate.get("type") or ""),
+                "title": target_title,
+                "url": url,
+            },
+        ))
+    if not scored:
+        return []
+    scored.sort(key=lambda item: (-item[0], item[1]["type"] != "page", len(item[1]["title"])))
+    return [scored[0][1]]
+
+
+@router.post("/rewrite")
+async def rewrite_post(
+    data: RewriteRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    company_id = _require_company(current_user)
+    api_key = _resolve_anthropic_api_key(db, company_id)
+    source_text = _strip_html(data.content_html)
+    source_word_count = _word_count(source_text)
+    if source_word_count < 100:
+        raise HTTPException(status_code=400, detail="The post needs at least 100 readable words before AI rewriting.")
+
+    chosen_keyword, keyword_conflict = _choose_focus_keyword(
+        data.title,
+        source_text,
+        data.focus_keyword,
+        [str(x).strip() for x in data.used_focus_keywords if str(x).strip()],
+    )
+    target_candidates = _select_single_internal_link_candidate(
+        str(data.url), data.title, source_text, chosen_keyword, data.internal_link_candidates
+    )
+
+    system = """You are a senior SEO content editor specializing in helpful content and AI search / answer-engine optimization. Rewrite the supplied article without inventing business facts, statistics, credentials, locations, prices, awards, reviews, or guarantees. Preserve supported facts and the article's real subject. Improve clarity, topical completeness, passage-level answers, entity clarity, headings, internal coherence, and natural focus-keyword usage. Do not keyword-stuff. The rewritten article must remain about the same existing blog topic, not become a new page or a different service. Return only valid JSON."""
+
+    prompt = f"""
+Original URL: {data.url}
+Current title: {data.title}
+Focus keyword selected for this rewrite: {chosen_keyword}
+Focus keyword conflict detected: {keyword_conflict}
+Current meta title: {data.meta_title}
+Current meta description: {data.meta_description}
+Source word count: {source_word_count}
+
+Existing analysis:
+{json.dumps(data.analysis, indent=2)}
+
+Original article:
+{source_text[:28000]}
+
+Exactly one verified internal-link target may be used:
+{json.dumps(target_candidates, ensure_ascii=False, indent=2)}
+
+Return ONLY:
+{{
+  "title": "",
+  "focus_keyword": "{chosen_keyword}",
+  "meta_title": "",
+  "meta_description": "",
+  "article_html": "",
+  "change_summary": [],
+  "focus_keyword_usage": {{"title": true, "first_paragraph": true, "headings": true, "body": true, "natural_usage": true}},
+  "internal_links_applied": 0
+}}
+
+Rules:
+- Use exactly this focus keyword: {chosen_keyword}. Do not switch to a different keyword.
+- This focus keyword must not duplicate any keyword in the supplied used-focus-keyword list.
+- Use the focus keyword naturally in the title/H1, opening section, one relevant subheading where natural, and body. Never force it into every heading or sentence.
+- Preserve the existing blog's search intent, subject, supported facts, service/topic scope, and useful details. Do not turn the article into a landing page or a different article.
+- Improve the title with a specific, benefit-led angle without clickbait.
+- Meta title should be concise, accurate, and contain the exact focus keyword naturally.
+- Meta description should be approximately 140-160 characters, accurate, and contain the exact focus keyword naturally.
+- Produce complete WordPress-compatible HTML using h2/h3, p, ul/ol, and strong where useful.
+- Do not shorten the article. Target at least {max(source_word_count, 1200)} readable words when the source supports expansion; preserve all useful existing information while adding genuinely useful explanations, examples, steps, FAQs, or decision guidance relevant to the existing topic.
+- Do not pad with generic filler. Every added section must answer a real user need related to the existing article.
+- Add one contextual internal link to the single verified target supplied above when the target is relevant. Use a natural descriptive anchor, never a generic anchor. Do not add any other new internal-link targets. Never invent URLs. Never link to the current page.
+- Keep the existing blog as the destination being optimized; do not create or imply a new page.
+- Do not output markdown.
+- Do not invent unsupported facts.
+"""
+
+    rewrite = await _claude_json(system, prompt, api_key=api_key, max_tokens=14000)
+    rewrite["focus_keyword"] = chosen_keyword
+    article_html = str(rewrite.get("article_html") or "")
+
+    if _word_count(_strip_html(article_html)) < max(100, int(source_word_count * 0.9)):
+        expand_prompt = f"""Expand the supplied rewritten WordPress article without changing its subject, facts, focus keyword, or title intent. The current article is too short. Return only JSON with the same fields.
+Focus keyword: {chosen_keyword}
+Minimum readable word count: {max(source_word_count, 1200)}
+Current article HTML:
+{article_html[:50000]}
+Add useful, specific sections, explanations, steps, FAQs, comparisons, or practical guidance only when supported by the existing article topic. Do not invent business facts. Keep exactly one internal-link target if already present.
+"""
+        expanded = await _claude_json(system, expand_prompt, api_key=api_key, max_tokens=14000)
+        expanded_html = str(expanded.get("article_html") or "")
+        if _word_count(_strip_html(expanded_html)) > _word_count(_strip_html(article_html)):
+            rewrite = expanded
+            rewrite["focus_keyword"] = chosen_keyword
+            article_html = expanded_html
+
+    article_html, verified_count, linked_targets = _sanitize_internal_links(
+        article_html, str(data.url), target_candidates
+    )
+    article_html, inserted_count, inserted_targets = _insert_contextual_links(
+        article_html, str(data.url), target_candidates, verified_count
+    )
+
+    rewrite["article_html"] = article_html
+    rewrite["focus_keyword"] = chosen_keyword
+    rewrite["internal_links_applied"] = min(1, verified_count + inserted_count)
+    rewrite["internal_link_targets"] = (linked_targets + inserted_targets)[:1]
+    rewrite["meta_title"] = str(
+        rewrite.get("meta_title") or rewrite.get("title") or data.title
+    ).strip()[:500]
+
+    meta_description = str(rewrite.get("meta_description") or "").strip()
+    if not meta_description:
+        meta_description = _safe_excerpt(_strip_html(article_html), 160)
+    rewrite["meta_description"] = meta_description[:1000]
+
+    if keyword_conflict:
+        rewrite.setdefault("change_summary", []).append(
+            f"Replaced the requested focus keyword with the unused keyword: {chosen_keyword}."
+        )
+    if rewrite["internal_links_applied"]:
+        rewrite.setdefault("change_summary", []).append(
+            "Added one contextual internal link to a verified WordPress target page/post."
+        )
+
+    return {"success": True, "rewrite": rewrite}
+
+
+@router.post("/wordpress/content")
+async def wordpress_content(data: WordPressCredentialsRequest, current_user: User = Depends(get_current_user)):
+    _require_company(current_user)
+    site = _clean_url(str(data.wordpress_site))
+    auth = (data.wordpress_username.strip(), data.wordpress_application_password.strip())
+
+    async with httpx.AsyncClient(timeout=WP_TIMEOUT, follow_redirects=True) as client:
+        me = await client.get(
+            f"{site}/wp-json/wp/v2/users/me",
+            params={"context": "edit"},
+            auth=auth,
+        )
+        if me.status_code >= 400:
+            raise HTTPException(
+                status_code=401,
+                detail="WordPress authentication failed. Use a WordPress Application Password.",
+            )
+
+        items: list[dict[str, Any]] = []
+        max_items = 1000
+
+        for content_type in ("posts", "pages"):
+            page_num = 1
+            while len(items) < max_items:
+                response = await client.get(
+                    f"{site}/wp-json/wp/v2/{content_type}",
+                    params={
+                        "per_page": 100,
+                        "page": page_num,
+                        "context": "edit",
+                        "orderby": "modified",
+                        "order": "desc",
+                        "_fields": "id,link,title,status,modified,content,excerpt",
+                    },
+                    auth=auth,
+                )
+                if response.status_code >= 400:
+                    break
+                try:
+                    rows = response.json()
+                except Exception:
+                    break
+                if not isinstance(rows, list) or not rows:
+                    break
+
+                for row in rows:
+                    title = str((row.get("title") or {}).get("rendered") or "").strip()
+                    if not title:
+                        continue
+                    items.append(
+                        {
+                            "id": int(row["id"]),
+                            "type": "post" if content_type == "posts" else "page",
+                            "title": title,
+                            "url": str(row.get("link") or ""),
+                            "status": str(row.get("status") or ""),
+                            "modified": str(row.get("modified") or ""),
+                            "content_html": str((row.get("content") or {}).get("rendered") or ""),
+                            "excerpt": str((row.get("excerpt") or {}).get("rendered") or ""),
+                            "focus_keyword": "",
+                        }
+                    )
+                    if len(items) >= max_items:
+                        break
+
+                total_pages = int(response.headers.get("X-WP-TotalPages", "0") or 0)
+                if len(rows) < 100 or (total_pages and page_num >= total_pages):
+                    break
+                page_num += 1
+
+        bridge = await client.get(
+            f"{site}/wp-json/boost-rankers/v1/seo-meta/status",
+            auth=auth,
+        )
+        if bridge.status_code == 200:
+            semaphore = asyncio.Semaphore(10)
+
+            async def load_focus(item: dict[str, Any]) -> None:
+                async with semaphore:
+                    try:
+                        meta = await client.get(
+                            f"{site}/wp-json/boost-rankers/v1/seo-meta/{int(item['id'])}",
+                            auth=auth,
+                        )
+                        if meta.status_code >= 400:
+                            return
+                        payload = meta.json()
+                        value = (
+                            payload.get("focus_keyword")
+                            or payload.get("focuskw")
+                            or payload.get("_yoast_wpseo_focuskw")
+                        )
+                        if isinstance(value, str):
+                            item["focus_keyword"] = " ".join(value.split())
+                    except Exception:
+                        return
+
+            await asyncio.gather(*(load_focus(item) for item in items))
+
+        return {"success": True, "items": items}
+
+
+@router.post("/wordpress/apply")
+async def apply_to_wordpress(data: WordPressApplyRequest, current_user: User = Depends(get_current_user)):
+    _require_company(current_user)
+    site = _clean_url(str(data.wordpress_site))
+    auth = (data.wordpress_username.strip(), data.wordpress_application_password.strip())
+    async with httpx.AsyncClient(timeout=WP_TIMEOUT, follow_redirects=True) as client:
+        me = await client.get(f"{site}/wp-json/wp/v2/users/me", params={"context": "edit"}, auth=auth)
+        if me.status_code >= 400:
+            raise HTTPException(status_code=401, detail="WordPress authentication failed. Use a WordPress Application Password.")
+
+        content_type = None
+        for candidate in ("posts", "pages"):
+            existing = await client.get(f"{site}/wp-json/wp/v2/{candidate}/{data.post_id}", params={"context": "edit"}, auth=auth)
+            if existing.status_code == 200:
+                content_type = candidate
+                break
+        if content_type is None:
+            raise HTTPException(status_code=404, detail=f"WordPress content ID {data.post_id} could not be loaded as a post or page.")
+
+        updated = await client.post(
+            f"{site}/wp-json/wp/v2/{content_type}/{data.post_id}",
+            json={"title": data.title, "content": data.content_html, "status": data.status},
+            auth=auth,
+        )
+        if updated.status_code >= 400:
+            try:
+                detail = updated.json().get("message", updated.text)
+            except Exception:
+                detail = updated.text
+            raise HTTPException(status_code=502, detail=f"WordPress rejected the optimized content: {detail}")
+
+        seo_applied = False
+        bridge = await client.get(f"{site}/wp-json/boost-rankers/v1/seo-meta/status", auth=auth)
+        if bridge.status_code == 200 and bridge.json().get("yoast_active"):
+            seo_response = await client.post(
+                f"{site}/wp-json/boost-rankers/v1/seo-meta/{data.post_id}",
+                json={"seo_title": data.meta_title[:500], "meta_description": data.meta_description[:1000], "focus_keyphrase": data.focus_keyphrase[:500]},
+                auth=auth,
+            )
+            if seo_response.status_code >= 400:
+                try:
+                    detail = seo_response.json().get("message", seo_response.text)
+                except Exception:
+                    detail = seo_response.text
+                raise HTTPException(status_code=502, detail=f"WordPress SEO metadata could not be saved: {detail}")
+            seo_applied = True
+
+        return {
+            "success": True,
+            "message": "Optimized content applied to WordPress.",
+            "wordpress": {
+                "content_type": content_type[:-1],
+                "post_id": data.post_id,
+                "url": updated.json().get("link"),
+                "seo_metadata_applied": seo_applied,
+                "status": data.status,
+            },
+        }
+

@@ -142,27 +142,6 @@ def get_current_user(
 
     return user
 
-def require_super_admin(
-    current_user: User = Depends(get_current_user),
-) -> User:
-    """
-    Require a platform-level Super Admin account.
-
-    Supports both existing Super Admin representations:
-    - is_superuser == True
-    - role == "super_admin"
-    """
-
-    role = str(getattr(current_user, "role", "") or "").strip().lower()
-    is_superuser = bool(getattr(current_user, "is_superuser", False))
-
-    if not is_superuser and role != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Super Admin access required.",
-        )
-
-    return current_user
 
 # ============================================================
 # CURRENT COMPANY

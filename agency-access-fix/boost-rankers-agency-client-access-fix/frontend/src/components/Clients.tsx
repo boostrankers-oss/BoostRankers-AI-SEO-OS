@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -15,19 +15,14 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { toast } from "sonner";
 import {
   Search,
+  Plus,
   Globe,
   MapPin,
   TrendingUp,
   Trash2,
-  UserPlus,
-  Link2,
-  Copy,
-  Power,
-  PowerOff,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
-import { useAuth } from "@/components/AuthProvider";
 
 const colorOptions = [
   "bg-gradient-to-br from-emerald-500 to-teal-600",
@@ -87,30 +82,18 @@ export function Clients() {
   const [clients, setClients] = useState<Client[]>([]);
   const [search, setSearch] = useState("");
   const [isAddOpen, setIsAddOpen] = useState(false);
+  const [isConnectOpen, setIsConnectOpen] = useState(false);
+  const [connectClientId, setConnectClientId] = useState("");
+  const [isConnecting, setIsConnecting] = useState(false);
   const [newClient, setNewClient] = useState(emptyClient);
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const { user } = useAuth();
-  const isAgency = ["agency_admin", "manager", "super_admin"].includes(user?.role || "");
-  const [inviteMode, setInviteMode] = useState<"new" | "existing" | null>(null);
-  const [inviteEmail, setInviteEmail] = useState("");
-  const [inviteContact, setInviteContact] = useState("");
-  const [inviteLink, setInviteLink] = useState<string | null>(null);
-  const [accessStatus, setAccessStatus] = useState<Record<string, string>>({});
 
   useEffect(() => {
     const fetchClients = async () => {
       try {
         const data = await api.get<Client[]>("/api/clients");
         setClients(data);
-        if (isAgency) {
-          try {
-            const access = await api.get<Array<{ client_id: string; status: string }>>("/api/clients/agency-access");
-            setAccessStatus(Object.fromEntries(access.map((item) => [item.client_id, item.status])));
-          } catch (accessError) {
-            console.warn("Agency access list unavailable:", accessError);
-          }
-        }
       } catch (error) {
         console.error("Failed to fetch clients:", error);
         toast.error("Could not load clients");
@@ -168,77 +151,6 @@ export function Clients() {
     }
   };
 
-  const copyInvitation = async (link: string) => {
-    try {
-      await navigator.clipboard.writeText(link);
-      toast.success("Invitation link copied");
-    } catch {
-      toast.error("Could not copy invitation link");
-    }
-  };
-
-  const handleInviteNew = async () => {
-    if (!newClient.business_name || !newClient.website || !inviteEmail) {
-      toast.error("Business name, website and client email are required");
-      return;
-    }
-    setIsSubmitting(true);
-    try {
-      const response = await api.post<any>("/api/clients/invitations", {
-        business_name: newClient.business_name,
-        website: newClient.website,
-        industry: newClient.industry || undefined,
-        email: inviteEmail,
-        contact_name: inviteContact || undefined,
-      });
-      setClients((current) => [response.client, ...current]);
-      setInviteLink(response.invitation.invitation_url);
-      setNewClient(emptyClient);
-      setInviteEmail("");
-      setInviteContact("");
-      setInviteMode(null);
-      toast.success("Client workspace created and invitation generated");
-    } catch (error: any) {
-      toast.error(error?.data?.detail || error?.message || "Could not create invitation");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const handleInviteExisting = async () => {
-    if (!inviteEmail) {
-      toast.error("Client email is required");
-      return;
-    }
-    setIsSubmitting(true);
-    try {
-      const response = await api.post<any>("/api/clients/invitations/existing", { email: inviteEmail });
-      setInviteLink(response.invitation.invitation_url);
-      setInviteEmail("");
-      setInviteMode(null);
-      toast.success("Invitation generated");
-    } catch (error: any) {
-      toast.error(error?.data?.detail || error?.message || "Could not invite existing client");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const changeAccess = async (id: string, action: "enable" | "disable" | "revoke") => {
-    try {
-      if (action === "revoke") {
-        await api.delete(`/api/clients/${id}/agency-access`);
-        setAccessStatus((current) => ({ ...current, [id]: "revoked" }));
-      } else {
-        await api.post(`/api/clients/${id}/agency-access/${action}`);
-        setAccessStatus((current) => ({ ...current, [id]: action === "enable" ? "active" : "disabled" }));
-      }
-      toast.success(action === "revoke" ? "Agency access revoked" : `Agency access ${action}d`);
-    } catch (error: any) {
-      toast.error(error?.data?.detail || error?.message || "Could not update agency access");
-    }
-  };
-
   const handleDelete = async (id: string) => {
     try {
       await api.delete(`/api/clients/${id}`);
@@ -268,10 +180,21 @@ export function Clients() {
             Manage your agency's client portfolio.
           </p>
         </div>
-        {isAgency && <div className="flex gap-2 flex-wrap">
-          <Button onClick={() => setInviteMode("existing")} variant="outline"><Link2 className="size-4" />Connect Existing</Button>
-          <Button onClick={() => setInviteMode("new")} className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20"><UserPlus className="size-4" />Add & Invite Client</Button>
-        </div>}
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            onClick={() => setIsConnectOpen(true)}
+          >
+            Connect Existing Client
+          </Button>
+          <Button
+            onClick={() => setIsAddOpen(true)}
+            className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-600/20"
+          >
+            <Plus className="size-4" />
+            Add Client
+          </Button>
+        </div>
       </header>
 
       <div className="relative max-w-md">
@@ -317,12 +240,12 @@ export function Clients() {
                       </p>
                     </div>
                   </div>
-                  {(!isAgency || client.company_id === user?.company_id) && <button
+                  <button
                     onClick={() => setDeleteId(client.id)}
                     className="p-1.5 rounded-md text-slate-400 hover:bg-rose-50 hover:text-rose-500 dark:hover:bg-rose-500/10 transition-colors"
                   >
                     <Trash2 className="size-4" />
-                  </button>}
+                  </button>
                 </div>
 
                 <div className="mt-4 space-y-2 text-sm">
@@ -335,16 +258,6 @@ export function Clients() {
                     {location}
                   </div>
                 </div>
-
-                {isAgency && client.company_id !== user?.company_id && (
-                  <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2">
-                    <span className={cn("text-xs font-medium px-2 py-1 rounded-full", accessStatus[client.id] === "active" ? "bg-emerald-50 text-emerald-700" : accessStatus[client.id] === "disabled" ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-600")}>{accessStatus[client.id] || "connected"}</span>
-                    <div className="flex gap-1">
-                      {accessStatus[client.id] === "disabled" ? <Button size="sm" variant="outline" onClick={() => changeAccess(client.id, "enable")}><Power className="size-3" /></Button> : <Button size="sm" variant="outline" onClick={() => changeAccess(client.id, "disable")}><PowerOff className="size-3" /></Button>}
-                      <Button size="sm" variant="outline" onClick={() => changeAccess(client.id, "revoke")} className="text-rose-600">Revoke</Button>
-                    </div>
-                  </div>
-                )}
 
                 <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
                   <div>
@@ -374,6 +287,50 @@ export function Clients() {
           </CardContent>
         </Card>
       )}
+
+      <Dialog open={isConnectOpen} onOpenChange={setIsConnectOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Connect Existing Client</DialogTitle>
+            <DialogDescription>
+              Connect an independently owned client account to this agency. Ownership and the client's separate login remain unchanged.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-4">
+            <Label htmlFor="existing-client-id">Client ID *</Label>
+            <Input
+              id="existing-client-id"
+              value={connectClientId}
+              onChange={(e) => setConnectClientId(e.target.value)}
+              placeholder="Paste the existing client ID"
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setIsConnectOpen(false)}>Cancel</Button>
+            <Button
+              disabled={isConnecting || !connectClientId.trim()}
+              onClick={async () => {
+                setIsConnecting(true);
+                try {
+                  const data = await api.post<Client>("/api/clients/access", { client_id: connectClientId.trim() });
+                  setClients((current) => current.some((item) => item.id === data.id) ? current : [data, ...current]);
+                  setConnectClientId("");
+                  setIsConnectOpen(false);
+                  toast.success("Existing client connected without changing ownership");
+                } catch (error: any) {
+                  const message = error?.data?.detail || error?.message || "Could not connect client.";
+                  toast.error(message);
+                } finally {
+                  setIsConnecting(false);
+                }
+              }}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white"
+            >
+              {isConnecting ? "Connecting..." : "Connect Client"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={isAddOpen} onOpenChange={setIsAddOpen}>
         <DialogContent>
@@ -450,36 +407,6 @@ export function Clients() {
               {isSubmitting ? "Adding..." : "Add Client"}
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={inviteMode !== null} onOpenChange={(open) => !open && setInviteMode(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{inviteMode === "new" ? "Add & Invite New Client" : "Connect Existing Client"}</DialogTitle>
-            <DialogDescription>{inviteMode === "new" ? "Create a private client workspace and invite the owner to activate access." : "Invite an existing Boost Rankers client without changing ownership."}</DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-4">
-            {inviteMode === "new" && <>
-              <div className="space-y-2"><Label>Business Name *</Label><Input value={newClient.business_name} onChange={e => setNewClient({ ...newClient, business_name: e.target.value })} /></div>
-              <div className="space-y-2"><Label>Website *</Label><Input value={newClient.website} onChange={e => setNewClient({ ...newClient, website: e.target.value })} placeholder="https://example.com" /></div>
-              <div className="space-y-2"><Label>Industry</Label><Input value={newClient.industry} onChange={e => setNewClient({ ...newClient, industry: e.target.value })} /></div>
-              <div className="space-y-2"><Label>Client / Owner Name</Label><Input value={inviteContact} onChange={e => setInviteContact(e.target.value)} /></div>
-            </>}
-            <div className="space-y-2"><Label>Client Email *</Label><Input type="email" value={inviteEmail} onChange={e => setInviteEmail(e.target.value)} placeholder="owner@example.com" /></div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setInviteMode(null)}>Cancel</Button>
-            <Button onClick={inviteMode === "new" ? handleInviteNew : handleInviteExisting} disabled={isSubmitting} className="bg-emerald-600 hover:bg-emerald-700 text-white">{isSubmitting ? "Creating..." : "Generate Invitation"}</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={inviteLink !== null} onOpenChange={(open) => !open && setInviteLink(null)}>
-        <DialogContent>
-          <DialogHeader><DialogTitle>Client Invitation Ready</DialogTitle><DialogDescription>Email delivery is not configured, so the secure invitation link is ready to copy and send to the client.</DialogDescription></DialogHeader>
-          <div className="flex gap-2"><Input value={inviteLink || ""} readOnly /><Button onClick={() => inviteLink && copyInvitation(inviteLink)}><Copy className="size-4" />Copy</Button></div>
-          <p className="text-xs text-slate-500">The link expires after 72 hours and can only be used once.</p>
         </DialogContent>
       </Dialog>
 
