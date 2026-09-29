@@ -740,24 +740,40 @@ async def _bulk_gsc_rows(
     return rows
 
 
-def _bulk_match_gsc_rows(
+def _normalize_gsc_key(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _build_bulk_gsc_index(
     rows: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    index: dict[str, list[dict[str, Any]]] = {}
+
+    for row in rows:
+        keys = row.get("keys") or []
+        query = _normalize_gsc_key(
+            keys[0] if keys else ""
+        )
+
+        if query:
+            index.setdefault(query, []).append(row)
+
+    return index
+
+
+def _bulk_match_gsc_index(
+    index: dict[str, list[dict[str, Any]]],
     *,
     keyword: str,
     target_url: str | None = None,
 ) -> dict[str, Any]:
-    """Convert bulk GSC query/page rows into one keyword result."""
 
-    normalized_keyword = " ".join(keyword.casefold().split())
-
-    matching = [
-        row
-        for row in rows
-        if normalized_keyword
-        == " ".join(
-            str((row.get("keys") or [""])[0] or "").casefold().split()
+    matching = list(
+        index.get(
+            _normalize_gsc_key(keyword),
+            [],
         )
-    ]
+    )
 
     if target_url:
         target_norm = target_url.rstrip("/").casefold()
@@ -782,12 +798,17 @@ def _bulk_match_gsc_rows(
             "impressions": 0.0,
             "ctr": 0.0,
             "matched_rows": 0,
-            "message": "No Search Console data found for this keyword in the selected period.",
+            "message": (
+                "No Search Console data found for this keyword "
+                "in the selected period."
+            ),
         }
 
     best = min(
         matching,
-        key=lambda item: float(item.get("position", math.inf)),
+        key=lambda item: float(
+            item.get("position", math.inf)
+        ),
     )
 
     total_clicks = sum(
@@ -821,7 +842,6 @@ def _bulk_match_gsc_rows(
             "result row(s)."
         ),
     }
-
 
 async def _refresh_keywords_bulk(
     db: Session,
@@ -880,14 +900,14 @@ async def _refresh_keywords_bulk(
         )
         groups.setdefault(key, []).append(row)
 
-    current_rows_by_group: dict[
+    current_index_by_group: dict[
         tuple[str, str],
-        list[dict[str, Any]],
+        dict[str, list[dict[str, Any]]],
     ] = {}
 
-    previous_rows_by_group: dict[
+    previous_index_by_group: dict[
         tuple[str, str],
-        list[dict[str, Any]],
+        dict[str, list[dict[str, Any]]],
     ] = {}
 
     errors: list[dict[str, str]] = []
@@ -896,7 +916,7 @@ async def _refresh_keywords_bulk(
         country, device = group_key
 
         try:
-            current_rows_by_group[group_key] = await _bulk_gsc_rows(
+            current_rows = await _bulk_gsc_rows(
                 connection,
                 db,
                 site_url=site_url,
@@ -906,7 +926,13 @@ async def _refresh_keywords_bulk(
                 device=device,
             )
 
-            previous_rows_by_group[group_key] = await _bulk_gsc_rows(
+            current_index_by_group[group_key] = (
+                _build_bulk_gsc_index(current_rows)
+            )
+
+            del current_rows
+
+            previous_rows = await _bulk_gsc_rows(
                 connection,
                 db,
                 site_url=site_url,
@@ -915,6 +941,12 @@ async def _refresh_keywords_bulk(
                 country=country,
                 device=device,
             )
+
+            previous_index_by_group[group_key] = (
+                _build_bulk_gsc_index(previous_rows)
+            )
+
+            del previous_rows
 
         except HTTPException as exc:
             message = str(exc.detail)
@@ -934,18 +966,18 @@ async def _refresh_keywords_bulk(
             (row.device or "all").strip().lower(),
         )
 
-        if group_key not in current_rows_by_group:
+        if group_key not in current_index_by_group:
             continue
 
         try:
-            current_data = _bulk_match_gsc_rows(
-                current_rows_by_group[group_key],
+            current_data = _bulk_match_gsc_index(
+                current_index_by_group[group_key],
                 keyword=row.keyword,
                 target_url=row.target_url,
             )
 
-            previous_data = _bulk_match_gsc_rows(
-                previous_rows_by_group.get(group_key, []),
+            previous_data = _bulk_match_gsc_index(
+                previous_index_by_group.get(group_key, {}),
                 keyword=row.keyword,
                 target_url=row.target_url,
             )
