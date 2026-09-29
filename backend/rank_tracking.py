@@ -101,7 +101,7 @@ class KeywordUpdate(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    keyword_ids: list[str] = Field(default_factory=list, max_length=100)
+    keyword_ids: list[str] = Field(default_factory=list, max_length=500)
     period: str = Field(default="daily", max_length=20)
     compare: str = Field(default="previous_period", max_length=30)
     custom_compare_start: date | None = None
@@ -670,24 +670,420 @@ def overview(
         "average_position": round(sum(positions) / len(positions), 2) if positions else None,
     }
 
+async def _bulk_gsc_rows(
+    connection: GoogleIntegration,
+    db: Session,
+    *,
+    site_url: str,
+    start_date: date,
+    end_date: date,
+    country: str,
+    device: str,
+) -> list[dict[str, Any]]:
+    """Fetch query/page GSC data for bulk rank synchronization."""
+
+    base: dict[str, Any] = {
+        "startDate": start_date.isoformat(),
+        "endDate": end_date.isoformat(),
+        "dimensions": ["query", "page"],
+        "rowLimit": 25000,
+        "dataState": "all",
+    }
+
+    filters: list[dict[str, str]] = []
+
+    country_values = _normalize_country(country)
+    device_value = _normalize_device(device)
+
+    if country_values:
+        filters.append({
+            "dimension": "country",
+            "operator": "equals",
+            "expression": country_values[0],
+        })
+
+    if device_value:
+        filters.append({
+            "dimension": "device",
+            "operator": "equals",
+            "expression": device_value,
+        })
+
+    if filters:
+        base["dimensionFilterGroups"] = [{"filters": filters}]
+
+    rows: list[dict[str, Any]] = []
+    start_row = 0
+
+    # Search Console supports a maximum rowLimit of 25,000.
+    # Continue paging until the returned page is smaller than the limit.
+    while True:
+        page_rows = await _gsc_request(
+            connection,
+            db,
+            site_url,
+            {**base, "startRow": start_row},
+        )
+
+        rows.extend(page_rows)
+
+        if len(page_rows) < 25000:
+            break
+
+        start_row += 25000
+
+        # Prevent an unexpectedly huge property from keeping one
+        # synchronization request alive indefinitely.
+        if start_row >= 100000:
+            break
+
+    return rows
+
+
+def _bulk_match_gsc_rows(
+    rows: list[dict[str, Any]],
+    *,
+    keyword: str,
+    target_url: str | None = None,
+) -> dict[str, Any]:
+    """Convert bulk GSC query/page rows into one keyword result."""
+
+    normalized_keyword = " ".join(keyword.casefold().split())
+
+    matching = [
+        row
+        for row in rows
+        if normalized_keyword
+        == " ".join(
+            str((row.get("keys") or [""])[0] or "").casefold().split()
+        )
+    ]
+
+    if target_url:
+        target_norm = target_url.rstrip("/").casefold()
+
+        target_matching = [
+            row
+            for row in matching
+            if str(
+                (row.get("keys") or [None, None])[1] or ""
+            ).rstrip("/").casefold()
+            == target_norm
+        ]
+
+        if target_matching:
+            matching = target_matching
+
+    if not matching:
+        return {
+            "position": None,
+            "ranking_url": None,
+            "clicks": 0.0,
+            "impressions": 0.0,
+            "ctr": 0.0,
+            "matched_rows": 0,
+            "message": "No Search Console data found for this keyword in the selected period.",
+        }
+
+    best = min(
+        matching,
+        key=lambda item: float(item.get("position", math.inf)),
+    )
+
+    total_clicks = sum(
+        float(item.get("clicks", 0))
+        for item in matching
+    )
+
+    total_impressions = sum(
+        float(item.get("impressions", 0))
+        for item in matching
+    )
+
+    return {
+        "position": round(
+            float(best.get("position", 0)),
+            2,
+        ),
+        "ranking_url": (
+            best.get("keys") or [None, None]
+        )[1],
+        "clicks": total_clicks,
+        "impressions": total_impressions,
+        "ctr": (
+            total_clicks / total_impressions
+            if total_impressions
+            else 0.0
+        ),
+        "matched_rows": len(matching),
+        "message": (
+            f"Matched {len(matching)} Search Console "
+            "result row(s)."
+        ),
+    }
+
+
+async def _refresh_keywords_bulk(
+    db: Session,
+    rows: list[RankTrackingKeyword],
+    company_id: str,
+    *,
+    period: str,
+    compare: str,
+    custom_compare_start: date | None,
+    custom_compare_end: date | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Synchronize many keywords using batched GSC queries."""
+
+    connection = get_connection(
+        db,
+        company_id,
+        "search_console",
+    )
+
+    if connection is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google Search Console is not connected. "
+                "Connect it in Google Integration first."
+            ),
+        )
+
+    site_url, available_sites = await _resolve_gsc_property(
+        connection,
+        db,
+    )
+
+    # Use one common GSC date for the bulk operation.
+    # This avoids one date-discovery request per keyword.
+    latest_date_base = date.today() - timedelta(days=3)
+
+    current_start, current_end, previous_start, previous_end = (
+        _period_windows(
+            period,
+            latest_date_base,
+            compare,
+            custom_compare_start,
+            custom_compare_end,
+        )
+    )
+
+    # Group keywords so GSC is queried once per country/device
+    # combination rather than once per keyword.
+    groups: dict[tuple[str, str], list[RankTrackingKeyword]] = {}
+
+    for row in rows:
+        key = (
+            (row.country or "global").strip().lower(),
+            (row.device or "all").strip().lower(),
+        )
+        groups.setdefault(key, []).append(row)
+
+    current_rows_by_group: dict[
+        tuple[str, str],
+        list[dict[str, Any]],
+    ] = {}
+
+    previous_rows_by_group: dict[
+        tuple[str, str],
+        list[dict[str, Any]],
+    ] = {}
+
+    errors: list[dict[str, str]] = []
+
+    for group_key, group_rows in groups.items():
+        country, device = group_key
+
+        try:
+            current_rows_by_group[group_key] = await _bulk_gsc_rows(
+                connection,
+                db,
+                site_url=site_url,
+                start_date=current_start,
+                end_date=current_end,
+                country=country,
+                device=device,
+            )
+
+            previous_rows_by_group[group_key] = await _bulk_gsc_rows(
+                connection,
+                db,
+                site_url=site_url,
+                start_date=previous_start,
+                end_date=previous_end,
+                country=country,
+                device=device,
+            )
+
+        except HTTPException as exc:
+            message = str(exc.detail)
+
+            for row in group_rows:
+                errors.append({
+                    "keyword_id": row.id,
+                    "keyword": row.keyword,
+                    "error": message,
+                })
+
+    results: list[dict[str, Any]] = []
+
+    for row in rows:
+        group_key = (
+            (row.country or "global").strip().lower(),
+            (row.device or "all").strip().lower(),
+        )
+
+        if group_key not in current_rows_by_group:
+            continue
+
+        try:
+            current_data = _bulk_match_gsc_rows(
+                current_rows_by_group[group_key],
+                keyword=row.keyword,
+                target_url=row.target_url,
+            )
+
+            previous_data = _bulk_match_gsc_rows(
+                previous_rows_by_group.get(group_key, []),
+                keyword=row.keyword,
+                target_url=row.target_url,
+            )
+
+            snapshot = (
+                db.query(RankTrackingSnapshot)
+                .filter(
+                    RankTrackingSnapshot.keyword_id == row.id,
+                    RankTrackingSnapshot.measurement_start_date == current_start,
+                    RankTrackingSnapshot.measurement_end_date == current_end,
+                    RankTrackingSnapshot.period == period,
+                    RankTrackingSnapshot.comparison_start_date == previous_start,
+                    RankTrackingSnapshot.comparison_end_date == previous_end,
+                )
+                .order_by(
+                    RankTrackingSnapshot.checked_at.desc()
+                )
+                .first()
+            )
+
+            if snapshot is None:
+                snapshot = RankTrackingSnapshot(
+                    keyword_id=row.id,
+                    measurement_start_date=current_start,
+                    measurement_end_date=current_end,
+                    comparison_start_date=previous_start,
+                    comparison_end_date=previous_end,
+                )
+                db.add(snapshot)
+
+            snapshot.checked_at = datetime.now(UTC)
+            snapshot.position = current_data["position"]
+            snapshot.ranking_url = current_data["ranking_url"]
+            snapshot.clicks = current_data["clicks"]
+            snapshot.impressions = current_data["impressions"]
+            snapshot.ctr = current_data["ctr"]
+            snapshot.comparison_position = previous_data["position"]
+            snapshot.period = period
+            snapshot.source = "google_search_console"
+            snapshot.status = "ok"
+
+            if current_data["position"] is None:
+                snapshot.error_message = current_data["message"]
+            elif previous_data["position"] is None:
+                snapshot.error_message = (
+                    "Current period matched data, but comparison "
+                    "period has no Search Console position: "
+                    f"{previous_data['message']}"
+                )
+            else:
+                snapshot.error_message = None
+
+            db.commit()
+            db.refresh(snapshot)
+
+            result = _serialize_keyword(
+                db,
+                row,
+                period,
+            )
+
+            result["measurement_property"] = site_url
+            result["available_properties"] = available_sites
+            result["date_range"] = {
+                "start": current_start.isoformat(),
+                "end": current_end.isoformat(),
+            }
+            result["comparison_date_range"] = {
+                "start": previous_start.isoformat(),
+                "end": previous_end.isoformat(),
+            }
+            result["period"] = period
+            result["compare"] = compare
+            result["latest_gsc_date"] = (
+                current_end.isoformat()
+            )
+            result["measurement_message"] = (
+                current_data["message"]
+            )
+            result["comparison_message"] = (
+                previous_data["message"]
+            )
+
+            results.append(result)
+
+        except Exception as exc:
+            db.rollback()
+
+            errors.append({
+                "keyword_id": row.id,
+                "keyword": row.keyword,
+                "error": str(exc)[:1000],
+            })
+
+    return results, errors
 
 @router.post("/refresh")
-async def refresh_keywords(payload: RefreshRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> dict[str, Any]:
+async def refresh_keywords(
+    payload: RefreshRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
     company_id = _company_id(current_user)
+
     query = db.query(RankTrackingKeyword).filter(
         RankTrackingKeyword.company_id == company_id,
         RankTrackingKeyword.deleted_at.is_(None),
         RankTrackingKeyword.is_active.is_(True),
     )
+
     if payload.keyword_ids:
-        query = query.filter(RankTrackingKeyword.id.in_(payload.keyword_ids))
-    rows = query.order_by(RankTrackingKeyword.created_at.asc()).limit(100).all()
-    results: list[dict[str, Any]] = []; errors: list[dict[str, str]] = []
-    for row in rows:
-        try:
-            results.append(await _refresh_keyword(db, row, company_id, payload.period, payload.compare, payload.custom_compare_start, payload.custom_compare_end))
-        except HTTPException as exc:
-            errors.append({"keyword_id": row.id, "keyword": row.keyword, "error": str(exc.detail)})
+        query = query.filter(
+            RankTrackingKeyword.id.in_(payload.keyword_ids)
+        )
+
+    rows = (
+        query
+        .order_by(RankTrackingKeyword.created_at.asc())
+        .all()
+    )
+
+    results, errors = await _refresh_keywords_bulk(
+        db,
+        rows,
+        company_id,
+        period=payload.period,
+        compare=payload.compare,
+        custom_compare_start=payload.custom_compare_start,
+        custom_compare_end=payload.custom_compare_end,
+    )
+
+    return {
+        "requested": len(rows),
+        "updated": len(results),
+        "failed": len(errors),
+        "items": results,
+        "errors": errors,
+    }
     return {"updated": len(results), "items": results, "errors": errors}
 
 
