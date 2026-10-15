@@ -85,7 +85,7 @@ export function AuthProvider({
     }
   });
 
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -124,17 +124,19 @@ export function AuthProvider({
           );
         }
       } catch (error) {
-        console.warn(
-          "Session restoration failed. Clearing local session.",
-          error
-        );
+		  console.warn(
+			"Background session validation failed. Keeping the cached session.",
+			error
+		  );
 
-        clearSession();
-
-        if (mounted) {
-          setUser(null);
-        }
-      } finally {
+		  /*
+		   * Do NOT clear the local session here.
+		   *
+		   * The API client is responsible for clearing authentication only when
+		   * the refresh token is genuinely rejected. Temporary backend/network
+		   * failures must never log the user out or destroy the cached session.
+		   */
+		} finally {
         if (mounted) {
           setLoading(false);
         }

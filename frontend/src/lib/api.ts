@@ -37,15 +37,38 @@ class ApiClient {
   private readonly baseUrl: string;
   private refreshPromise: Promise<boolean> | null = null;
   private refreshRejected = false;
-  private readonly refreshLockKey = "boost_auth_refresh_lock";
-  private readonly refreshLockOwner =
-    typeof window !== "undefined"
-      ? `${Date.now()}-${Math.random().toString(36).slice(2)}`
-      : "server";
+  private readonly proactiveRefreshWindowMs = 60_000;
   private readonly refreshLockTtlMs = 15_000;
+  private refreshTimer: number | null = null;
+  private refreshChannel: BroadcastChannel | null = null;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
+
+    if (typeof window !== "undefined") {
+      if ("BroadcastChannel" in window) {
+        this.refreshChannel = new BroadcastChannel("boost-auth");
+        this.refreshChannel.addEventListener("message", (event) => {
+          const message = event.data as {
+            type?: string;
+            access_token?: string;
+            refresh_token?: string;
+            expires_in?: number;
+          };
+
+          if (message?.type !== "tokens-updated") return;
+          if (!message.access_token || !message.refresh_token) return;
+
+          this.storeTokenMetadata(
+            message.access_token,
+            message.refresh_token,
+            message.expires_in,
+          );
+        });
+      }
+
+      this.scheduleProactiveRefresh();
+    }
   }
 
   private getToken(): string | null {
@@ -64,8 +87,68 @@ class ApiClient {
     localStorage.removeItem("access_token");
     localStorage.removeItem("refresh_token");
     localStorage.removeItem("boost_user");
+    localStorage.removeItem("boost_access_token_expires_at");
+    localStorage.removeItem("boost_refresh_token_expires_at");
+
+    if (this.refreshTimer !== null) {
+      window.clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
 
     window.dispatchEvent(new CustomEvent("auth:expired"));
+  }
+
+  private getTokenExpiry(token: string | null): number | null {
+    if (!token) return null;
+
+    try {
+      const payloadPart = token.split(".")[1];
+      if (!payloadPart) return null;
+
+      const normalized = payloadPart
+        .replace(/-/g, "+")
+        .replace(/_/g, "/")
+        .padEnd(Math.ceil(payloadPart.length / 4) * 4, "=");
+
+      const payload = JSON.parse(atob(normalized)) as { exp?: number };
+      return typeof payload.exp === "number"
+        ? payload.exp * 1000
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private storeTokenMetadata(
+    accessToken: string,
+    refreshToken: string,
+    expiresIn?: number,
+  ): void {
+    localStorage.setItem("access_token", accessToken);
+    localStorage.setItem("refresh_token", refreshToken);
+
+    const accessExpiry =
+      typeof expiresIn === "number" && expiresIn > 0
+        ? Date.now() + expiresIn * 1000
+        : this.getTokenExpiry(accessToken);
+
+    const refreshExpiry = this.getTokenExpiry(refreshToken);
+
+    if (accessExpiry) {
+      localStorage.setItem(
+        "boost_access_token_expires_at",
+        String(accessExpiry),
+      );
+    }
+
+    if (refreshExpiry) {
+      localStorage.setItem(
+        "boost_refresh_token_expires_at",
+        String(refreshExpiry),
+      );
+    }
+
+    this.scheduleProactiveRefresh();
   }
 
   private saveTokens(data: RefreshResponse): boolean {
@@ -77,9 +160,147 @@ class ApiClient {
       return false;
     }
 
-    localStorage.setItem("access_token", accessToken);
-    localStorage.setItem("refresh_token", refreshToken);
+    this.storeTokenMetadata(
+      accessToken,
+      refreshToken,
+      tokens.expires_in,
+    );
+
+    try {
+      this.refreshChannel?.postMessage({
+        type: "tokens-updated",
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        expires_in: tokens.expires_in,
+      });
+    } catch {
+      // Optional browser coordination.
+    }
+
     return true;
+  }
+
+  private scheduleProactiveRefresh(): void {
+    if (typeof window === "undefined") return;
+
+    if (this.refreshTimer !== null) {
+      window.clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+
+    const accessToken = this.getToken();
+    const refreshToken = this.getRefreshToken();
+
+    if (!accessToken || !refreshToken) return;
+
+    const storedExpiry = Number(
+      localStorage.getItem("boost_access_token_expires_at") || "0",
+    );
+
+    const tokenExpiry =
+      storedExpiry > 0
+        ? storedExpiry
+        : this.getTokenExpiry(accessToken);
+
+    if (!tokenExpiry) return;
+
+    const refreshAt = Math.max(
+      10_000,
+      tokenExpiry - Date.now() - this.proactiveRefreshWindowMs,
+    );
+
+    this.refreshTimer = window.setTimeout(() => {
+      void this.refreshAccessToken();
+    }, refreshAt);
+  }
+
+  private async ensureFreshAccessToken(): Promise<void> {
+    const accessToken = this.getToken();
+    const refreshToken = this.getRefreshToken();
+
+    if (!accessToken || !refreshToken) return;
+
+    const storedExpiry = Number(
+      localStorage.getItem("boost_access_token_expires_at") || "0",
+    );
+
+    const expiry =
+      storedExpiry > 0
+        ? storedExpiry
+        : this.getTokenExpiry(accessToken);
+
+    if (!expiry) return;
+
+    if (expiry - Date.now() <= this.proactiveRefreshWindowMs) {
+      await this.refreshAccessToken();
+    }
+  }
+
+  private async waitForOtherTabRefresh(
+    originalRefreshToken: string,
+  ): Promise<boolean> {
+    const deadline = Date.now() + this.refreshLockTtlMs + 3_000;
+
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      const currentRefreshToken = this.getRefreshToken();
+
+      if (
+        currentRefreshToken &&
+        currentRefreshToken !== originalRefreshToken &&
+        this.getToken()
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private async runWithBrowserLock(
+    task: () => Promise<boolean>,
+  ): Promise<boolean> {
+    if (
+      typeof navigator !== "undefined" &&
+      "locks" in navigator &&
+      navigator.locks
+    ) {
+      return navigator.locks.request(
+        "boost-auth-refresh",
+        { mode: "exclusive" },
+        async () => task(),
+      );
+    }
+
+    return task();
+  }
+
+  private async performRefresh(refreshToken: string): Promise<boolean> {
+    const response = await fetch(`${this.baseUrl}/api/auth/refresh`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        refresh_token: refreshToken,
+      }),
+    });
+
+    if (!response.ok) {
+      if (
+        response.status === 400 ||
+        response.status === 401 ||
+        response.status === 403
+      ) {
+        this.refreshRejected = true;
+      }
+
+      return false;
+    }
+
+    const data = (await response.json()) as RefreshResponse;
+    return this.saveTokens(data);
   }
 
   private buildHeaders(
@@ -118,110 +339,6 @@ class ApiClient {
     }
   }
 
-  private async waitForOtherTabRefresh(
-    originalRefreshToken: string,
-  ): Promise<boolean> {
-    const deadline = Date.now() + this.refreshLockTtlMs + 2_000;
-
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
-      const currentRefreshToken = this.getRefreshToken();
-
-      // Another tab may already have rotated the token successfully.
-      if (
-        currentRefreshToken &&
-        currentRefreshToken !== originalRefreshToken &&
-        this.getToken()
-      ) {
-        return true;
-      }
-
-      const lockRaw = localStorage.getItem(this.refreshLockKey);
-      if (!lockRaw) {
-        return false;
-      }
-
-      try {
-        const lock = JSON.parse(lockRaw) as {
-          owner?: string;
-          expiresAt?: number;
-        };
-
-        if (!lock.expiresAt || lock.expiresAt <= Date.now()) {
-          return false;
-        }
-      } catch {
-        return false;
-      }
-    }
-
-    return false;
-  }
-
-  private acquireRefreshLock(): boolean {
-    const now = Date.now();
-
-    try {
-      const existingRaw = localStorage.getItem(this.refreshLockKey);
-
-      if (existingRaw) {
-        try {
-          const existing = JSON.parse(existingRaw) as {
-            owner?: string;
-            expiresAt?: number;
-          };
-
-          if (
-            existing.owner &&
-            existing.owner !== this.refreshLockOwner &&
-            typeof existing.expiresAt === "number" &&
-            existing.expiresAt > now
-          ) {
-            return false;
-          }
-        } catch {
-          // Replace malformed/stale lock.
-        }
-      }
-
-      localStorage.setItem(
-        this.refreshLockKey,
-        JSON.stringify({
-          owner: this.refreshLockOwner,
-          expiresAt: now + this.refreshLockTtlMs,
-        }),
-      );
-
-      const verifyRaw = localStorage.getItem(this.refreshLockKey);
-      if (!verifyRaw) return false;
-
-      const verify = JSON.parse(verifyRaw) as {
-        owner?: string;
-        expiresAt?: number;
-      };
-
-      return verify.owner === this.refreshLockOwner;
-    } catch {
-      // If localStorage is unavailable, preserve the existing in-tab mutex.
-      return true;
-    }
-  }
-
-  private releaseRefreshLock(): void {
-    try {
-      const raw = localStorage.getItem(this.refreshLockKey);
-      if (!raw) return;
-
-      const lock = JSON.parse(raw) as { owner?: string };
-      if (lock.owner === this.refreshLockOwner) {
-        localStorage.removeItem(this.refreshLockKey);
-      }
-    } catch {
-      // Nothing to do.
-    }
-  }
-
   private async refreshAccessToken(): Promise<boolean> {
     const refreshToken = this.getRefreshToken();
 
@@ -236,71 +353,50 @@ class ApiClient {
 
     this.refreshRejected = false;
 
-    this.refreshPromise = (async () => {
-      let ownsLock = false;
-
+    this.refreshPromise = this.runWithBrowserLock(async () => {
       try {
-        ownsLock = this.acquireRefreshLock();
+        const currentRefreshToken = this.getRefreshToken();
 
-        if (!ownsLock) {
-          // Another browser tab is rotating this refresh token. Wait for it
-          // and then use the newly stored access/refresh tokens.
-          const reused = await this.waitForOtherTabRefresh(refreshToken);
-          if (reused) {
-            return true;
-          }
-
-          // The other tab stopped without rotating the token. Re-read the
-          // current token before attempting the refresh ourselves.
-          const currentRefreshToken = this.getRefreshToken();
-          if (!currentRefreshToken) {
-            this.refreshRejected = true;
-            return false;
-          }
-        }
-
-        const tokenForRequest = this.getRefreshToken();
-        if (!tokenForRequest) {
+        if (!currentRefreshToken) {
           this.refreshRejected = true;
           return false;
         }
 
-        const response = await fetch(`${this.baseUrl}/api/auth/refresh`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            refresh_token: tokenForRequest,
-          }),
-        });
+        if (currentRefreshToken !== refreshToken) {
+          return true;
+        }
 
-        if (!response.ok) {
-          if (
-            response.status === 400 ||
-            response.status === 401 ||
-            response.status === 403
-          ) {
-            this.refreshRejected = true;
-          }
+        const refreshed = await this.performRefresh(currentRefreshToken);
+
+        if (refreshed) {
+          return true;
+        }
+
+        if (!this.refreshRejected) {
           return false;
         }
 
-        const data = (await response.json()) as RefreshResponse;
-        return this.saveTokens(data);
+        const reused = await this.waitForOtherTabRefresh(
+          currentRefreshToken,
+        );
+
+        if (reused) {
+          this.refreshRejected = false;
+          return true;
+        }
+
+        return false;
       } catch (error) {
         console.error("Token refresh failed:", error);
         this.refreshRejected = false;
         return false;
-      } finally {
-        if (ownsLock) {
-          this.releaseRefreshLock();
-        }
-        this.refreshPromise = null;
       }
-    })();
+    });
 
     const refreshed = await this.refreshPromise;
+
+    this.refreshPromise = null;
+    this.scheduleProactiveRefresh();
 
     if (!refreshed && this.refreshRejected) {
       this.clearAuthStorage();
@@ -324,28 +420,15 @@ class ApiClient {
 
     const hasBody = body !== undefined && body !== null;
 
+    if (auth && !skipRefresh) {
+      await this.ensureFreshAccessToken();
+    }
+
     const requestHeaders = this.buildHeaders(
       headers,
       auth,
       hasBody
     );
-
-    // Agency workspace context is sent to backend module endpoints.
-    // Client-management/invitation endpoints intentionally remain in the
-    // agency workspace so an agency can manage its portfolio and access.
-    const normalizedEndpoint = endpoint.split("?")[0].replace(/\/+$/, "");
-    const isWorkspaceManagementEndpoint =
-      normalizedEndpoint === "/api/clients" ||
-      normalizedEndpoint.startsWith("/api/clients/") ||
-      normalizedEndpoint.startsWith("/api/auth/");
-    const workspaceClientId =
-      typeof window !== "undefined"
-        ? localStorage.getItem("boost_workspace_client_id")
-        : null;
-
-    if (auth && workspaceClientId && !isWorkspaceManagementEndpoint) {
-      requestHeaders.set("X-Workspace-Client-ID", workspaceClientId);
-    }
 
     let response: Response;
 

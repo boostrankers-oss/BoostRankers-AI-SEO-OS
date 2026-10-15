@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # JWT & Security Settings
     SECRET_KEY: str = os.getenv("SECRET_KEY", "super-secret-key-change-in-production-please")
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 2880
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
     
     # AI Settings
@@ -30,7 +30,11 @@ class Settings(BaseSettings):
     # CORS Settings
     BACKEND_CORS_ORIGINS: list = ["*"]
 
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+    model_config = SettingsConfigDict(
+    env_file=".env",
+    case_sensitive=True,
+    extra="ignore",
+)
 
 settings = Settings()
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")

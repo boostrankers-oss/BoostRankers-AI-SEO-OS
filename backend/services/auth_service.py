@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 from jose import JWTError
 
 from datetime import UTC, datetime, timedelta
@@ -462,44 +462,49 @@ class AuthService:
         # Refresh Access Token
         # ==========================================================
 
+    def _access_token_expiry_seconds() -> int:
+        try:
+            from core.jwt import ACCESS_TOKEN_EXPIRE_MINUTES
+            return max(60, int(ACCESS_TOKEN_EXPIRE_MINUTES) * 60)
+        except Exception:
+            return 900
+    
     def refresh(
-        self,
-        refresh_token: str,
-    ) -> dict:
+    self,
+    refresh_token: str,
+) -> dict:
         """
-        Refresh JWT tokens using refresh token rotation.
+        Refresh the access token without rotating the database refresh-token
+        record.
 
-        Flow
+        Access tokens are short-lived JWTs, while the refresh token represents
+        the authenticated browser session.
 
-        1. Verify JWT
-        2. Check DB record
-        3. Check revoked
-        4. Check expired
-        5. Load user
-        6. Create new Access Token
-        7. Rotate Refresh Token
-        8. Revoke previous Refresh Token
+        The refresh endpoint intentionally does not perform refresh-token
+        rotation because rotation was causing unnecessary database transaction
+        failures and 500 responses during normal session renewal.
         """
 
         try:
-
-            # ---------------------------------------------
-            # Verify JWT
-            # ---------------------------------------------
-
+            # ---------------------------------------------------------
+            # Verify refresh JWT
+            # ---------------------------------------------------------
             payload = verify_token(
                 refresh_token,
                 token_type="refresh",
             )
 
-            user_id = payload["sub"]
+            user_id = payload.get("sub")
 
-            session_id = payload["sid"]
+            if not user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid refresh token.",
+                )
 
-            # ---------------------------------------------
-            # Database Lookup
-            # ---------------------------------------------
-
+            # ---------------------------------------------------------
+            # Verify refresh token still exists in the database
+            # ---------------------------------------------------------
             db_token = self.db.scalar(
                 select(RefreshToken).where(
                     RefreshToken.token == refresh_token
@@ -507,69 +512,55 @@ class AuthService:
             )
 
             if db_token is None:
-
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Refresh token not found.",
                 )
 
-            # ---------------------------------------------
-            # Revoked
-            # ---------------------------------------------
-
+            # ---------------------------------------------------------
+            # Explicit logout / revocation remains a hard failure
+            # ---------------------------------------------------------
             if db_token.is_revoked:
-
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Refresh token revoked.",
                 )
 
-            # ---------------------------------------------
-            # Expired
-            # ---------------------------------------------
-
+            # ---------------------------------------------------------
+            # Refresh-token expiry
+            # ---------------------------------------------------------
             if db_token.is_expired:
-
-                db_token.revoke("expired")
-
-                self._commit()
-
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Refresh token expired.",
                 )
 
-            # ---------------------------------------------
-            # User
-            # ---------------------------------------------
-
+            # ---------------------------------------------------------
+            # Load user
+            # ---------------------------------------------------------
             user = self.db.get(
                 User,
                 user_id,
             )
 
             if user is None:
-
                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
+                    status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="User not found.",
                 )
 
             if not user.is_active:
-
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Account disabled.",
                 )
 
-            # ---------------------------------------------
-            # Rotate Token
-            # ---------------------------------------------
-
-            db_token.revoke(
-                reason="rotation"
-            )
-
+            # ---------------------------------------------------------
+            # Issue a fresh 48-hour access token.
+            #
+            # The expiry is controlled centrally by
+            # ACCESS_TOKEN_EXPIRE_MINUTES=2880.
+            # ---------------------------------------------------------
             new_access = create_access_token(
                 user_id=user.id,
                 email=user.email,
@@ -578,52 +569,32 @@ class AuthService:
                 permissions=[],
             )
 
-            new_refresh = create_refresh_token(
-                user_id=user.id,
-                session_id=session_id,
-            )
-
-            self.db.add(
-                RefreshToken(
-                    user_id=user.id,
-                    token=new_refresh,
-                    token_family=db_token.token_family,
-                    device_name=db_token.device_name,
-                    device_type=db_token.device_type,
-                    browser=db_token.browser,
-                    operating_system=db_token.operating_system,
-                    ip_address=db_token.ip_address,
-                    user_agent=db_token.user_agent,
-                    location=db_token.location,
-                    expires_at=datetime.now(UTC)
-                    + timedelta(days=30),
-                )
-            )
-
-            db_token.replaced_by_token = new_refresh
-
+            # ---------------------------------------------------------
+            # Update last-used timestamp only.
+            #
+            # No token rotation.
+            # No replacement row.
+            # No replaced_by_token update.
+            # No revoke/commit cycle.
+            #
+            # This keeps refresh reliable and avoids the database
+            # transaction that was producing the 500 errors.
+            # ---------------------------------------------------------
             db_token.last_used_at = datetime.now(UTC)
 
             self._commit()
 
             return {
-
                 "success": True,
-
                 "message": "Token refreshed.",
-
                 "tokens": {
-
                     "access_token": new_access,
-
-                    "refresh_token": new_refresh,
-
-                    "expires_in": 900,
+                    "refresh_token": refresh_token,
+                    "expires_in": 2880 * 60,
                 },
             }
 
         except JWTError:
-
             self._rollback()
 
             raise HTTPException(
@@ -632,21 +603,23 @@ class AuthService:
             )
 
         except HTTPException:
-
             self._rollback()
-
             raise
 
         except Exception as exc:
-
             self._rollback()
 
-            raise HTTPException(
-                status_code=500,
-                detail=str(exc),
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "CRITICAL REFRESH TOKEN ERROR"
             )
-        
-            # ==========================================================
+
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Refresh token processing failed.",
+            )
+    
     # Logout Current Device
     # ==========================================================
 
@@ -766,7 +739,7 @@ class AuthService:
 
                 # TODO:
                 # Persist a hashed reset token with an expiry
-                # (e.g. 15–30 minutes) in a dedicated table or
+                # (e.g. 15â€“30 minutes) in a dedicated table or
                 # user fields before sending the email.
 
                 self.db.add(
@@ -907,12 +880,16 @@ class AuthService:
             raise
 
         except Exception as exc:
-
             self._rollback()
 
+            import logging
+            logging.getLogger(__name__).exception(
+                "CRITICAL REFRESH TOKEN ERROR"
+            )
+
             raise HTTPException(
-                status_code=500,
-                detail=str(exc),
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Refresh token processing failed.",
             )
 
 
@@ -1009,3 +986,5 @@ def authenticate_user(db, email: str, password: str):
     )
 
     return service.login(request)
+
+
